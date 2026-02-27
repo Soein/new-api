@@ -17,7 +17,7 @@ jobs:
       - name: Checkout 代码
         uses: actions/checkout@v4
         with:
-          ref: deploy
+          ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
@@ -33,10 +33,10 @@ jobs:
           git fetch upstream
 
           echo "📊 上游新提交："
-          git log --oneline deploy..upstream/main | head -10 || echo "无新提交"
+          git log --oneline main..upstream/main | head -10 || echo "无新提交"
 
           # 检查是否有新提交
-          if [ "$(git rev-parse deploy)" = "$(git merge-base deploy upstream/main)" ] && [ "$(git rev-parse upstream/main)" = "$(git rev-parse deploy)" ]; then
+          if [ "$(git rev-parse main)" = "$(git merge-base main upstream/main)" ] && [ "$(git rev-parse upstream/main)" = "$(git rev-parse main)" ]; then
             echo "✅ 已是最新，无需同步"
             exit 0
           fi
@@ -44,7 +44,7 @@ jobs:
           echo "🔀 合并上游代码..."
           if git merge upstream/main --no-edit; then
             echo "✅ 合并成功"
-            git push origin deploy
+            git push origin main
             echo "🚀 已推送到 GitHub"
           else
             echo "❌ 合并失败，可能有冲突"
@@ -72,5 +72,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: '⚠️ 上游同步失败 - ' + new Date().toISOString().split('T')[0],
-              body: `## 同步失败报告\n\n**失败时间**: ${new Date().toISOString()}\n**Workflow 运行**: ${context.payload.repository.html_url}/actions/runs/${context.runId}\n\n### 可能原因\n\n- deploy 分支的自定义补丁与上游代码冲突\n- 上游仓库暂时不可访问\n\n### 当前补丁\n\n- Dockerfile: GOPROXY 加速\n- stream_scanner.go: channel 写入超时 10s → 600s\n\n### 建议操作\n\n1. 查看 [Actions 日志](${context.payload.repository.html_url}/actions/runs/${context.runId}) 了解详细错误\n2. 本地手动解决冲突：\n   \`\`\`bash\n   cd ~/github/new-api && git checkout deploy\n   git fetch origin && git merge origin/main\n   # 解决冲突后\n   git push fork deploy\n   \`\`\``
+              body: `## 同步失败报告\n\n**失败时间**: ${new Date().toISOString()}\n**Workflow 运行**: ${context.payload.repository.html_url}/actions/runs/${context.runId}\n\n### 可能原因\n\n- main 分支的自定义补丁与上游代码冲突\n- 上游仓库暂时不可访问\n\n### 当前补丁\n\n- Dockerfile: GOPROXY 加速\n- stream_scanner.go: channel 写入超时 10s → 600s\n\n### 建议操作\n\n1. 查看 [Actions 日志](${context.payload.repository.html_url}/actions/runs/${context.runId}) 了解详细错误\n2. 本地手动解决冲突：\n   \`\`\`bash\n   cd ~/github/new-api && git checkout main\n   git fetch upstream && git merge upstream/main\n   # 解决冲突后\n   git push origin main\n   \`\`\``
             })

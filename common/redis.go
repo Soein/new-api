@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -21,8 +23,23 @@ func RedisKeyCacheSeconds() int {
 }
 
 // InitRedisClient This function is called after init()
+//
+// Supported REDIS_CONN_STRING forms:
+//
+//   - redis://[:pass@]host:port/db                 (single instance)
+//   - rediss://[:pass@]host:port/db                (single instance + TLS)
+//   - redis-sentinel://[:pass@]h1:p1,h2:p2,h3:p3/db?master=<name>[&sentinel_password=<pw>]
+//     → Redis Sentinel HA. Pass is used to authenticate against the master/
+//     replica (AUTH); sentinel_password is used to authenticate against the
+//     Sentinel processes themselves if they run requirepass. The URL accepts
+//     2+ sentinel addresses separated by commas in the host part.
+//
+// Example:
+//
+//	REDIS_CONN_STRING=redis-sentinel://:mypw@10.0.0.1:26379,10.0.0.2:26379,10.0.0.3:26379/0?master=mymaster
 func InitRedisClient() (err error) {
-	if os.Getenv("REDIS_CONN_STRING") == "" {
+	connStr := os.Getenv("REDIS_CONN_STRING")
+	if connStr == "" {
 		RedisEnabled = false
 		SysLog("REDIS_CONN_STRING not set, Redis is not enabled")
 		return nil
@@ -32,12 +49,30 @@ func InitRedisClient() (err error) {
 		SyncFrequency = 60
 	}
 	SysLog("Redis is enabled")
-	opt, err := redis.ParseURL(os.Getenv("REDIS_CONN_STRING"))
-	if err != nil {
-		FatalLog("failed to parse Redis connection string: " + err.Error())
+
+	poolSize := GetEnvOrDefault("REDIS_POOL_SIZE", 10)
+	if strings.HasPrefix(connStr, "redis-sentinel://") {
+		failoverOpt, err := parseSentinelURL(connStr)
+		if err != nil {
+			FatalLog("failed to parse Redis Sentinel connection string: " + err.Error())
+		}
+		failoverOpt.PoolSize = poolSize
+		RDB = redis.NewFailoverClient(failoverOpt)
+		if DebugEnabled {
+			SysLog(fmt.Sprintf("Redis Sentinel: master=%s sentinels=%v db=%d",
+				failoverOpt.MasterName, failoverOpt.SentinelAddrs, failoverOpt.DB))
+		}
+	} else {
+		opt, err := redis.ParseURL(connStr)
+		if err != nil {
+			FatalLog("failed to parse Redis connection string: " + err.Error())
+		}
+		opt.PoolSize = poolSize
+		RDB = redis.NewClient(opt)
+		if DebugEnabled {
+			SysLog(fmt.Sprintf("Redis connected to %s db=%d", opt.Addr, opt.DB))
+		}
 	}
-	opt.PoolSize = GetEnvOrDefault("REDIS_POOL_SIZE", 10)
-	RDB = redis.NewClient(opt)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -46,19 +81,102 @@ func InitRedisClient() (err error) {
 	if err != nil {
 		FatalLog("Redis ping test failed: " + err.Error())
 	}
-	if DebugEnabled {
-		SysLog(fmt.Sprintf("Redis connected to %s", opt.Addr))
-		SysLog(fmt.Sprintf("Redis database: %d", opt.DB))
-	}
 	return err
 }
 
-func ParseRedisOption() *redis.Options {
-	opt, err := redis.ParseURL(os.Getenv("REDIS_CONN_STRING"))
-	if err != nil {
-		FatalLog("failed to parse Redis connection string: " + err.Error())
+// parseSentinelURL parses redis-sentinel:// URLs. The format intentionally
+// mirrors redis:// so operators can mechanically convert (add the -sentinel
+// suffix, list multiple host:port pairs separated by commas, add
+// ?master=<name>).
+//
+// The master (AUTH) password comes from the URL userinfo; the Sentinel
+// password (used to AUTH against Sentinel processes themselves) comes from
+// the ?sentinel_password= query parameter or SENTINEL_PASSWORD env var.
+func parseSentinelURL(raw string) (*redis.FailoverOptions, error) {
+	// Strip the custom scheme so net/url can parse the rest; we'll put it
+	// back as a pseudo 'redis://' for the built-in parser. Simpler to just
+	// strip manually.
+	trimmed := strings.TrimPrefix(raw, "redis-sentinel://")
+
+	// Split userinfo (before @) from hostinfo+path+query (after @).
+	var userinfo, rest string
+	if at := strings.LastIndex(trimmed, "@"); at >= 0 {
+		userinfo = trimmed[:at]
+		rest = trimmed[at+1:]
+	} else {
+		rest = trimmed
 	}
-	return opt
+
+	// Split path/query from the host list. rest looks like:
+	//   host1:26379,host2:26379,host3:26379/0?master=mymaster&foo=bar
+	hosts := rest
+	pathAndQuery := ""
+	if slash := strings.Index(rest, "/"); slash >= 0 {
+		hosts = rest[:slash]
+		pathAndQuery = rest[slash:]
+	}
+	if hosts == "" {
+		return nil, fmt.Errorf("no sentinel hosts in %q", raw)
+	}
+
+	// Parse each sentinel addr; be strict about host:port.
+	addrs := strings.Split(hosts, ",")
+	for i, a := range addrs {
+		a = strings.TrimSpace(a)
+		if a == "" || !strings.Contains(a, ":") {
+			return nil, fmt.Errorf("invalid sentinel addr %q in %q", a, raw)
+		}
+		addrs[i] = a
+	}
+
+	opt := &redis.FailoverOptions{
+		SentinelAddrs: addrs,
+	}
+
+	// Master password is the "password" part of userinfo. Username is
+	// ignored (Sentinel protocol uses AUTH without username for the master
+	// in traditional deployments).
+	if userinfo != "" {
+		if colon := strings.Index(userinfo, ":"); colon >= 0 {
+			opt.Password = userinfo[colon+1:]
+		} else {
+			// Userinfo with no colon: treat whole thing as password for
+			// compatibility with "redis-sentinel://secret@host:port/..."
+			opt.Password = userinfo
+		}
+	}
+
+	// Parse path ("/<db>") and query (?master=... &sentinel_password=...).
+	if pathAndQuery != "" {
+		parsed, err := url.Parse("http://dummy" + pathAndQuery)
+		if err != nil {
+			return nil, fmt.Errorf("parse path/query: %w", err)
+		}
+		db := strings.TrimPrefix(parsed.Path, "/")
+		if db != "" {
+			n, err := strconv.Atoi(db)
+			if err != nil {
+				return nil, fmt.Errorf("invalid db number %q", db)
+			}
+			opt.DB = n
+		}
+		q := parsed.Query()
+		opt.MasterName = q.Get("master")
+		if sp := q.Get("sentinel_password"); sp != "" {
+			opt.SentinelPassword = sp
+		}
+	}
+
+	// Allow env override for sentinel password (operators often dislike
+	// putting it in the URL).
+	if sp := os.Getenv("SENTINEL_PASSWORD"); sp != "" {
+		opt.SentinelPassword = sp
+	}
+
+	if opt.MasterName == "" {
+		return nil, fmt.Errorf("missing ?master=<name> in %q", raw)
+	}
+	return opt, nil
 }
 
 func RedisSet(key string, value string, expiration time.Duration) error {

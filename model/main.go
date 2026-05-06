@@ -89,7 +89,15 @@ func createRootAccountIfNeed() error {
 }
 
 func CheckSetup() {
-	setup := GetSetup()
+	setup, err := GetSetup()
+	if err != nil {
+		// 数据库瞬时错误：保持 constant.Setup 当前值（默认 false），
+		// 但绝不在这里把它"固化"为已确认状态，避免把无鉴权的 /api/setup
+		// POST 长期暴露给攻击者；同时跳过 RootUserExists() 这一额外查询，
+		// 避免在 DB 抖动期间叠加更多副作用。
+		common.SysLog("CheckSetup: failed to query setup record, will recheck on demand: " + err.Error())
+		return
+	}
 	if setup == nil {
 		// No setup record exists, check if we have a root user
 		if RootUserExists() {
@@ -99,8 +107,7 @@ func CheckSetup() {
 				Version:       common.Version,
 				InitializedAt: time.Now().Unix(),
 			}
-			err := DB.Create(&newSetup).Error
-			if err != nil {
+			if err := DB.Create(&newSetup).Error; err != nil {
 				common.SysLog("failed to create setup record: " + err.Error())
 			}
 			constant.Setup = true
@@ -108,11 +115,11 @@ func CheckSetup() {
 			common.SysLog("system is not initialized and no root user exists")
 			constant.Setup = false
 		}
-	} else {
-		// Setup record exists, system is initialized
-		common.SysLog("system is already initialized at: " + time.Unix(setup.InitializedAt, 0).String())
-		constant.Setup = true
+		return
 	}
+	// Setup record exists, system is initialized
+	common.SysLog("system is already initialized at: " + time.Unix(setup.InitializedAt, 0).String())
+	constant.Setup = true
 }
 
 func chooseDB(envName string, isLog bool) (*gorm.DB, error) {

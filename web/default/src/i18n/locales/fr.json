@@ -4578,6 +4578,11 @@
     "This plan does not allow balance redemption": "Ce forfait ne permet pas le paiement avec le solde",
     "Use presets or upstream discovery to populate the model list faster.": "Utilisez des préréglages ou la découverte en amont pour remplir plus vite la liste des modèles.",
     "Vertex AI API Key mode does not support batch creation": "Le mode clé API Vertex AI ne prend pas en charge la création par lot",
-    "Vertex AI service account key must be valid JSON": "La clé de compte de service Vertex AI doit être un JSON valide"
+    "Vertex AI service account key must be valid JSON": "La clé de compte de service Vertex AI doit être un JSON valide",
+    "Adapt `-thinking` suffix requests to Anthropic native thinking behavior while keeping billing predictable.": "Adapter les requêtes avec le suffixe `-thinking` au comportement de pensée natif d’Anthropic tout en gardant une facturation prévisible.",
+    "Keep affinity when channel is disabled": "Conserver l'affinité lorsque le canal est désactivé",
+    "When enabled, keep the affinity entry even if the affinity channel is disabled or no longer usable for the current group/model. Leave it off to delete the entry and select another channel.": "Lorsque cette option est activée, conserver l'entrée d'affinité même si le canal affinitaire est désactivé ou n'est plus utilisable pour le groupe/modèle actuel. Laissez-la désactivée pour supprimer l'entrée et sélectionner un autre canal.",
+    "Models that skip thinking suffix processing": "Modèles qui ignorent le traitement des suffixes thinking",
+    "Thinking Suffix Adapter": "Adaptateur de suffixe thinking"
   }
 }

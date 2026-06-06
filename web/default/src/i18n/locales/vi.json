@@ -4578,6 +4578,11 @@
     "This plan does not allow balance redemption": "Gói này không cho phép thanh toán bằng số dư",
     "Use presets or upstream discovery to populate the model list faster.": "Dùng mẫu đặt sẵn hoặc phát hiện từ upstream để điền danh sách mô hình nhanh hơn.",
     "Vertex AI API Key mode does not support batch creation": "Chế độ API Key của Vertex AI không hỗ trợ tạo hàng loạt",
-    "Vertex AI service account key must be valid JSON": "Khóa tài khoản dịch vụ Vertex AI phải là JSON hợp lệ"
+    "Vertex AI service account key must be valid JSON": "Khóa tài khoản dịch vụ Vertex AI phải là JSON hợp lệ",
+    "Adapt `-thinking` suffix requests to Anthropic native thinking behavior while keeping billing predictable.": "Điều chỉnh các yêu cầu có hậu tố `-thinking` sang hành vi suy luận gốc của Anthropic trong khi vẫn giữ tính phí dễ dự đoán.",
+    "Keep affinity when channel is disabled": "Giữ ưu tiên khi kênh bị tắt",
+    "When enabled, keep the affinity entry even if the affinity channel is disabled or no longer usable for the current group/model. Leave it off to delete the entry and select another channel.": "Khi bật, giữ mục ưu tiên ngay cả khi kênh ưu tiên bị tắt hoặc không còn dùng được cho nhóm/mô hình hiện tại. Để tắt để xóa mục đó và chọn kênh khác.",
+    "Models that skip thinking suffix processing": "Mô hình bỏ qua xử lý hậu tố thinking",
+    "Thinking Suffix Adapter": "Adapter hậu tố thinking"
   }
 }

@@ -4578,6 +4578,11 @@
     "This plan does not allow balance redemption": "このプランでは残高での交換は許可されていません",
     "Use presets or upstream discovery to populate the model list faster.": "プリセットまたは上流検出を使ってモデルリストをすばやく入力します。",
     "Vertex AI API Key mode does not support batch creation": "Vertex AI API Key モードは一括作成をサポートしていません",
-    "Vertex AI service account key must be valid JSON": "Vertex AI サービスアカウントキーは有効な JSON である必要があります"
+    "Vertex AI service account key must be valid JSON": "Vertex AI サービスアカウントキーは有効な JSON である必要があります",
+    "Adapt `-thinking` suffix requests to Anthropic native thinking behavior while keeping billing predictable.": "`-thinking` サフィックス付きリクエストを Anthropic ネイティブの思考動作に適配し、課金を予測可能に保ちます。",
+    "Keep affinity when channel is disabled": "チャネル無効時にアフィニティを保持",
+    "When enabled, keep the affinity entry even if the affinity channel is disabled or no longer usable for the current group/model. Leave it off to delete the entry and select another channel.": "有効にすると、アフィニティチャネルが無効化された、または現在のグループ/モデルで利用できなくなった場合でも、そのアフィニティエントリを保持します。無効のままにすると、エントリを削除して別のチャネルを選択します。",
+    "Models that skip thinking suffix processing": "thinking サフィックス処理をスキップするモデル",
+    "Thinking Suffix Adapter": "思考サフィックスアダプター"
   }
 }

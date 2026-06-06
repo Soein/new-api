@@ -4578,6 +4578,11 @@
     "This plan does not allow balance redemption": "Этот план не разрешает оплату балансом",
     "Use presets or upstream discovery to populate the model list faster.": "Используйте пресеты или обнаружение upstream, чтобы быстрее заполнить список моделей.",
     "Vertex AI API Key mode does not support batch creation": "Режим API Key Vertex AI не поддерживает пакетное создание",
-    "Vertex AI service account key must be valid JSON": "Ключ сервисного аккаунта Vertex AI должен быть допустимым JSON"
+    "Vertex AI service account key must be valid JSON": "Ключ сервисного аккаунта Vertex AI должен быть допустимым JSON",
+    "Adapt `-thinking` suffix requests to Anthropic native thinking behavior while keeping billing predictable.": "Адаптировать запросы с суффиксом `-thinking` к собственному режиму размышления Anthropic, сохраняя предсказуемость биллинга.",
+    "Keep affinity when channel is disabled": "Сохранять привязку при отключении канала",
+    "When enabled, keep the affinity entry even if the affinity channel is disabled or no longer usable for the current group/model. Leave it off to delete the entry and select another channel.": "Если включено, запись привязки сохраняется, даже когда привязанный канал отключён или больше не подходит для текущей группы/модели. Оставьте выключенным, чтобы удалять запись и выбирать другой канал.",
+    "Models that skip thinking suffix processing": "Модели, пропускающие обработку суффиксов thinking",
+    "Thinking Suffix Adapter": "Адаптер суффикса thinking"
   }
 }

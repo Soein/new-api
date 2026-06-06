@@ -4578,6 +4578,11 @@
     "This plan does not allow balance redemption": "该套餐不允许使用余额兑换",
     "Use presets or upstream discovery to populate the model list faster.": "使用预设或上游发现来更快填充模型列表。",
     "Vertex AI API Key mode does not support batch creation": "Vertex AI API Key 模式不支持批量创建",
-    "Vertex AI service account key must be valid JSON": "Vertex AI 服务账号密钥必须是有效 JSON"
+    "Vertex AI service account key must be valid JSON": "Vertex AI 服务账号密钥必须是有效 JSON",
+    "Adapt `-thinking` suffix requests to Anthropic native thinking behavior while keeping billing predictable.": "将带 `-thinking` 后缀的请求适配为 Anthropic 原生思考请求，并保持计费可预测。",
+    "Keep affinity when channel is disabled": "渠道禁用后保留亲和",
+    "When enabled, keep the affinity entry even if the affinity channel is disabled or no longer usable for the current group/model. Leave it off to delete the entry and select another channel.": "开启后，亲和到的渠道被禁用，或不再适用于当前分组/模型时，仍保留这条亲和；关闭时会删除并重新选择渠道。",
+    "Models that skip thinking suffix processing": "不自动处理思考后缀的模型",
+    "Thinking Suffix Adapter": "思考后缀适配器"
   }
 }

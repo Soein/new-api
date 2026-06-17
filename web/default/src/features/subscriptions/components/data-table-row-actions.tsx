@@ -38,41 +38,43 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const { setOpen, setCurrentRow } = useSubscriptions()
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={<Button variant='ghost' className='h-8 w-8 p-0' />}
-      >
-        <MoreHorizontal className='h-4 w-4' />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align='end'>
-        <DropdownMenuItem
-          onClick={() => {
-            setCurrentRow(row.original)
-            setOpen('update')
-          }}
+    <div className='-ml-2'>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={<Button variant='ghost' className='h-8 w-8 p-0' />}
         >
-          <Pencil className='mr-2 h-4 w-4' />
-          {t('Edit')}
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onClick={() => {
-            setCurrentRow(row.original)
-            setOpen('toggle-status')
-          }}
-        >
-          {row.original.plan.enabled ? (
-            <>
-              <PowerOff className='mr-2 h-4 w-4' />
-              {t('Disable')}
-            </>
-          ) : (
-            <>
-              <Power className='mr-2 h-4 w-4' />
-              {t('Enable')}
-            </>
-          )}
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+          <MoreHorizontal className='h-4 w-4' />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align='end'>
+          <DropdownMenuItem
+            onClick={() => {
+              setCurrentRow(row.original)
+              setOpen('update')
+            }}
+          >
+            <Pencil className='mr-2 h-4 w-4' />
+            {t('Edit')}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={() => {
+              setCurrentRow(row.original)
+              setOpen('toggle-status')
+            }}
+          >
+            {row.original.plan.enabled ? (
+              <>
+                <PowerOff className='mr-2 h-4 w-4' />
+                {t('Disable')}
+              </>
+            ) : (
+              <>
+                <Power className='mr-2 h-4 w-4' />
+                {t('Enable')}
+              </>
+            )}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
   )
 }

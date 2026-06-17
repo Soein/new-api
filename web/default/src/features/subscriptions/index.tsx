@@ -30,7 +30,7 @@ function SubscriptionsContent() {
 
   return (
     <>
-      <SectionPageLayout>
+      <SectionPageLayout fixedContent>
         <SectionPageLayout.Title>
           {t('Subscription Management')}
         </SectionPageLayout.Title>
@@ -48,7 +48,11 @@ function SubscriptionsContent() {
           </div>
         </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
-          <SubscriptionsTable />
+          <div className='flex h-full min-h-0 flex-col gap-4'>
+            <div className='min-h-0 flex-1'>
+              <SubscriptionsTable />
+            </div>
+          </div>
         </SectionPageLayout.Content>
       </SectionPageLayout>
 

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -177,40 +178,42 @@ func TestFrtBreakerHalfOpenWindowExpiredFallsBackToNormal(t *testing.T) {
 	assert.Len(t, frtBreakerStrikeTs[1], 1, "应转入常规连击计数")
 }
 
+// createFrtTestChannel 在测试库里造一个自动禁用渠道，禁用原因与时间写入 other_info，
+// 测试结束自动删除。
+func createFrtTestChannel(t *testing.T, id int, reason string, statusTime int64) {
+	t.Helper()
+	channel := &model.Channel{
+		Id:        id,
+		Name:      fmt.Sprintf("frt-test-channel-%d", id),
+		Key:       "sk-test",
+		Status:    common.ChannelStatusAutoDisabled,
+		OtherInfo: fmt.Sprintf(`{"status_reason":%q,"status_time":%d}`, reason, statusTime),
+	}
+	require.NoError(t, model.DB.Create(channel).Error)
+	t.Cleanup(func() {
+		model.DB.Delete(&model.Channel{}, id)
+	})
+}
+
 func TestFrtBreakerHalfOpenSweepEnablesFrtDisabledChannel(t *testing.T) {
 	setupFrtBreaker(t, true, 15, 3, 300, 600)
 
-	channel := &model.Channel{
-		Id:        9101,
-		Name:      "frt-half-open-target",
-		Key:       "sk-test",
-		Status:    common.ChannelStatusAutoDisabled,
-		OtherInfo: `{"status_reason":"` + frtBreakerReasonPrefix + `：300s 内 3 次首字超过 15s"}`,
-	}
-	require.NoError(t, model.DB.Create(channel).Error)
-	frtBreakerLastTrip[9101] = time.Now().Unix() - 601
+	// 只有数据库状态、没有任何内存记录 —— 等价于节点重启后的场景
+	createFrtTestChannel(t, 9101, frtBreakerReasonPrefix+"：300s 内 3 次首字超过 15s", time.Now().Unix()-601)
 
 	now := time.Now().Unix()
 	frtBreakerHalfOpenSweep(now)
 
 	got, err := model.GetChannelById(9101, false)
 	require.NoError(t, err)
-	assert.Equal(t, common.ChannelStatusEnabled, got.Status, "冷却期满应半开启用")
+	assert.Equal(t, common.ChannelStatusEnabled, got.Status, "冷却期满应半开启用（不依赖内存记录）")
 	assert.Equal(t, now+int64(frtBreakerHalfOpenWindowSec), frtBreakerHalfOpenUntil[9101])
 }
 
 func TestFrtBreakerHalfOpenSweepSkipsForeignDisableReason(t *testing.T) {
 	setupFrtBreaker(t, true, 15, 3, 300, 600)
 
-	channel := &model.Channel{
-		Id:        9102,
-		Name:      "error-disabled-target",
-		Key:       "sk-test",
-		Status:    common.ChannelStatusAutoDisabled,
-		OtherInfo: `{"status_reason":"error: invalid api key"}`,
-	}
-	require.NoError(t, model.DB.Create(channel).Error)
-	frtBreakerLastTrip[9102] = time.Now().Unix() - 601
+	createFrtTestChannel(t, 9102, "error: invalid api key", time.Now().Unix()-601)
 
 	frtBreakerHalfOpenSweep(time.Now().Unix())
 
@@ -218,26 +221,39 @@ func TestFrtBreakerHalfOpenSweepSkipsForeignDisableReason(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, got.Status, "非 FRT 禁用的渠道不应被半开接管")
 	assert.NotContains(t, frtBreakerHalfOpenUntil, 9102)
-	assert.NotContains(t, frtBreakerLastTrip, 9102, "交还常规路径后应清理冷却记录")
 }
 
 func TestFrtBreakerHalfOpenSweepRespectsCooldown(t *testing.T) {
 	setupFrtBreaker(t, true, 15, 3, 300, 600)
 
-	channel := &model.Channel{
-		Id:        9103,
-		Name:      "cooling-target",
-		Key:       "sk-test",
-		Status:    common.ChannelStatusAutoDisabled,
-		OtherInfo: `{"status_reason":"` + frtBreakerReasonPrefix + `：test"}`,
-	}
-	require.NoError(t, model.DB.Create(channel).Error)
-	frtBreakerLastTrip[9103] = time.Now().Unix() - 10
+	createFrtTestChannel(t, 9103, frtBreakerReasonPrefix+"：test", time.Now().Unix()-10)
 
 	frtBreakerHalfOpenSweep(time.Now().Unix())
 
 	got, err := model.GetChannelById(9103, false)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, got.Status, "冷却期内不应启用")
-	assert.Contains(t, frtBreakerLastTrip, 9103)
+	assert.NotContains(t, frtBreakerHalfOpenUntil, 9103)
+}
+
+func TestFrtBreakerHalfOpenSweepSkipsMissingStatusTime(t *testing.T) {
+	setupFrtBreaker(t, true, 15, 3, 300, 600)
+
+	channel := &model.Channel{
+		Id:        9104,
+		Name:      "frt-test-channel-9104",
+		Key:       "sk-test",
+		Status:    common.ChannelStatusAutoDisabled,
+		OtherInfo: fmt.Sprintf(`{"status_reason":%q}`, frtBreakerReasonPrefix+"：test"),
+	}
+	require.NoError(t, model.DB.Create(channel).Error)
+	t.Cleanup(func() {
+		model.DB.Delete(&model.Channel{}, 9104)
+	})
+
+	frtBreakerHalfOpenSweep(time.Now().Unix())
+
+	got, err := model.GetChannelById(9104, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, got.Status, "缺失 status_time 应保守跳过")
 }

@@ -423,6 +423,14 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 	return channel, nil
 }
 
+// GetAutoDisabledChannels 返回所有处于自动禁用状态的渠道（不含 key），
+// 供 FRT 熔断半开扫描等自动恢复机制筛选候选。
+func GetAutoDisabledChannels() ([]*Channel, error) {
+	var channels []*Channel
+	err := DB.Omit("key").Where("status = ?", common.ChannelStatusAutoDisabled).Find(&channels).Error
+	return channels, err
+}
+
 func BatchInsertChannels(channels []Channel) error {
 	if len(channels) == 0 {
 		return nil

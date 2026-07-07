@@ -13,6 +13,8 @@ type ChannelSettings struct {
 	PassThroughBodyEnabled bool   `json:"pass_through_body_enabled,omitempty"`
 	SystemPrompt           string `json:"system_prompt,omitempty"`
 	SystemPromptOverride   bool   `json:"system_prompt_override,omitempty"`
+	// 渠道级响应时间/首字禁用阈值（秒）。>0 覆盖全局阈值（定时测试与生产 FRT 熔断共用），0 使用全局值
+	ResponseTimeThresholdSec float64 `json:"response_time_threshold_sec,omitempty"`
 }
 
 type VertexKeyType string

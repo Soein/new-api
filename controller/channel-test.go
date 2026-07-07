@@ -165,6 +165,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 	cache.WriteContext(c)
 	c.Set("id", testUserID)
+	c.Set("channel_test", true)
 
 	//c.Request.Header.Set("Authorization", "Bearer "+channel.Key)
 	c.Request.Header.Set("Content-Type", "application/json")
@@ -940,10 +941,14 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 			shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
 		}
 
-		// 当错误检查通过，才检查响应时间
+		// 当错误检查通过，才检查响应时间（渠道额外设置 response_time_threshold_sec 可覆盖全局阈值）
 		if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
-			if milliseconds > disableThreshold {
-				err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
+			chDisableThreshold := disableThreshold
+			if s := channel.GetSetting(); s.ResponseTimeThresholdSec > 0 {
+				chDisableThreshold = int64(s.ResponseTimeThresholdSec * 1000)
+			}
+			if milliseconds > chDisableThreshold {
+				err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(chDisableThreshold)/1000.0)
 				newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
 				shouldBanChannel = true
 			}

@@ -78,7 +78,14 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	other["cache_ratio"] = cacheRatio
 	other["model_price"] = modelPrice
 	other["user_group_ratio"] = userGroupRatio
-	other["frt"] = float64(relayInfo.FirstResponseTime.UnixMilli() - relayInfo.StartTime.UnixMilli())
+	frtMs := relayInfo.FirstResponseTime.UnixMilli() - relayInfo.StartTime.UnixMilli()
+	other["frt"] = float64(frtMs)
+	// 生产流量 FRT 熔断打点（渠道测试请求跳过，见 FRT_BREAKER_ENABLED）
+	if ctx != nil && !ctx.GetBool("channel_test") {
+		FrtBreakerStrike(relayInfo.ChannelId, relayInfo.ChannelType, frtMs,
+			relayInfo.ChannelSetting.ResponseTimeThresholdSec,
+			common.GetContextKeyBool(ctx, constant.ContextKeyChannelAutoBan))
+	}
 	if relayInfo.ReasoningEffort != "" {
 		other["reasoning_effort"] = relayInfo.ReasoningEffort
 	}

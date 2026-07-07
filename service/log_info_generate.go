@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -80,8 +81,12 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	other["user_group_ratio"] = userGroupRatio
 	frtMs := relayInfo.FirstResponseTime.UnixMilli() - relayInfo.StartTime.UnixMilli()
 	other["frt"] = float64(frtMs)
-	// 生产流量 FRT 熔断打点（渠道测试请求跳过，见 FRT_BREAKER_ENABLED）
-	if ctx != nil && !ctx.GetBool("channel_test") {
+	// 生产流量 FRT 熔断打点（渠道测试请求跳过，见 FRT_BREAKER_ENABLED）。
+	// 图片生成/编辑豁免：其流式响应在整图生成完成后才记首字时间（relay_image.go），
+	// 该时长常态超过阈值，打点会误禁健康渠道
+	isImageRelay := relayInfo.RelayMode == relayconstant.RelayModeImagesGenerations ||
+		relayInfo.RelayMode == relayconstant.RelayModeImagesEdits
+	if ctx != nil && !ctx.GetBool("channel_test") && !isImageRelay {
 		FrtBreakerStrike(relayInfo.ChannelId, relayInfo.ChannelType, frtMs,
 			relayInfo.ChannelSetting.ResponseTimeThresholdSec,
 			common.GetContextKeyBool(ctx, constant.ContextKeyChannelAutoBan))

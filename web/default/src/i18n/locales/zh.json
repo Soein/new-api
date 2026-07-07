@@ -5122,7 +5122,6 @@
     "The token has no group, so it is billed as the user group vip, using the base ratio of vip.": "令牌未设置分组，因此按用户分组 vip 计费，使用 vip 的基础倍率。",
     "The two roles of a group": "分组的两种角色",
     "There is a rule for vip billed as premium → use its ratio 0.3": "存在「vip 按 premium 计费」的规则 → 用规则里的 0.3",
-    "This historical record predates audit-info tracking and cannot be backfilled. The current instance already records server IP, callback IP, payment method, and system version for new top-ups going forward.": "该条历史记录缺少审计字段。当前版本已支持记录服务器 IP、回调 IP、支付方式与系统版本等审计信息；这些字段仅会写入后续新产生的记录，历史记录无法自动补齐。",
     "Three calls made by the same user, whose user group is vip:": "同一个用户（用户分组为 vip）发起的三次调用：",
     "Three calls made by the same vip user. Assume the base price of one call is 10.": "同一个 vip 用户发起三次调用，假设模型单次调用基础价格为 10：",
     "Three groups; the override matrix has exactly one cell filled in (highlighted).": "三个分组；覆盖矩阵只填了一个格子（高亮显示）。",
@@ -5133,6 +5132,8 @@
     "Users of vip, when billed as premium, pay ratio": "vip 分组的用户，按 premium 计费时，倍率用",
     "Visible": "可见",
     "When billed as {{group}}": "按 {{group}} 计费时",
-    "Worked example": "完整示例"
+    "Worked example": "完整示例",
+    "Response Time Threshold (seconds)": "响应时间阈值（秒）",
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "覆盖定时测试响应时间与生产首字熔断的全局阈值，0 表示使用全局设置"
   }
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/bytedance/gopkg/util/gopool"
 )
 
 // 生产流量首字（FRT）熔断器：
@@ -19,6 +20,7 @@ import (
 //   - 必须连击（默认 5 分钟内 3 次）才触发，单条冷缓存大 prompt 的合法慢请求不会误伤
 //   - 尊重渠道级 auto_ban 开关：关闭时只告警不禁用
 //   - frt < 0 为非流式哨兵值，跳过
+//   - 图片生成/编辑请求不打点（整图生成时长 ≠ 首字，见 GenerateTextOtherInfo 调用处）
 //   - 计数为节点内存级（各节点独立计数），多节点下最先达到连击数的节点执行禁用
 var (
 	frtBreakerEnabled      = common.GetEnvOrDefaultBool("FRT_BREAKER_ENABLED", false)
@@ -31,6 +33,13 @@ var (
 	frtBreakerStrikeTs = make(map[int][]int64)
 	frtBreakerLastTrip = make(map[int]int64)
 )
+
+func init() {
+	// 连击数下限 1：0 或负数会退化成单次超阈即熔断
+	if frtBreakerStrikes < 1 {
+		frtBreakerStrikes = 1
+	}
+}
 
 // FrtBreakerStrike 在每条真实请求完成、frt 已知时调用（渠道测试流量不应调用）。
 func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresholdSec float64, autoBan bool) {
@@ -84,5 +93,5 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 	})
 }
 
-// gopoolGo 与 processChannelError 的异步禁用保持同款语义，抽出便于测试替换。
-var gopoolGo = func(f func()) { go f() }
+// gopoolGo 与 processChannelError 的异步禁用保持同款语义（gopool.Go），抽出便于测试替换。
+var gopoolGo = func(f func()) { gopool.Go(f) }

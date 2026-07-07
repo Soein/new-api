@@ -280,6 +280,7 @@ const SENSITIVE_FORM_FIELDS = [
   'pass_through_body_enabled',
   'system_prompt',
   'system_prompt_override',
+  'response_time_threshold_sec',
   'allow_service_tier',
   'disable_store',
   'allow_safety_identifier',
@@ -332,6 +333,7 @@ function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
     values.thinking_to_content ||
     values.pass_through_body_enabled ||
     values.system_prompt_override ||
+    values.response_time_threshold_sec ||
     values.claude_beta_query ||
     values.upstream_model_update_check_enabled ||
     values.upstream_model_update_auto_sync_enabled ||
@@ -4100,6 +4102,35 @@ export function ChannelMutateDrawer({
                                       onCheckedChange={field.onChange}
                                     />
                                   </FormControl>
+                                </FormItem>
+                              )}
+                            />
+
+                            <FormField
+                              control={form.control}
+                              name='response_time_threshold_sec'
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel>
+                                    {t('Response Time Threshold (seconds)')}
+                                  </FormLabel>
+                                  <FormControl>
+                                    <Input
+                                      type='number'
+                                      min={0}
+                                      placeholder='0'
+                                      {...field}
+                                      onChange={(e) =>
+                                        field.onChange(Number(e.target.value))
+                                      }
+                                    />
+                                  </FormControl>
+                                  <FormDescription>
+                                    {t(
+                                      'Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting'
+                                    )}
+                                  </FormDescription>
+                                  <FormMessage />
                                 </FormItem>
                               )}
                             />

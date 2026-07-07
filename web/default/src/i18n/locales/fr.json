@@ -5122,7 +5122,6 @@
     "The token has no group, so it is billed as the user group vip, using the base ratio of vip.": "Le jeton n’a pas de groupe, il est donc facturé sous le groupe d’utilisateurs vip, avec le taux de base de vip.",
     "The two roles of a group": "Les deux rôles d’un groupe",
     "There is a rule for vip billed as premium → use its ratio 0.3": "Il existe une règle pour vip facturé sous premium → son taux 0,3 s’applique",
-    "This historical record predates audit-info tracking and cannot be backfilled. The current instance already records server IP, callback IP, payment method, and system version for new top-ups going forward.": "Cet enregistrement historique date d'avant le suivi des informations d'audit et ne peut pas être complété rétroactivement. La version actuelle enregistre déjà l'IP du serveur, l'IP de rappel, le mode de paiement et la version du système pour les nouveaux paiements à venir.",
     "Three calls made by the same user, whose user group is vip:": "Trois appels du même utilisateur, dont le groupe est vip :",
     "Three calls made by the same vip user. Assume the base price of one call is 10.": "Trois appels du même utilisateur vip. Supposons que le prix de base d’un appel est 10.",
     "Three groups; the override matrix has exactly one cell filled in (highlighted).": "Trois groupes ; la matrice de remplacement n’a qu’une seule cellule remplie (surlignée).",
@@ -5133,6 +5132,8 @@
     "Users of vip, when billed as premium, pay ratio": "Les utilisateurs de vip, facturés sous premium, paient le taux",
     "Visible": "Visible",
     "When billed as {{group}}": "Facturé sous {{group}}",
-    "Worked example": "Exemple détaillé"
+    "Worked example": "Exemple détaillé",
+    "Response Time Threshold (seconds)": "Seuil de temps de réponse (secondes)",
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Remplace le seuil global du temps de réponse des tests planifiés et du disjoncteur de premier jeton en production, 0 signifie utiliser le paramètre global"
   }
 }

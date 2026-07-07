@@ -5122,7 +5122,6 @@
     "The token has no group, so it is billed as the user group vip, using the base ratio of vip.": "トークンにグループがないため、ユーザーグループ vip として課金され、vip の基本倍率が使われます。",
     "The two roles of a group": "グループの2つの役割",
     "There is a rule for vip billed as premium → use its ratio 0.3": "「vip が premium として課金」のルールあり → ルールの 0.3 を使用",
-    "This historical record predates audit-info tracking and cannot be backfilled. The current instance already records server IP, callback IP, payment method, and system version for new top-ups going forward.": "このレコードは監査情報の記録に対応する前の履歴データのため、監査情報がありません。現在のバージョンではサーバーIP、コールバックIP、支払い方法、システムバージョンなどの監査情報を記録できますが、これらは今後新しく作成されるレコードにのみ適用され、過去のレコードを遡って補完することはできません。",
     "Three calls made by the same user, whose user group is vip:": "同じユーザー（ユーザーグループは vip）による3回の呼び出し：",
     "Three calls made by the same vip user. Assume the base price of one call is 10.": "同じ vip ユーザーによる3回の呼び出し。1回の基本価格を 10 とします：",
     "Three groups; the override matrix has exactly one cell filled in (highlighted).": "3つのグループ。上書きマトリクスには1つのセルだけ値が入っています（ハイライト表示）。",
@@ -5133,6 +5132,8 @@
     "Users of vip, when billed as premium, pay ratio": "vip グループのユーザーが premium として課金されるときの倍率は",
     "Visible": "表示",
     "When billed as {{group}}": "{{group}} として課金時",
-    "Worked example": "具体例"
+    "Worked example": "具体例",
+    "Response Time Threshold (seconds)": "応答時間しきい値（秒）",
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "定期テストの応答時間と本番の初回トークン遮断器の全体しきい値を上書きします。0 は全体設定を使用します"
   }
 }

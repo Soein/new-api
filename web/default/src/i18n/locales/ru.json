@@ -5122,7 +5122,6 @@
     "The token has no group, so it is billed as the user group vip, using the base ratio of vip.": "У токена нет группы, поэтому вызов тарифицируется по группе пользователя vip с базовым коэффициентом vip.",
     "The two roles of a group": "Две роли группы",
     "There is a rule for vip billed as premium → use its ratio 0.3": "Есть правило «vip по premium» → используется его коэффициент 0,3",
-    "This historical record predates audit-info tracking and cannot be backfilled. The current instance already records server IP, callback IP, payment method, and system version for new top-ups going forward.": "Эта историческая запись была создана до появления функции аудита и не содержит данных аудита. Текущая версия уже поддерживает запись IP-адреса сервера, IP обратного вызова, способа оплаты и версии системы, но эти поля будут заполняться только в новых записях — восполнить их в старых записях задним числом невозможно.",
     "Three calls made by the same user, whose user group is vip:": "Три вызова одного пользователя с группой vip:",
     "Three calls made by the same vip user. Assume the base price of one call is 10.": "Три вызова одного пользователя vip. Пусть базовая цена одного вызова равна 10.",
     "Three groups; the override matrix has exactly one cell filled in (highlighted).": "Три группы; в матрице переопределений заполнена ровно одна ячейка (выделена).",
@@ -5133,6 +5132,8 @@
     "Users of vip, when billed as premium, pay ratio": "Пользователи vip при тарификации по premium платят коэффициент",
     "Visible": "Видима",
     "When billed as {{group}}": "При тарификации по {{group}}",
-    "Worked example": "Разобранный пример"
+    "Worked example": "Разобранный пример",
+    "Response Time Threshold (seconds)": "Порог времени ответа (секунды)",
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Переопределяет глобальный порог времени ответа плановых тестов и продакшен-предохранителя первого токена, 0 — использовать глобальную настройку"
   }
 }

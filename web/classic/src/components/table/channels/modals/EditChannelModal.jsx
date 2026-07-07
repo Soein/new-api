@@ -532,8 +532,20 @@ const EditChannelModal = (props) => {
     // 同步更新inputs状态
     setInputs((prev) => ({ ...prev, [key]: value }));
 
-    // 生成setting JSON并更新
-    const newSettings = { ...channelSettings, [key]: value };
+    // 生成setting JSON并更新（先展开原 JSON，保留本表单未覆盖的字段，如 response_time_threshold_sec）
+    let originalSetting = {};
+    if (inputs.setting) {
+      try {
+        originalSetting = JSON.parse(inputs.setting);
+      } catch (error) {
+        console.error('解析渠道额外设置失败:', error);
+      }
+    }
+    const newSettings = {
+      ...originalSetting,
+      ...channelSettings,
+      [key]: value,
+    };
     const settingsJson = JSON.stringify(newSettings);
     handleInputChange('setting', settingsJson);
   };

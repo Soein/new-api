@@ -55,7 +55,11 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	} else {
 		convertedRequest, err := adaptor.ConvertImageRequest(c, info, *request)
 		if err != nil {
-			return types.NewError(err, types.ErrorCodeConvertRequestFailed)
+			// A ConvertImageRequest failure is a request-validation error
+			// (e.g. an out-of-range count/size field), not a server fault —
+			// surface it as a 400 per the project's billing-safety convention
+			// instead of NewError's default 500.
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithStatusCode(http.StatusBadRequest), types.ErrOptionWithSkipRetry())
 		}
 		relaycommon.AppendRequestConversionFromRequest(info, convertedRequest)
 

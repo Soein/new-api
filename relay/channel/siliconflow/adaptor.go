@@ -58,6 +58,12 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 			sfRequest.BatchSize = lo.FromPtr(request.N)
 		}
 	}
+	// BatchSize may come from request.Extra["batch_size"], bypassing the
+	// top-level n validation; enforce the same bound so we never generate
+	// (and get charged by the upstream for) more images than we bill.
+	if sfRequest.BatchSize > uint(dto.MaxImageN) {
+		return nil, fmt.Errorf("batch_size must be an integer between 1 and %d", dto.MaxImageN)
+	}
 
 	return sfRequest, nil
 }

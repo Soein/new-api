@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -250,7 +251,13 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if adjustedRatios := adaptor.AdjustBillingOnSubmit(info, taskData); len(adjustedRatios) > 0 {
 		// 基于调整后的 ratios 重新计算 quota
 		finalQuota = recalcQuotaFromRatios(info, adjustedRatios)
-		info.PriceData.OtherRatios = adjustedRatios
+		// Route through AddOtherRatio instead of overwriting the map
+		// directly, so a non-positive/NaN/+Inf ratio from the adaptor
+		// can't bypass the guard and poison future quota multiplications.
+		info.PriceData.OtherRatios = nil
+		for k, v := range adjustedRatios {
+			info.PriceData.AddOtherRatio(k, v)
+		}
 		info.PriceData.Quota = finalQuota
 	}
 
@@ -276,7 +283,10 @@ func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float6
 	// 应用新的 ratios
 	result := baseQuota
 	for _, ra := range ratios {
-		if ra != 1.0 {
+		// Mirror AddOtherRatio's guard: a non-positive or +Inf ratio here
+		// (adaptor bug or untrusted upstream value) must not poison the
+		// quota product with a negative or runaway result.
+		if ra != 1.0 && ra > 0 && !math.IsInf(ra, 1) {
 			result *= ra
 		}
 	}

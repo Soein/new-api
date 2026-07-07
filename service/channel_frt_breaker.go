@@ -2,17 +2,25 @@ package service
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/bytedance/gopkg/util/gopool"
 )
 
 // 生产流量首字（FRT）熔断器：
-// 真实请求的首字时间超过阈值记一次违规，滑动窗口内连击达到次数则自动禁用渠道，
-// 恢复依赖既有的定时测试自动启用机制（半开探测）。
+// 真实请求的首字时间超过阈值记一次违规，滑动窗口内连击达到次数则自动禁用渠道。
+//
+// 恢复有两条路径，可共存：
+//   - 定时测试自动启用（合成测试请求，见 performChannelTests）
+//   - 半开探测（FRT_BREAKER_HALF_OPEN_ENABLED=true）：禁用冷却期满后自动重新启用，
+//     放行真实用户流量试探；半开观察窗内首字超阈达到 FRT_BREAKER_HALF_OPEN_STRIKES
+//     （默认 1，即一超阈立即）就重新禁用，窗口内无违规则转回常规连击模式
 //
 // 设计要点：
 //   - 默认关闭，FRT_BREAKER_ENABLED=true 开启，对存量部署零影响
@@ -21,7 +29,9 @@ import (
 //   - 尊重渠道级 auto_ban 开关：关闭时只告警不禁用
 //   - frt < 0 为非流式哨兵值，跳过
 //   - 图片生成/编辑请求不打点（整图生成时长 ≠ 首字，见 GenerateTextOtherInfo 调用处）
-//   - 计数为节点内存级（各节点独立计数），多节点下最先达到连击数的节点执行禁用
+//   - 计数与半开状态为节点内存级，多节点下由触发禁用的节点负责半开恢复；
+//     其他节点对半开渠道按常规连击计数
+//   - 半开只接管「禁因是 FRT 熔断」的渠道，错误关键词禁用、手动禁用一概不碰
 var (
 	frtBreakerEnabled      = common.GetEnvOrDefaultBool("FRT_BREAKER_ENABLED", false)
 	frtBreakerThresholdSec = common.GetEnvOrDefault("FRT_BREAKER_THRESHOLD_SEC", 15)
@@ -29,15 +39,37 @@ var (
 	frtBreakerWindowSec    = common.GetEnvOrDefault("FRT_BREAKER_WINDOW_SEC", 300)
 	frtBreakerCooldownSec  = common.GetEnvOrDefault("FRT_BREAKER_COOLDOWN_SEC", 600)
 
-	frtBreakerMu       sync.Mutex
-	frtBreakerStrikeTs = make(map[int][]int64)
-	frtBreakerLastTrip = make(map[int]int64)
+	frtBreakerHalfOpenEnabled   = common.GetEnvOrDefaultBool("FRT_BREAKER_HALF_OPEN_ENABLED", false)
+	frtBreakerHalfOpenWindowSec = common.GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_WINDOW_SEC", 300)
+	frtBreakerHalfOpenStrikes   = common.GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_STRIKES", 1)
+	frtBreakerHalfOpenSweepSec  = common.GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_SWEEP_SEC", 30)
+
+	frtBreakerMu            sync.Mutex
+	frtBreakerStrikeTs      = make(map[int][]int64)
+	frtBreakerLastTrip      = make(map[int]int64)
+	frtBreakerHalfOpenUntil = make(map[int]int64)
+	frtBreakerHalfOpenHits  = make(map[int]int)
+)
+
+// 禁用原因前缀，半开扫描据此识别「归本熔断器管」的渠道
+const (
+	frtBreakerReasonPrefix         = "生产流量首字熔断"
+	frtBreakerHalfOpenReasonPrefix = "半开探测失败"
 )
 
 func init() {
 	// 连击数下限 1：0 或负数会退化成单次超阈即熔断
 	if frtBreakerStrikes < 1 {
 		frtBreakerStrikes = 1
+	}
+	if frtBreakerHalfOpenStrikes < 1 {
+		frtBreakerHalfOpenStrikes = 1
+	}
+	if frtBreakerHalfOpenSweepSec < 5 {
+		frtBreakerHalfOpenSweepSec = 5
+	}
+	if frtBreakerEnabled && frtBreakerHalfOpenEnabled {
+		go frtBreakerHalfOpenLoop()
 	}
 }
 
@@ -58,7 +90,24 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 	frtBreakerMu.Lock()
 	defer frtBreakerMu.Unlock()
 
-	// 冷却期内不重复触发，等定时测试的自动启用来做半开恢复
+	// 半开观察窗：渠道刚被真实流量探测性启用，违规按半开连击数（默认 1，一超阈立即）重新禁用
+	if until, halfOpen := frtBreakerHalfOpenUntil[channelId]; halfOpen {
+		if now >= until {
+			// 观察窗已过且无违规，转正回常规连击模式
+			delete(frtBreakerHalfOpenUntil, channelId)
+			delete(frtBreakerHalfOpenHits, channelId)
+		} else {
+			frtBreakerHalfOpenHits[channelId]++
+			if frtBreakerHalfOpenHits[channelId] < frtBreakerHalfOpenStrikes {
+				return
+			}
+			reason := fmt.Sprintf("%s：半开观察期内首字 %.1fs 超过 %.0fs", frtBreakerHalfOpenReasonPrefix, float64(frtMs)/1000.0, thresholdSec)
+			tripFrtBreakerLocked(channelId, channelType, now, reason, autoBan)
+			return
+		}
+	}
+
+	// 冷却期内不重复触发，等定时测试自动启用或半开探测来做恢复
 	if now-frtBreakerLastTrip[channelId] < int64(frtBreakerCooldownSec) {
 		return
 	}
@@ -77,10 +126,18 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 		return
 	}
 
+	reason := fmt.Sprintf("%s：%ds 内 %d 次首字超过 %.0fs（最近一次 %.1fs）",
+		frtBreakerReasonPrefix, frtBreakerWindowSec, frtBreakerStrikes, thresholdSec, float64(frtMs)/1000.0)
+	tripFrtBreakerLocked(channelId, channelType, now, reason, autoBan)
+}
+
+// tripFrtBreakerLocked 执行一次熔断触发：清计数、记冷却起点、按 auto_ban 禁用或仅告警。
+// 调用方必须持有 frtBreakerMu。
+func tripFrtBreakerLocked(channelId int, channelType int, now int64, reason string, autoBan bool) {
 	frtBreakerStrikeTs[channelId] = nil
 	frtBreakerLastTrip[channelId] = now
-	reason := fmt.Sprintf("生产流量首字熔断：%ds 内 %d 次首字超过 %.0fs（最近一次 %.1fs）",
-		frtBreakerWindowSec, frtBreakerStrikes, thresholdSec, float64(frtMs)/1000.0)
+	delete(frtBreakerHalfOpenUntil, channelId)
+	delete(frtBreakerHalfOpenHits, channelId)
 
 	if !autoBan {
 		common.SysLog(fmt.Sprintf("FRT熔断告警（渠道 #%d auto_ban 已关，仅告警不禁用）：%s", channelId, reason))
@@ -95,3 +152,68 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 
 // gopoolGo 与 processChannelError 的异步禁用保持同款语义（gopool.Go），抽出便于测试替换。
 var gopoolGo = func(f func()) { gopool.Go(f) }
+
+// frtBreakerHalfOpenLoop 周期扫描被本节点 FRT 禁用且冷却期满的渠道，
+// 重新启用进入半开观察窗，用真实用户流量探测恢复。
+func frtBreakerHalfOpenLoop() {
+	ticker := time.NewTicker(time.Duration(frtBreakerHalfOpenSweepSec) * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		frtBreakerHalfOpenSweep(time.Now().Unix())
+	}
+}
+
+// frtBreakerHalfOpenSweep 执行单轮半开扫描，抽出便于测试。
+func frtBreakerHalfOpenSweep(now int64) {
+	frtBreakerMu.Lock()
+	// 清理已过期的半开观察窗（有流量时 FrtBreakerStrike 会顺路清，这里兜底无流量渠道）
+	for id, until := range frtBreakerHalfOpenUntil {
+		if now >= until {
+			delete(frtBreakerHalfOpenUntil, id)
+			delete(frtBreakerHalfOpenHits, id)
+		}
+	}
+	candidates := make([]int, 0)
+	for id, trip := range frtBreakerLastTrip {
+		if _, halfOpen := frtBreakerHalfOpenUntil[id]; halfOpen {
+			continue
+		}
+		if now-trip >= int64(frtBreakerCooldownSec) {
+			candidates = append(candidates, id)
+		}
+	}
+	frtBreakerMu.Unlock()
+
+	for _, id := range candidates {
+		channel, err := model.GetChannelById(id, false)
+		if err != nil || channel.Status != common.ChannelStatusAutoDisabled || !isFrtBreakerDisableReason(channel) {
+			// 渠道已被其他机制接管（手动处理/定时测试已恢复/因错误另行禁用），交还常规路径
+			frtBreakerMu.Lock()
+			delete(frtBreakerLastTrip, id)
+			frtBreakerMu.Unlock()
+			continue
+		}
+		if !model.UpdateChannelStatus(id, "", common.ChannelStatusEnabled, "") {
+			continue
+		}
+		frtBreakerMu.Lock()
+		frtBreakerHalfOpenUntil[id] = now + int64(frtBreakerHalfOpenWindowSec)
+		delete(frtBreakerHalfOpenHits, id)
+		frtBreakerMu.Unlock()
+
+		msg := fmt.Sprintf("通道「%s」（#%d）熔断冷却期满，已半开启用，%ds 内用真实流量探测首字", channel.Name, id, frtBreakerHalfOpenWindowSec)
+		common.SysLog(msg)
+		channelId, channelName := id, channel.Name
+		gopoolGo(func() {
+			NotifyRootUser(fmt.Sprintf("%s_%d_half_open", dto.NotifyTypeChannelUpdate, channelId),
+				fmt.Sprintf("通道「%s」（#%d）已半开启用", channelName, channelId), msg)
+		})
+	}
+}
+
+// isFrtBreakerDisableReason 判断渠道当前禁用原因是否出自本熔断器；
+// 错误关键词禁用、手动禁用等其他来源的渠道半开探测一概不接管。
+func isFrtBreakerDisableReason(channel *model.Channel) bool {
+	reason, _ := channel.GetOtherInfo()["status_reason"].(string)
+	return strings.HasPrefix(reason, frtBreakerReasonPrefix) || strings.HasPrefix(reason, frtBreakerHalfOpenReasonPrefix)
+}

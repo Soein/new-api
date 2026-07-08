@@ -16,30 +16,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { api } from '@/lib/api'
 
-import type {
-  SystemInstanceDeleteResponse,
-  SystemInstanceListResponse,
-} from './types'
-
-export async function listSystemInstances() {
-  const res = await api.get<SystemInstanceListResponse>(
-    '/api/system-info/instances'
-  )
-  return res.data
+export function resolveOAuthSiteUrl(
+  serverAddress: string,
+  fallback: string
+): string {
+  const normalized = serverAddress.trim().replace(/\/+$/, '')
+  return normalized || fallback
 }
 
-export async function deleteStaleSystemInstances() {
-  const res = await api.delete<SystemInstanceDeleteResponse>(
-    '/api/system-info/stale-instances'
-  )
-  return res.data
-}
-
-export async function deleteStaleSystemInstance(nodeName: string) {
-  const res = await api.delete<SystemInstanceDeleteResponse>(
-    `/api/system-info/instances/${encodeURIComponent(nodeName)}`
-  )
-  return res.data
+export function buildOAuthCallbackUrl(
+  serverAddress: string,
+  callbackPath: string,
+  fallback: string
+): string {
+  const siteUrl = resolveOAuthSiteUrl(serverAddress, fallback)
+  return `${siteUrl}/oauth/${callbackPath.replace(/^\/+/, '')}`
 }

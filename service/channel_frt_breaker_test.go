@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 )
 
 // setupFrtBreaker 覆盖包级配置与状态，返回被调度的异步任务次数指针
-//（触发禁用与半开通知都经 gopoolGo）。gopoolGo 被替换为只计数不执行，避免测试触碰数据库。
+// （触发禁用与半开通知都经 gopoolGo）。gopoolGo 被替换为只计数不执行，避免测试触碰数据库。
 func setupFrtBreaker(t *testing.T, enabled bool, thresholdSec, strikes, windowSec, cooldownSec int) *int {
 	t.Helper()
 	origEnabled := frtBreakerEnabled
@@ -20,6 +21,7 @@ func setupFrtBreaker(t *testing.T, enabled bool, thresholdSec, strikes, windowSe
 	origStrikes := frtBreakerStrikes
 	origWindow := frtBreakerWindowSec
 	origCooldown := frtBreakerCooldownSec
+	origHalfOpenEnabled := frtBreakerHalfOpenEnabled
 	origHalfOpenWindow := frtBreakerHalfOpenWindowSec
 	origHalfOpenStrikes := frtBreakerHalfOpenStrikes
 	origGo := gopoolGo
@@ -29,6 +31,8 @@ func setupFrtBreaker(t *testing.T, enabled bool, thresholdSec, strikes, windowSe
 	frtBreakerStrikes = strikes
 	frtBreakerWindowSec = windowSec
 	frtBreakerCooldownSec = cooldownSec
+	frtBreakerHalfOpenEnabled = true
+	frtBreakerHalfOpenStrikes = 1
 	frtBreakerStrikeTs = make(map[int][]int64)
 	frtBreakerLastTrip = make(map[int]int64)
 	frtBreakerHalfOpenUntil = make(map[int]int64)
@@ -43,6 +47,7 @@ func setupFrtBreaker(t *testing.T, enabled bool, thresholdSec, strikes, windowSe
 		frtBreakerStrikes = origStrikes
 		frtBreakerWindowSec = origWindow
 		frtBreakerCooldownSec = origCooldown
+		frtBreakerHalfOpenEnabled = origHalfOpenEnabled
 		frtBreakerHalfOpenWindowSec = origHalfOpenWindow
 		frtBreakerHalfOpenStrikes = origHalfOpenStrikes
 		frtBreakerStrikeTs = make(map[int][]int64)
@@ -56,10 +61,10 @@ func setupFrtBreaker(t *testing.T, enabled bool, thresholdSec, strikes, windowSe
 
 func TestFrtBreakerStrikeSkipConditions(t *testing.T) {
 	tests := []struct {
-		name       string
-		enabled    bool
-		channelId  int
-		frtMs      int64
+		name        string
+		enabled     bool
+		channelId   int
+		frtMs       int64
 		chThreshold float64
 	}{
 		{name: "disabled by default", enabled: false, channelId: 1, frtMs: 60000},
@@ -195,6 +200,21 @@ func createFrtTestChannel(t *testing.T, id int, reason string, statusTime int64)
 	})
 }
 
+func createFrtEnabledHalfOpenChannel(t *testing.T, id int, statusTime int64) {
+	t.Helper()
+	channel := &model.Channel{
+		Id:        id,
+		Name:      fmt.Sprintf("frt-test-channel-%d", id),
+		Key:       "sk-test",
+		Status:    common.ChannelStatusEnabled,
+		OtherInfo: fmt.Sprintf(`{"status_reason":%q,"status_time":%d}`, frtBreakerHalfOpenActivePrefix+"：test", statusTime),
+	}
+	require.NoError(t, model.DB.Create(channel).Error)
+	t.Cleanup(func() {
+		model.DB.Delete(&model.Channel{}, id)
+	})
+}
+
 func TestFrtBreakerHalfOpenSweepEnablesFrtDisabledChannel(t *testing.T) {
 	setupFrtBreaker(t, true, 15, 3, 300, 600)
 
@@ -208,6 +228,10 @@ func TestFrtBreakerHalfOpenSweepEnablesFrtDisabledChannel(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusEnabled, got.Status, "冷却期满应半开启用（不依赖内存记录）")
 	assert.Equal(t, now+int64(frtBreakerHalfOpenWindowSec), frtBreakerHalfOpenUntil[9101])
+	info := got.GetOtherInfo()
+	reason, _ := info["status_reason"].(string)
+	assert.True(t, strings.HasPrefix(reason, frtBreakerHalfOpenActivePrefix), "半开状态应写入 DB，供其他节点识别")
+	assert.Equal(t, now, frtBreakerStatusTime(info))
 }
 
 func TestFrtBreakerHalfOpenSweepSkipsForeignDisableReason(t *testing.T) {
@@ -256,4 +280,48 @@ func TestFrtBreakerHalfOpenSweepSkipsMissingStatusTime(t *testing.T) {
 	got, err := model.GetChannelById(9104, false)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, got.Status, "缺失 status_time 应保守跳过")
+}
+
+func TestFrtBreakerHalfOpenStrikeLoadsDbMarkerAcrossNodes(t *testing.T) {
+	disables := setupFrtBreaker(t, true, 15, 3, 300, 600)
+
+	// 模拟节点 A 已半开启用并写入 DB，节点 B 没有本地半开内存但承接到慢请求。
+	createFrtEnabledHalfOpenChannel(t, 9105, time.Now().Unix())
+
+	FrtBreakerStrike(9105, 1, 20000, 0, true)
+
+	assert.Equal(t, 1, *disables, "其他节点应从 DB 识别半开状态并按半开规则重新禁用")
+	assert.NotContains(t, frtBreakerHalfOpenUntil, 9105)
+	assert.NotZero(t, frtBreakerLastTrip[9105])
+}
+
+func TestFrtBreakerHalfOpenStrikeClearsExpiredDbMarker(t *testing.T) {
+	disables := setupFrtBreaker(t, true, 15, 3, 300, 600)
+
+	expired := time.Now().Unix() - int64(frtBreakerHalfOpenWindowSec) - 1
+	createFrtEnabledHalfOpenChannel(t, 9106, expired)
+
+	FrtBreakerStrike(9106, 1, 20000, 0, true)
+
+	assert.Equal(t, 0, *disables, "过期半开标记不应按半开立即禁用")
+	assert.Len(t, frtBreakerStrikeTs[9106], 1, "过期后应回到常规连击计数")
+	got, err := model.GetChannelById(9106, false)
+	require.NoError(t, err)
+	info := got.GetOtherInfo()
+	assert.Empty(t, info["status_reason"], "过期半开标记应被清理")
+}
+
+func TestFrtBreakerHalfOpenSweepClearsExpiredEnabledMarker(t *testing.T) {
+	setupFrtBreaker(t, true, 15, 3, 300, 600)
+
+	now := time.Now().Unix()
+	createFrtEnabledHalfOpenChannel(t, 9107, now-int64(frtBreakerHalfOpenWindowSec)-1)
+
+	frtBreakerHalfOpenSweep(now)
+
+	got, err := model.GetChannelById(9107, false)
+	require.NoError(t, err)
+	info := got.GetOtherInfo()
+	assert.Empty(t, info["status_reason"], "无流量时也应由扫描清理过期半开标记")
+	assert.Equal(t, now, frtBreakerStatusTime(info))
 }

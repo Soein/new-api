@@ -29,9 +29,8 @@ import (
 //   - 尊重渠道级 auto_ban 开关：关闭时只告警不禁用
 //   - frt < 0 为非流式哨兵值，跳过
 //   - 图片生成/编辑请求不打点（整图生成时长 ≠ 首字，见 GenerateTextOtherInfo 调用处）
-//   - 连击计数与半开观察窗为节点内存级；半开扫描候选来自数据库（status_reason
-//     前缀 + status_time 冷却判定），节点重启或触发节点下线后任一开启半开的
-//     节点都能接手恢复，启用成功的节点持有观察窗，其他节点按常规连击计数
+//   - 连击计数为节点内存级；半开状态同时写入数据库 status_reason/status_time，
+//     集群内任一节点承接半开后的慢请求时都能识别半开并按半开规则重新禁用
 //   - 半开只接管「禁因是 FRT 熔断」的渠道，错误关键词禁用、手动禁用一概不碰
 var (
 	frtBreakerEnabled      = common.GetEnvOrDefaultBool("FRT_BREAKER_ENABLED", false)
@@ -56,6 +55,7 @@ var (
 const (
 	frtBreakerReasonPrefix         = "生产流量首字熔断"
 	frtBreakerHalfOpenReasonPrefix = "半开探测失败"
+	frtBreakerHalfOpenActivePrefix = "FRT半开探测中"
 )
 
 func init() {
@@ -88,25 +88,12 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 	}
 
 	now := time.Now().Unix()
+	if frtBreakerHandleHalfOpen(channelId, channelType, frtMs, thresholdSec, autoBan, now) {
+		return
+	}
+
 	frtBreakerMu.Lock()
 	defer frtBreakerMu.Unlock()
-
-	// 半开观察窗：渠道刚被真实流量探测性启用，违规按半开连击数（默认 1，一超阈立即）重新禁用
-	if until, halfOpen := frtBreakerHalfOpenUntil[channelId]; halfOpen {
-		if now >= until {
-			// 观察窗已过且无违规，转正回常规连击模式
-			delete(frtBreakerHalfOpenUntil, channelId)
-			delete(frtBreakerHalfOpenHits, channelId)
-		} else {
-			frtBreakerHalfOpenHits[channelId]++
-			if frtBreakerHalfOpenHits[channelId] < frtBreakerHalfOpenStrikes {
-				return
-			}
-			reason := fmt.Sprintf("%s：半开观察期内首字 %.1fs 超过 %.0fs", frtBreakerHalfOpenReasonPrefix, float64(frtMs)/1000.0, thresholdSec)
-			tripFrtBreakerLocked(channelId, channelType, now, reason, autoBan)
-			return
-		}
-	}
 
 	// 冷却期内不重复触发，等定时测试自动启用或半开探测来做恢复
 	if now-frtBreakerLastTrip[channelId] < int64(frtBreakerCooldownSec) {
@@ -130,6 +117,79 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 	reason := fmt.Sprintf("%s：%ds 内 %d 次首字超过 %.0fs（最近一次 %.1fs）",
 		frtBreakerReasonPrefix, frtBreakerWindowSec, frtBreakerStrikes, thresholdSec, float64(frtMs)/1000.0)
 	tripFrtBreakerLocked(channelId, channelType, now, reason, autoBan)
+}
+
+func frtBreakerHandleHalfOpen(channelId int, channelType int, frtMs int64, thresholdSec float64, autoBan bool, now int64) bool {
+	frtBreakerMu.Lock()
+	handled := frtBreakerHandleHalfOpenLocked(channelId, channelType, frtMs, thresholdSec, autoBan, now)
+	frtBreakerMu.Unlock()
+	if handled {
+		return true
+	}
+	if !frtBreakerHalfOpenEnabled || !frtBreakerLoadHalfOpenFromDB(channelId, now) {
+		return false
+	}
+	frtBreakerMu.Lock()
+	handled = frtBreakerHandleHalfOpenLocked(channelId, channelType, frtMs, thresholdSec, autoBan, now)
+	frtBreakerMu.Unlock()
+	return handled
+}
+
+// frtBreakerHandleHalfOpenLocked 处理本节点已知的半开观察窗。
+// 调用方必须持有 frtBreakerMu。
+func frtBreakerHandleHalfOpenLocked(channelId int, channelType int, frtMs int64, thresholdSec float64, autoBan bool, now int64) bool {
+	if until, halfOpen := frtBreakerHalfOpenUntil[channelId]; halfOpen {
+		if now >= until {
+			// 观察窗已过且无违规，转正回常规连击模式
+			delete(frtBreakerHalfOpenUntil, channelId)
+			delete(frtBreakerHalfOpenHits, channelId)
+			return false
+		} else {
+			frtBreakerHalfOpenHits[channelId]++
+			if frtBreakerHalfOpenHits[channelId] < frtBreakerHalfOpenStrikes {
+				return true
+			}
+			reason := fmt.Sprintf("%s：半开观察期内首字 %.1fs 超过 %.0fs", frtBreakerHalfOpenReasonPrefix, float64(frtMs)/1000.0, thresholdSec)
+			tripFrtBreakerLocked(channelId, channelType, now, reason, autoBan)
+			return true
+		}
+	}
+	return false
+}
+
+func frtBreakerLoadHalfOpenFromDB(channelId int, now int64) bool {
+	if model.DB == nil {
+		return false
+	}
+	channel, err := model.GetChannelById(channelId, false)
+	if err != nil || channel.Status != common.ChannelStatusEnabled {
+		return false
+	}
+	info := channel.GetOtherInfo()
+	reason, _ := info["status_reason"].(string)
+	if !strings.HasPrefix(reason, frtBreakerHalfOpenActivePrefix) {
+		return false
+	}
+	statusTime := frtBreakerStatusTime(info)
+	if statusTime <= 0 {
+		return false
+	}
+	until := statusTime + int64(frtBreakerHalfOpenWindowSec)
+	if now >= until {
+		frtBreakerClearHalfOpenMarker(channel, info, now)
+		return false
+	}
+	frtBreakerMu.Lock()
+	if now-frtBreakerLastTrip[channelId] < int64(frtBreakerCooldownSec) {
+		frtBreakerMu.Unlock()
+		return false
+	}
+	if oldUntil, ok := frtBreakerHalfOpenUntil[channelId]; !ok || oldUntil < until {
+		frtBreakerHalfOpenUntil[channelId] = until
+		delete(frtBreakerHalfOpenHits, channelId)
+	}
+	frtBreakerMu.Unlock()
+	return true
 }
 
 // tripFrtBreakerLocked 执行一次熔断触发：清计数、记冷却起点、按 auto_ban 禁用或仅告警。
@@ -167,8 +227,8 @@ func frtBreakerHalfOpenLoop() {
 // frtBreakerHalfOpenSweep 执行单轮半开扫描，抽出便于测试。
 // 候选来自数据库（自动禁用 + 禁因是 FRT 熔断 + 按 status_time 判定冷却期满），
 // 不依赖节点内存：节点重启后、或触发禁用的节点下线时，任一开启半开的节点都能恢复。
-// UpdateChannelStatus 幂等（已启用返回 false），多节点并发扫描只有一个节点
-// 启用成功并把渠道纳入自己的观察窗。
+// 半开启用使用 DB 快照条件更新，多节点并发扫描时只有一个节点能抢到恢复权；
+// 半开状态也写入 DB，其他节点承接慢请求时可按需加载并执行半开失败禁用。
 func frtBreakerHalfOpenSweep(now int64) {
 	if model.DB == nil {
 		return
@@ -182,6 +242,7 @@ func frtBreakerHalfOpenSweep(now int64) {
 		}
 	}
 	frtBreakerMu.Unlock()
+	frtBreakerCleanupExpiredHalfOpenMarkers(now)
 
 	channels, err := model.GetAutoDisabledChannels()
 	if err != nil {
@@ -192,21 +253,15 @@ func frtBreakerHalfOpenSweep(now int64) {
 		info := channel.GetOtherInfo()
 		reason, _ := info["status_reason"].(string)
 		// 只接管禁因出自本熔断器的渠道；错误关键词禁用、手动禁用等一概不碰
-		if !strings.HasPrefix(reason, frtBreakerReasonPrefix) && !strings.HasPrefix(reason, frtBreakerHalfOpenReasonPrefix) {
+		if !frtBreakerManagedDisableReason(reason) {
 			continue
 		}
-		// other_info 经 JSON round-trip 后数字为 float64；缺失时保守跳过
-		statusTime := int64(0)
-		switch v := info["status_time"].(type) {
-		case float64:
-			statusTime = int64(v)
-		case int64:
-			statusTime = v
-		}
+		statusTime := frtBreakerStatusTime(info)
 		if statusTime <= 0 || now-statusTime < int64(frtBreakerCooldownSec) {
 			continue
 		}
-		if !model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusEnabled, "") {
+		activeReason := fmt.Sprintf("%s：%ds 内用真实流量探测首字", frtBreakerHalfOpenActivePrefix, frtBreakerHalfOpenWindowSec)
+		if !model.UpdateChannelStatusFromSnapshot(channel, common.ChannelStatusAutoDisabled, common.ChannelStatusEnabled, activeReason, now) {
 			continue
 		}
 		frtBreakerMu.Lock()
@@ -221,5 +276,51 @@ func frtBreakerHalfOpenSweep(now int64) {
 			NotifyRootUser(fmt.Sprintf("%s_%d_half_open", dto.NotifyTypeChannelUpdate, channelId),
 				fmt.Sprintf("通道「%s」（#%d）已半开启用", channelName, channelId), msg)
 		})
+	}
+}
+
+func frtBreakerManagedDisableReason(reason string) bool {
+	return strings.HasPrefix(reason, frtBreakerReasonPrefix) || strings.HasPrefix(reason, frtBreakerHalfOpenReasonPrefix)
+}
+
+func frtBreakerStatusTime(info map[string]interface{}) int64 {
+	switch v := info["status_time"].(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	}
+	return 0
+}
+
+func frtBreakerClearHalfOpenMarker(channel *model.Channel, info map[string]interface{}, now int64) {
+	if channel == nil || info == nil {
+		return
+	}
+	info["status_reason"] = ""
+	info["status_time"] = now
+	model.UpdateChannelOtherInfoFromSnapshot(channel, common.ChannelStatusEnabled, info)
+}
+
+func frtBreakerCleanupExpiredHalfOpenMarkers(now int64) {
+	pattern := fmt.Sprintf("%%\"status_reason\":\"%s%%", frtBreakerHalfOpenActivePrefix)
+	channels, err := model.GetChannelsByStatusAndOtherInfoLike(common.ChannelStatusEnabled, pattern)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("FRT半开扫描查询半开渠道失败：%v", err))
+		return
+	}
+	for _, channel := range channels {
+		info := channel.GetOtherInfo()
+		reason, _ := info["status_reason"].(string)
+		if !strings.HasPrefix(reason, frtBreakerHalfOpenActivePrefix) {
+			continue
+		}
+		statusTime := frtBreakerStatusTime(info)
+		if statusTime <= 0 || now-statusTime < int64(frtBreakerHalfOpenWindowSec) {
+			continue
+		}
+		frtBreakerClearHalfOpenMarker(channel, info, now)
 	}
 }

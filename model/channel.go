@@ -431,6 +431,15 @@ func GetAutoDisabledChannels() ([]*Channel, error) {
 	return channels, err
 }
 
+// GetChannelsByStatusAndOtherInfoLike returns channels with a specific status
+// whose other_info text matches pattern. It is used by background maintenance
+// jobs that store operational markers in other_info.
+func GetChannelsByStatusAndOtherInfoLike(status int, pattern string) ([]*Channel, error) {
+	var channels []*Channel
+	err := DB.Omit("key").Where("status = ? AND other_info LIKE ?", status, pattern).Find(&channels).Error
+	return channels, err
+}
+
 func BatchInsertChannels(channels []Channel) error {
 	if len(channels) == 0 {
 		return nil
@@ -784,6 +793,67 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 		}
 	}
 	return true
+}
+
+// UpdateChannelStatusFromSnapshot changes a channel only when both status and
+// other_info still match the caller's snapshot. This gives background workers a
+// lightweight cross-node compare-and-swap without database-specific SQL.
+func UpdateChannelStatusFromSnapshot(channel *Channel, expectedStatus int, status int, reason string, statusTime int64) bool {
+	if channel == nil || channel.Id == 0 {
+		return false
+	}
+	if statusTime <= 0 {
+		statusTime = common.GetTimestamp()
+	}
+	info := channel.GetOtherInfo()
+	info["status_reason"] = reason
+	info["status_time"] = statusTime
+	otherInfoBytes, err := common.Marshal(info)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("failed to marshal other info: channel_id=%d, tag=%s, name=%s, error=%v", channel.Id, channel.GetTag(), channel.Name, err))
+		return false
+	}
+	result := DB.Model(&Channel{}).
+		Where("id = ? AND status = ? AND other_info = ?", channel.Id, expectedStatus, channel.OtherInfo).
+		Updates(map[string]interface{}{
+			"status":     status,
+			"other_info": string(otherInfoBytes),
+		})
+	if result.Error != nil {
+		common.SysLog(fmt.Sprintf("failed to update channel status from snapshot: channel_id=%d, status=%d, error=%v", channel.Id, status, result.Error))
+		return false
+	}
+	if result.RowsAffected == 0 {
+		return false
+	}
+	if common.MemoryCacheEnabled {
+		CacheUpdateChannelStatus(channel.Id, status)
+	}
+	if err := UpdateAbilityStatus(channel.Id, status == common.ChannelStatusEnabled); err != nil {
+		common.SysLog(fmt.Sprintf("failed to update ability status: channel_id=%d, error=%v", channel.Id, err))
+	}
+	return true
+}
+
+// UpdateChannelOtherInfoFromSnapshot updates other_info only if status and the
+// previous other_info still match the caller's snapshot.
+func UpdateChannelOtherInfoFromSnapshot(channel *Channel, expectedStatus int, otherInfo map[string]interface{}) bool {
+	if channel == nil || channel.Id == 0 {
+		return false
+	}
+	otherInfoBytes, err := common.Marshal(otherInfo)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("failed to marshal other info: channel_id=%d, tag=%s, name=%s, error=%v", channel.Id, channel.GetTag(), channel.Name, err))
+		return false
+	}
+	result := DB.Model(&Channel{}).
+		Where("id = ? AND status = ? AND other_info = ?", channel.Id, expectedStatus, channel.OtherInfo).
+		Update("other_info", string(otherInfoBytes))
+	if result.Error != nil {
+		common.SysLog(fmt.Sprintf("failed to update channel other_info from snapshot: channel_id=%d, error=%v", channel.Id, result.Error))
+		return false
+	}
+	return result.RowsAffected > 0
 }
 
 func EnableChannelByTag(tag string) error {

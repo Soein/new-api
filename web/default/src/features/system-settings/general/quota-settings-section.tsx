@@ -39,6 +39,8 @@ import { FormDirtyIndicator } from '../components/form-dirty-indicator'
 import { FormNavigationGuard } from '../components/form-navigation-guard'
 import {
   SettingsForm,
+  SettingsControlChildren,
+  SettingsControlGroup,
   SettingsSwitchContent,
   SettingsSwitchItem,
   SettingsFormGrid,
@@ -54,6 +56,9 @@ const quotaSchema = z.object({
   PreConsumedQuota: z.coerce.number().min(0),
   QuotaForInviter: z.coerce.number().min(0),
   QuotaForInvitee: z.coerce.number().min(0),
+  WalletTrustBypassEnabled: z.boolean(),
+  WalletTrustBypassMinUsd: z.coerce.number().min(0),
+  WalletTrustBypassMaxInflightUsd: z.coerce.number().min(0),
   TopUpLink: z.string(),
   general_setting: z.object({
     docs_link: z.string(),
@@ -101,6 +106,7 @@ export function QuotaSettingsSection({ defaultValues }: QuotaSettingsSectionProp
         }
       },
     })
+  const walletTrustBypassEnabled = form.watch('WalletTrustBypassEnabled')
 
   return (
     <SettingsSection title={t('Quota Settings')}>
@@ -246,6 +252,100 @@ export function QuotaSettingsSection({ defaultValues }: QuotaSettingsSectionProp
                   </SettingsSwitchItem>
                 )}
               />
+            </SettingsFormGridItem>
+
+            <SettingsFormGridItem span='full'>
+              <SettingsControlGroup>
+                <FormField
+                  control={form.control}
+                  name='WalletTrustBypassEnabled'
+                  render={({ field }) => (
+                    <SettingsSwitchItem className='py-0'>
+                      <SettingsSwitchContent>
+                        <FormLabel>{t('Wallet Trust Bypass')}</FormLabel>
+                        <FormDescription>
+                          {t(
+                            'Allow high-balance wallet requests to skip pre-consume. Keep disabled unless delayed-settlement exposure is acceptable.'
+                          )}
+                        </FormDescription>
+                      </SettingsSwitchContent>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                          disabled={updateOption.isPending}
+                        />
+                      </FormControl>
+                    </SettingsSwitchItem>
+                  )}
+                />
+
+                <SettingsControlChildren>
+                  <SettingsFormGrid>
+                    <FormField
+                      control={form.control}
+                      name='WalletTrustBypassMinUsd'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Wallet Trust Minimum Balance (USD)')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={0}
+                              step='0.01'
+                              value={field.value ?? ''}
+                              onChange={handleNumberChange(field.onChange)}
+                              name={field.name}
+                              onBlur={field.onBlur}
+                              ref={field.ref}
+                              disabled={!walletTrustBypassEnabled}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t(
+                              'Wallet users must stay above this USD balance before the trust bypass can be used.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name='WalletTrustBypassMaxInflightUsd'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Wallet Trust Max In-Flight (USD)')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={0}
+                              step='0.01'
+                              value={field.value ?? ''}
+                              onChange={handleNumberChange(field.onChange)}
+                              name={field.name}
+                              onBlur={field.onBlur}
+                              ref={field.ref}
+                              disabled={!walletTrustBypassEnabled}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t(
+                              'Maximum estimated wallet spend that can be in trust bypass at the same time for one user.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </SettingsFormGrid>
+                </SettingsControlChildren>
+              </SettingsControlGroup>
             </SettingsFormGridItem>
 
             <FormField

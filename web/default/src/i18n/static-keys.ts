@@ -45,6 +45,14 @@ export const STATIC_I18N_KEYS = [
   'Routing Reliability',
   'Maintenance',
 
+  // Billing / quota settings
+  'Wallet Trust Bypass',
+  'Allow high-balance wallet requests to skip pre-consume. Keep disabled unless delayed-settlement exposure is acceptable.',
+  'Wallet Trust Minimum Balance (USD)',
+  'Wallet users must stay above this USD balance before the trust bypass can be used.',
+  'Wallet Trust Max In-Flight (USD)',
+  'Maximum estimated wallet spend that can be in trust bypass at the same time for one user.',
+
   // System info
   'online',
   'stale',

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -35,10 +36,11 @@ func modelPriceNotConfiguredError(modelName string, userId int) error {
 // https://docs.claude.com/en/docs/build-with-claude/prompt-caching#1-hour-cache-duration
 const claudeCacheCreation1hMultiplier = 6 / 3.75
 
-// defaultTieredPreConsumeMaxTokens is the fallback completion-token estimate
-// used for tiered expression pre-consume when the client omits max_tokens, so
-// the pre-consumed quota still reflects a plausible output cost in paid groups.
-const defaultTieredPreConsumeMaxTokens = 8192
+// defaultPreConsumeMaxTokens is the fallback completion-token estimate used
+// when a paid text request omits max_tokens. It keeps wallet reservations
+// conservative for streaming/Responses requests whose final billed tokens can
+// be much higher than the prompt-only estimate.
+const defaultPreConsumeMaxTokens = 8192
 
 // HandleGroupRatio checks for "auto_group" in the context and updates the group ratio and relayInfo.UsingGroup if present
 func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) types.GroupRatioInfo {
@@ -69,10 +71,38 @@ func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) types.
 	return groupRatioInfo
 }
 
+func estimateResponsesToolPreConsumeQuota(info *relaycommon.RelayInfo, groupRatio float64) int {
+	if groupRatio == 0 || info == nil || info.ResponsesUsageInfo == nil {
+		return 0
+	}
+
+	imageTool, ok := info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration]
+	if !ok || imageTool == nil {
+		return 0
+	}
+
+	price := preConsumeGPTImageGenerationPrice(imageTool.ImageGenerationQuality, imageTool.ImageGenerationSize)
+	return common.QuotaFromFloat(price * common.QuotaPerUnit * groupRatio)
+}
+
+func preConsumeGPTImageGenerationPrice(quality string, size string) float64 {
+	quality = strings.TrimSpace(quality)
+	size = strings.TrimSpace(size)
+	switch quality {
+	case "low", "medium", "high":
+		switch size {
+		case "1024x1024", "1024x1536", "1536x1024":
+			return operation_setting.GetGPTImage1PriceOnceCall(quality, size)
+		}
+	}
+	return operation_setting.GetGPTImage1PriceOnceCall("high", "1024x1536")
+}
+
 func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta) (types.PriceData, error) {
 	modelPrice, usePrice := ratio_setting.GetModelPrice(info.OriginModelName, false)
 
 	groupRatioInfo := HandleGroupRatio(c, info)
+	toolPreConsumedQuota := estimateResponsesToolPreConsumeQuota(info, groupRatioInfo.GroupRatio)
 
 	// Check if this model uses tiered_expr billing
 	if billing_setting.GetBillingMode(info.OriginModelName) == billing_setting.BillingModeTieredExpr {
@@ -92,9 +122,11 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	var freeModel bool
 	if !usePrice {
 		preConsumedTokens := common.Max(promptTokens, common.PreConsumedQuota)
-		if meta.MaxTokens != 0 {
-			preConsumedTokens += meta.MaxTokens
+		estimatedCompletionTokens := meta.MaxTokens
+		if estimatedCompletionTokens == 0 && groupRatioInfo.GroupRatio != 0 {
+			estimatedCompletionTokens = defaultPreConsumeMaxTokens
 		}
+		preConsumedTokens += estimatedCompletionTokens
 		var success bool
 		var matchName string
 		modelRatio, success, matchName = ratio_setting.GetModelRatio(info.OriginModelName)
@@ -142,6 +174,11 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 				freeModel = true
 			}
 		}
+	}
+
+	if toolPreConsumedQuota > 0 {
+		preConsumedQuota += toolPreConsumedQuota
+		freeModel = false
 	}
 
 	priceData := types.PriceData{
@@ -251,7 +288,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 
 	estimatedCompletionTokens := meta.MaxTokens
 	if estimatedCompletionTokens == 0 && groupRatioInfo.GroupRatio != 0 {
-		estimatedCompletionTokens = defaultTieredPreConsumeMaxTokens
+		estimatedCompletionTokens = defaultPreConsumeMaxTokens
 	}
 
 	requestInput, err := ResolveIncomingBillingExprRequestInput(c, info)
@@ -278,6 +315,10 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 			preConsumedQuota = 0
 			freeModel = true
 		}
+	}
+	if toolPreConsumedQuota := estimateResponsesToolPreConsumeQuota(info, groupRatioInfo.GroupRatio); toolPreConsumedQuota > 0 {
+		preConsumedQuota += toolPreConsumedQuota
+		freeModel = false
 	}
 
 	exprHash := billingexpr.ExprHashString(exprStr)

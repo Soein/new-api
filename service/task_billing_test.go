@@ -430,6 +430,34 @@ func TestRecalculate_PositiveDelta(t *testing.T) {
 	assert.Equal(t, actualQuota-preConsumed, log.Quota)
 }
 
+func TestRecalculate_PositiveDeltaRecordsWalletDebt(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 110, 110, 110
+	const currentQuota, preConsumed = 500, 2000
+	const actualQuota = 3000
+	const tokenRemain = 5000
+
+	seedUser(t, userID, currentQuota)
+	seedToken(t, tokenID, userID, "sk-recalc-debt", tokenRemain)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+
+	RecalculateTaskQuota(ctx, task, actualQuota, "adaptor adjustment")
+
+	delta := actualQuota - preConsumed
+	assert.Equal(t, currentQuota-delta, getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain-delta, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, actualQuota, task.Quota)
+
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.Equal(t, model.LogTypeConsume, log.Type)
+	assert.Equal(t, delta, log.Quota)
+}
+
 func TestRecalculate_NegativeDelta(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()

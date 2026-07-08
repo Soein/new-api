@@ -62,6 +62,10 @@ const BILLING_SECTIONS = [
           PreConsumedQuota: settings.PreConsumedQuota,
           QuotaForInviter: settings.QuotaForInviter,
           QuotaForInvitee: settings.QuotaForInvitee,
+          WalletTrustBypassEnabled: settings.WalletTrustBypassEnabled,
+          WalletTrustBypassMinUsd: settings.WalletTrustBypassMinUsd,
+          WalletTrustBypassMaxInflightUsd:
+            settings.WalletTrustBypassMaxInflightUsd,
           TopUpLink: settings.TopUpLink,
           general_setting: {
             docs_link: settings['general_setting.docs_link'],

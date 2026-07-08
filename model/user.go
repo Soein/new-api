@@ -1053,17 +1053,11 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheIncrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to increase user quota: " + err.Error())
-		}
-	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
-		return nil
+	if err := increaseUserQuota(id, quota); err != nil {
+		return err
 	}
-	return increaseUserQuota(id, quota)
+	updateUserQuotaCacheDelta(id, quota)
+	return nil
 }
 
 func increaseUserQuota(id int, quota int) (err error) {
@@ -1078,25 +1072,63 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheDecrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to decrease user quota: " + err.Error())
-		}
-	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
-		return nil
+	if err := decreaseUserQuota(id, quota); err != nil {
+		return err
 	}
-	return decreaseUserQuota(id, quota)
+	updateUserQuotaCacheDelta(id, -quota)
+	return nil
+}
+
+// DecreaseUserQuotaForSettlement records costs that have already happened
+// upstream. Pre-consume paths must use DecreaseUserQuota instead so they cannot
+// overdraw and release new requests without enough balance.
+func DecreaseUserQuotaForSettlement(id int, quota int) (err error) {
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if err := decreaseUserQuotaAllowNegative(id, quota); err != nil {
+		return err
+	}
+	updateUserQuotaCacheDelta(id, -quota)
+	return nil
 }
 
 func decreaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
-	if err != nil {
-		return err
+	result := DB.Model(&User{}).
+		Where("id = ? AND quota >= ?", id, quota).
+		Update("quota", gorm.Expr("quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
 	}
-	return err
+	if result.RowsAffected == 0 {
+		return ErrUserQuotaInsufficient
+	}
+	return nil
+}
+
+func decreaseUserQuotaAllowNegative(id int, quota int) (err error) {
+	result := DB.Model(&User{}).
+		Where("id = ?", id).
+		Update("quota", gorm.Expr("quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func updateUserQuotaCacheDelta(id int, delta int) {
+	if delta == 0 {
+		return
+	}
+	if err := cacheIncrUserQuota(id, int64(delta)); err != nil {
+		common.SysLog("failed to update user quota cache: " + err.Error())
+		if invalidateErr := invalidateUserCache(id); invalidateErr != nil {
+			common.SysLog("failed to invalidate user cache after quota update error: " + invalidateErr.Error())
+		}
+	}
 }
 
 func DeltaUpdateUserQuota(id int, delta int) (err error) {

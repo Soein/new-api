@@ -1,12 +1,14 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -29,6 +31,7 @@ type BillingSession struct {
 	tokenConsumed    int  // 令牌额度实际扣减量
 	extraReserved    int  // 发送前补充预扣的额度（订阅退款时需要单独回滚）
 	trusted          bool // 是否命中信任额度旁路
+	trustInflight    int  // 信任旁路占用的在途预估额度
 	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
 	settled          bool // Settle 全部完成（资金 + 令牌）
 	refunded         bool // Refund 已调用
@@ -41,6 +44,7 @@ type BillingSession struct {
 func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.releaseTrustInflightLocked()
 	if s.settled {
 		return nil
 	}
@@ -81,12 +85,22 @@ func (s *BillingSession) Settle(actualQuota int) error {
 // Refund 退还所有预扣费，幂等安全，异步执行。
 func (s *BillingSession) Refund(c *gin.Context) {
 	s.mu.Lock()
-	if s.settled || s.refunded || !s.needsRefundLocked() {
+	needsRefund := s.needsRefundLocked()
+	trustInflight := s.trustInflight
+	if s.settled || s.refunded || (!needsRefund && trustInflight <= 0) {
 		s.mu.Unlock()
 		return
 	}
 	s.refunded = true
+	s.trustInflight = 0
 	s.mu.Unlock()
+
+	if trustInflight > 0 {
+		releaseWalletTrustInflight(s.relayInfo.UserId, trustInflight)
+	}
+	if !needsRefund {
+		return
+	}
 
 	logger.LogInfo(c, fmt.Sprintf("用户 %d 请求失败, 返还预扣费（token_quota=%s, funding=%s）",
 		s.relayInfo.UserId,
@@ -135,6 +149,9 @@ func (s *BillingSession) needsRefundLocked() bool {
 		return false
 	}
 	if s.tokenConsumed > 0 {
+		return true
+	}
+	if s.trustInflight > 0 {
 		return true
 	}
 	// 订阅可能在 tokenConsumed=0 时仍预扣了额度
@@ -187,7 +204,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	effectiveQuota := quota
 
 	// ---- 信任额度旁路 ----
-	if s.shouldTrust(c) {
+	if s.shouldTrust(c, quota) && s.reserveTrustInflight(quota) {
 		s.trusted = true
 		effectiveQuota = 0
 		logger.LogInfo(c, fmt.Sprintf("用户 %d 额度充足, 信任且不需要预扣费 (funding=%s)", s.relayInfo.UserId, s.funding.Source()))
@@ -218,6 +235,12 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 		if strings.Contains(errMsg, "no active subscription") || strings.Contains(errMsg, "subscription quota insufficient") {
 			return types.NewErrorWithStatusCode(fmt.Errorf("订阅额度不足或未配置订阅: %s", errMsg), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
+		if errors.Is(err, model.ErrUserQuotaInsufficient) {
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("用户额度不足, 需要预扣费额度: %s", logger.FormatQuota(effectiveQuota)),
+				types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
+				types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		}
 		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 	}
 
@@ -233,6 +256,15 @@ func (s *BillingSession) reserveFunding(delta int) error {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
 		if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
+			if errors.Is(err, model.ErrUserQuotaInsufficient) {
+				return types.NewErrorWithStatusCode(
+					fmt.Errorf("用户额度不足, 需要补扣费额度: %s", logger.FormatQuota(delta)),
+					types.ErrorCodeInsufficientUserQuota,
+					http.StatusForbidden,
+					types.ErrOptionWithSkipRetry(),
+					types.ErrOptionWithNoRecordErrorLog(),
+				)
+			}
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 		}
 		funding.consumed += delta
@@ -278,31 +310,20 @@ func (s *BillingSession) reserveToken(delta int) error {
 	return nil
 }
 
-// shouldTrust 统一信任额度检查，适用于钱包和订阅。
-func (s *BillingSession) shouldTrust(c *gin.Context) bool {
+// shouldTrust controls the wallet trust bypass. It remains opt-in and bounded
+// by a per-user in-flight cap so bursts fall back to normal pre-consume.
+func (s *BillingSession) shouldTrust(c *gin.Context, quota int) bool {
 	// 异步任务（ForcePreConsume=true）必须预扣全额，不允许信任旁路
 	if s.relayInfo.ForcePreConsume {
 		return false
 	}
-
-	trustQuota := common.GetTrustQuota()
-	if trustQuota <= 0 {
-		return false
-	}
-
-	// 检查令牌是否充足
-	tokenTrusted := s.relayInfo.TokenUnlimited
-	if !tokenTrusted {
-		tokenQuota := c.GetInt("token_quota")
-		tokenTrusted = tokenQuota > trustQuota
-	}
-	if !tokenTrusted {
+	if s.hasResponsesBillableTool() {
 		return false
 	}
 
 	switch s.funding.Source() {
 	case BillingSourceWallet:
-		return s.relayInfo.UserQuota > trustQuota
+		return walletTrustBypassAllowed(c, s.relayInfo, quota)
 	case BillingSourceSubscription:
 		// 订阅不能启用信任旁路。原因：
 		// 1. PreConsumeUserSubscription 要求 amount>0 来创建预扣记录并锁定订阅
@@ -312,6 +333,39 @@ func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 	default:
 		return false
 	}
+}
+
+func (s *BillingSession) reserveTrustInflight(quota int) bool {
+	if s.funding.Source() != BillingSourceWallet {
+		return false
+	}
+	limit := common.GetWalletTrustBypassMaxInflightQuota()
+	if !reserveWalletTrustInflight(s.relayInfo.UserId, quota, limit) {
+		logger.LogInfo(nil, fmt.Sprintf("用户 %d 信任额度在途额度已满，回退到预扣费 (quota=%s, max_inflight=%s)",
+			s.relayInfo.UserId,
+			logger.FormatQuota(quota),
+			logger.FormatQuota(limit),
+		))
+		return false
+	}
+	s.trustInflight = quota
+	return true
+}
+
+func (s *BillingSession) releaseTrustInflightLocked() {
+	if s.trustInflight <= 0 {
+		return
+	}
+	releaseWalletTrustInflight(s.relayInfo.UserId, s.trustInflight)
+	s.trustInflight = 0
+}
+
+func (s *BillingSession) hasResponsesBillableTool() bool {
+	if s == nil || s.relayInfo == nil || s.relayInfo.ResponsesUsageInfo == nil {
+		return false
+	}
+	_, ok := s.relayInfo.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration]
+	return ok
 }
 
 // syncRelayInfo 将 BillingSession 的状态同步到 RelayInfo 的兼容字段上。

@@ -72,6 +72,15 @@ const routingReliabilitySchema = z
     ChannelDisableThreshold: numericString,
     AutomaticDisableChannelEnabled: z.boolean(),
     AutomaticEnableChannelEnabled: z.boolean(),
+    FrtBreakerEnabled: z.boolean(),
+    FrtBreakerThresholdSec: z.coerce.number().int().min(1),
+    FrtBreakerStrikes: z.coerce.number().int().min(1),
+    FrtBreakerWindowSec: z.coerce.number().int().min(1),
+    FrtBreakerCooldownSec: z.coerce.number().int().min(0),
+    FrtBreakerHalfOpenEnabled: z.boolean(),
+    FrtBreakerHalfOpenWindowSec: z.coerce.number().int().min(1),
+    FrtBreakerHalfOpenStrikes: z.coerce.number().int().min(1),
+    FrtBreakerHalfOpenSweepSec: z.coerce.number().int().min(5),
     AutomaticDisableKeywords: z.string(),
     AutomaticDisableStatusCodes: z.string(),
     AutomaticRetryStatusCodes: z.string(),
@@ -121,6 +130,15 @@ type RoutingReliabilitySectionProps = {
     ChannelDisableThreshold: string
     AutomaticDisableChannelEnabled: boolean
     AutomaticEnableChannelEnabled: boolean
+    FrtBreakerEnabled: boolean
+    FrtBreakerThresholdSec: number
+    FrtBreakerStrikes: number
+    FrtBreakerWindowSec: number
+    FrtBreakerCooldownSec: number
+    FrtBreakerHalfOpenEnabled: boolean
+    FrtBreakerHalfOpenWindowSec: number
+    FrtBreakerHalfOpenStrikes: number
+    FrtBreakerHalfOpenSweepSec: number
     AutomaticDisableKeywords: string
     AutomaticDisableStatusCodes: string
     AutomaticRetryStatusCodes: string
@@ -139,6 +157,15 @@ type NormalizedRoutingReliabilityValues = {
   ChannelDisableThreshold: string
   AutomaticDisableChannelEnabled: boolean
   AutomaticEnableChannelEnabled: boolean
+  FrtBreakerEnabled: boolean
+  FrtBreakerThresholdSec: number
+  FrtBreakerStrikes: number
+  FrtBreakerWindowSec: number
+  FrtBreakerCooldownSec: number
+  FrtBreakerHalfOpenEnabled: boolean
+  FrtBreakerHalfOpenWindowSec: number
+  FrtBreakerHalfOpenStrikes: number
+  FrtBreakerHalfOpenSweepSec: number
   AutomaticDisableKeywords: string
   AutomaticDisableStatusCodes: string
   AutomaticRetryStatusCodes: string
@@ -158,6 +185,15 @@ const buildFormDefaults = (
   ChannelDisableThreshold: defaults.ChannelDisableThreshold ?? '',
   AutomaticDisableChannelEnabled: defaults.AutomaticDisableChannelEnabled,
   AutomaticEnableChannelEnabled: defaults.AutomaticEnableChannelEnabled,
+  FrtBreakerEnabled: defaults.FrtBreakerEnabled,
+  FrtBreakerThresholdSec: defaults.FrtBreakerThresholdSec ?? 15,
+  FrtBreakerStrikes: defaults.FrtBreakerStrikes ?? 3,
+  FrtBreakerWindowSec: defaults.FrtBreakerWindowSec ?? 300,
+  FrtBreakerCooldownSec: defaults.FrtBreakerCooldownSec ?? 600,
+  FrtBreakerHalfOpenEnabled: defaults.FrtBreakerHalfOpenEnabled,
+  FrtBreakerHalfOpenWindowSec: defaults.FrtBreakerHalfOpenWindowSec ?? 300,
+  FrtBreakerHalfOpenStrikes: defaults.FrtBreakerHalfOpenStrikes ?? 1,
+  FrtBreakerHalfOpenSweepSec: defaults.FrtBreakerHalfOpenSweepSec ?? 30,
   AutomaticDisableKeywords: normalizeLineEndings(
     defaults.AutomaticDisableKeywords ?? ''
   ),
@@ -181,6 +217,15 @@ const normalizeDefaults = (
   ChannelDisableThreshold: (defaults.ChannelDisableThreshold ?? '').trim(),
   AutomaticDisableChannelEnabled: defaults.AutomaticDisableChannelEnabled,
   AutomaticEnableChannelEnabled: defaults.AutomaticEnableChannelEnabled,
+  FrtBreakerEnabled: defaults.FrtBreakerEnabled,
+  FrtBreakerThresholdSec: defaults.FrtBreakerThresholdSec ?? 15,
+  FrtBreakerStrikes: defaults.FrtBreakerStrikes ?? 3,
+  FrtBreakerWindowSec: defaults.FrtBreakerWindowSec ?? 300,
+  FrtBreakerCooldownSec: defaults.FrtBreakerCooldownSec ?? 600,
+  FrtBreakerHalfOpenEnabled: defaults.FrtBreakerHalfOpenEnabled,
+  FrtBreakerHalfOpenWindowSec: defaults.FrtBreakerHalfOpenWindowSec ?? 300,
+  FrtBreakerHalfOpenStrikes: defaults.FrtBreakerHalfOpenStrikes ?? 1,
+  FrtBreakerHalfOpenSweepSec: defaults.FrtBreakerHalfOpenSweepSec ?? 30,
   AutomaticDisableKeywords: normalizeLineEndings(
     defaults.AutomaticDisableKeywords ?? ''
   ),
@@ -206,6 +251,15 @@ const normalizeFormValues = (
   ChannelDisableThreshold: values.ChannelDisableThreshold.trim(),
   AutomaticDisableChannelEnabled: values.AutomaticDisableChannelEnabled,
   AutomaticEnableChannelEnabled: values.AutomaticEnableChannelEnabled,
+  FrtBreakerEnabled: values.FrtBreakerEnabled,
+  FrtBreakerThresholdSec: values.FrtBreakerThresholdSec,
+  FrtBreakerStrikes: values.FrtBreakerStrikes,
+  FrtBreakerWindowSec: values.FrtBreakerWindowSec,
+  FrtBreakerCooldownSec: values.FrtBreakerCooldownSec,
+  FrtBreakerHalfOpenEnabled: values.FrtBreakerHalfOpenEnabled,
+  FrtBreakerHalfOpenWindowSec: values.FrtBreakerHalfOpenWindowSec,
+  FrtBreakerHalfOpenStrikes: values.FrtBreakerHalfOpenStrikes,
+  FrtBreakerHalfOpenSweepSec: values.FrtBreakerHalfOpenSweepSec,
   AutomaticDisableKeywords: normalizeLineEndings(
     values.AutomaticDisableKeywords
   ),
@@ -578,6 +632,235 @@ export function RoutingReliabilitySection({
                     <FormDescription>
                       {t(
                         'If an upstream error contains any of these keywords (case insensitive), the channel will be disabled automatically.'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </div>
+
+          <Separator />
+
+          <div className='flex min-w-0 flex-col gap-4'>
+            <div className='flex flex-col gap-1'>
+              <h4 className='text-sm font-medium'>
+                {t('Production FRT breaker')}
+              </h4>
+            </div>
+            <div className='grid min-w-0 gap-6 lg:grid-cols-3'>
+              <FormField
+                control={form.control}
+                name='FrtBreakerEnabled'
+                render={({ field }) => (
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent>
+                      <FormLabel>{t('Production FRT breaker')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Disable slow production channels from real first-response latency'
+                        )}
+                      </FormDescription>
+                    </SettingsSwitchContent>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </SettingsSwitchItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='FrtBreakerThresholdSec'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      {t('First response threshold (seconds)')}
+                    </FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min={1}
+                        step={1}
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'A channel-level threshold overrides this global value'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='FrtBreakerStrikes'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Strike count')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min={1}
+                        step={1}
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'Disable after this many slow first responses in the window'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='FrtBreakerWindowSec'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Strike window (seconds)')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min={1}
+                        step={1}
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t('Slow first responses are counted inside this window')}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='FrtBreakerCooldownSec'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Cooldown (seconds)')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min={0}
+                        step={1}
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'Wait this long before allowing another FRT disable or half-open recovery'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+
+            <div className='grid min-w-0 gap-6 lg:grid-cols-4'>
+              <FormField
+                control={form.control}
+                name='FrtBreakerHalfOpenEnabled'
+                render={({ field }) => (
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent>
+                      <FormLabel>{t('Half-open recovery')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Re-enable FRT-disabled channels after cooldown for live traffic probing'
+                        )}
+                      </FormDescription>
+                    </SettingsSwitchContent>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </SettingsSwitchItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='FrtBreakerHalfOpenWindowSec'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Half-open window (seconds)')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min={1}
+                        step={1}
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'Live traffic observation time after half-open recovery'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='FrtBreakerHalfOpenStrikes'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Half-open strike count')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min={1}
+                        step={1}
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'Slow first responses needed to disable again during half-open'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='FrtBreakerHalfOpenSweepSec'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      {t('Half-open scan interval (seconds)')}
+                    </FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min={5}
+                        step={1}
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'How often to scan FRT-disabled channels for half-open recovery'
                       )}
                     </FormDescription>
                     <FormMessage />

@@ -218,6 +218,15 @@ export type ModelSettings = {
   ChannelDisableThreshold: string
   AutomaticDisableChannelEnabled: boolean
   AutomaticEnableChannelEnabled: boolean
+  FrtBreakerEnabled: boolean
+  FrtBreakerThresholdSec: number
+  FrtBreakerStrikes: number
+  FrtBreakerWindowSec: number
+  FrtBreakerCooldownSec: number
+  FrtBreakerHalfOpenEnabled: boolean
+  FrtBreakerHalfOpenWindowSec: number
+  FrtBreakerHalfOpenStrikes: number
+  FrtBreakerHalfOpenSweepSec: number
   AutomaticDisableKeywords: string
   AutomaticDisableStatusCodes: string
   AutomaticRetryStatusCodes: string

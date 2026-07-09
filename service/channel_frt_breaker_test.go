@@ -16,23 +16,26 @@ import (
 // （触发禁用与半开通知都经 gopoolGo）。gopoolGo 被替换为只计数不执行，避免测试触碰数据库。
 func setupFrtBreaker(t *testing.T, enabled bool, thresholdSec, strikes, windowSec, cooldownSec int) *int {
 	t.Helper()
-	origEnabled := frtBreakerEnabled
-	origThreshold := frtBreakerThresholdSec
-	origStrikes := frtBreakerStrikes
-	origWindow := frtBreakerWindowSec
-	origCooldown := frtBreakerCooldownSec
-	origHalfOpenEnabled := frtBreakerHalfOpenEnabled
-	origHalfOpenWindow := frtBreakerHalfOpenWindowSec
-	origHalfOpenStrikes := frtBreakerHalfOpenStrikes
+	origEnabled := common.FrtBreakerEnabled
+	origThreshold := common.FrtBreakerThresholdSec
+	origStrikes := common.FrtBreakerStrikes
+	origWindow := common.FrtBreakerWindowSec
+	origCooldown := common.FrtBreakerCooldownSec
+	origHalfOpenEnabled := common.FrtBreakerHalfOpenEnabled
+	origHalfOpenWindow := common.FrtBreakerHalfOpenWindowSec
+	origHalfOpenStrikes := common.FrtBreakerHalfOpenStrikes
+	origHalfOpenSweep := common.FrtBreakerHalfOpenSweepSec
 	origGo := gopoolGo
 
-	frtBreakerEnabled = enabled
-	frtBreakerThresholdSec = thresholdSec
-	frtBreakerStrikes = strikes
-	frtBreakerWindowSec = windowSec
-	frtBreakerCooldownSec = cooldownSec
-	frtBreakerHalfOpenEnabled = true
-	frtBreakerHalfOpenStrikes = 1
+	common.FrtBreakerEnabled = enabled
+	common.FrtBreakerThresholdSec = thresholdSec
+	common.FrtBreakerStrikes = strikes
+	common.FrtBreakerWindowSec = windowSec
+	common.FrtBreakerCooldownSec = cooldownSec
+	common.FrtBreakerHalfOpenEnabled = true
+	common.FrtBreakerHalfOpenWindowSec = 300
+	common.FrtBreakerHalfOpenStrikes = 1
+	common.FrtBreakerHalfOpenSweepSec = 30
 	frtBreakerStrikeTs = make(map[int][]int64)
 	frtBreakerLastTrip = make(map[int]int64)
 	frtBreakerHalfOpenUntil = make(map[int]int64)
@@ -42,14 +45,15 @@ func setupFrtBreaker(t *testing.T, enabled bool, thresholdSec, strikes, windowSe
 	gopoolGo = func(f func()) { disables++ }
 
 	t.Cleanup(func() {
-		frtBreakerEnabled = origEnabled
-		frtBreakerThresholdSec = origThreshold
-		frtBreakerStrikes = origStrikes
-		frtBreakerWindowSec = origWindow
-		frtBreakerCooldownSec = origCooldown
-		frtBreakerHalfOpenEnabled = origHalfOpenEnabled
-		frtBreakerHalfOpenWindowSec = origHalfOpenWindow
-		frtBreakerHalfOpenStrikes = origHalfOpenStrikes
+		common.FrtBreakerEnabled = origEnabled
+		common.FrtBreakerThresholdSec = origThreshold
+		common.FrtBreakerStrikes = origStrikes
+		common.FrtBreakerWindowSec = origWindow
+		common.FrtBreakerCooldownSec = origCooldown
+		common.FrtBreakerHalfOpenEnabled = origHalfOpenEnabled
+		common.FrtBreakerHalfOpenWindowSec = origHalfOpenWindow
+		common.FrtBreakerHalfOpenStrikes = origHalfOpenStrikes
+		common.FrtBreakerHalfOpenSweepSec = origHalfOpenSweep
 		frtBreakerStrikeTs = make(map[int][]int64)
 		frtBreakerLastTrip = make(map[int]int64)
 		frtBreakerHalfOpenUntil = make(map[int]int64)
@@ -227,7 +231,7 @@ func TestFrtBreakerHalfOpenSweepEnablesFrtDisabledChannel(t *testing.T) {
 	got, err := model.GetChannelById(9101, false)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusEnabled, got.Status, "冷却期满应半开启用（不依赖内存记录）")
-	assert.Equal(t, now+int64(frtBreakerHalfOpenWindowSec), frtBreakerHalfOpenUntil[9101])
+	assert.Equal(t, now+int64(frtBreakerHalfOpenWindowSec()), frtBreakerHalfOpenUntil[9101])
 	info := got.GetOtherInfo()
 	reason, _ := info["status_reason"].(string)
 	assert.True(t, strings.HasPrefix(reason, frtBreakerHalfOpenActivePrefix), "半开状态应写入 DB，供其他节点识别")
@@ -298,7 +302,7 @@ func TestFrtBreakerHalfOpenStrikeLoadsDbMarkerAcrossNodes(t *testing.T) {
 func TestFrtBreakerHalfOpenStrikeClearsExpiredDbMarker(t *testing.T) {
 	disables := setupFrtBreaker(t, true, 15, 3, 300, 600)
 
-	expired := time.Now().Unix() - int64(frtBreakerHalfOpenWindowSec) - 1
+	expired := time.Now().Unix() - int64(frtBreakerHalfOpenWindowSec()) - 1
 	createFrtEnabledHalfOpenChannel(t, 9106, expired)
 
 	FrtBreakerStrike(9106, 1, 20000, 0, true)
@@ -315,7 +319,7 @@ func TestFrtBreakerHalfOpenSweepClearsExpiredEnabledMarker(t *testing.T) {
 	setupFrtBreaker(t, true, 15, 3, 300, 600)
 
 	now := time.Now().Unix()
-	createFrtEnabledHalfOpenChannel(t, 9107, now-int64(frtBreakerHalfOpenWindowSec)-1)
+	createFrtEnabledHalfOpenChannel(t, 9107, now-int64(frtBreakerHalfOpenWindowSec())-1)
 
 	frtBreakerHalfOpenSweep(now)
 

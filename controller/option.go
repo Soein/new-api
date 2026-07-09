@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -25,6 +26,17 @@ var completionRatioMetaOptionKeys = []string{
 	"ImageRatio",
 	"AudioRatio",
 	"AudioCompletionRatio",
+}
+
+func validateIntegerOption(value string, min int) error {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fmt.Errorf("必须是整数")
+	}
+	if parsed < min {
+		return fmt.Errorf("不能小于 %d", min)
+	}
+	return nil
 }
 
 func collectModelNamesFromOptionValue(raw string, modelNames map[string]struct{}) {
@@ -261,6 +273,33 @@ func UpdateOption(c *gin.Context) {
 		}
 	case "AutomaticRetryStatusCodes":
 		_, err = operation_setting.ParseHTTPStatusCodeRanges(option.Value.(string))
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	case "FrtBreakerThresholdSec", "FrtBreakerStrikes", "FrtBreakerWindowSec", "FrtBreakerHalfOpenWindowSec", "FrtBreakerHalfOpenStrikes":
+		err = validateIntegerOption(option.Value.(string), 1)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	case "FrtBreakerCooldownSec":
+		err = validateIntegerOption(option.Value.(string), 0)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	case "FrtBreakerHalfOpenSweepSec":
+		err = validateIntegerOption(option.Value.(string), 5)
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,

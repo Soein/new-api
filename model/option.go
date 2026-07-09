@@ -47,6 +47,15 @@ func InitOptionMap() {
 	common.OptionMap["RegisterEnabled"] = strconv.FormatBool(common.RegisterEnabled)
 	common.OptionMap["AutomaticDisableChannelEnabled"] = strconv.FormatBool(common.AutomaticDisableChannelEnabled)
 	common.OptionMap["AutomaticEnableChannelEnabled"] = strconv.FormatBool(common.AutomaticEnableChannelEnabled)
+	common.OptionMap["FrtBreakerEnabled"] = strconv.FormatBool(common.FrtBreakerEnabled)
+	common.OptionMap["FrtBreakerThresholdSec"] = strconv.Itoa(common.FrtBreakerThresholdSec)
+	common.OptionMap["FrtBreakerStrikes"] = strconv.Itoa(common.FrtBreakerStrikes)
+	common.OptionMap["FrtBreakerWindowSec"] = strconv.Itoa(common.FrtBreakerWindowSec)
+	common.OptionMap["FrtBreakerCooldownSec"] = strconv.Itoa(common.FrtBreakerCooldownSec)
+	common.OptionMap["FrtBreakerHalfOpenEnabled"] = strconv.FormatBool(common.FrtBreakerHalfOpenEnabled)
+	common.OptionMap["FrtBreakerHalfOpenWindowSec"] = strconv.Itoa(common.FrtBreakerHalfOpenWindowSec)
+	common.OptionMap["FrtBreakerHalfOpenStrikes"] = strconv.Itoa(common.FrtBreakerHalfOpenStrikes)
+	common.OptionMap["FrtBreakerHalfOpenSweepSec"] = strconv.Itoa(common.FrtBreakerHalfOpenSweepSec)
 	common.OptionMap["LogConsumeEnabled"] = strconv.FormatBool(common.LogConsumeEnabled)
 	common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(common.DisplayInCurrencyEnabled)
 	common.OptionMap["DisplayTokenStatEnabled"] = strconv.FormatBool(common.DisplayTokenStatEnabled)
@@ -309,6 +318,10 @@ func updateOptionMap(key string, value string) (err error) {
 			common.AutomaticDisableChannelEnabled = boolValue
 		case "AutomaticEnableChannelEnabled":
 			common.AutomaticEnableChannelEnabled = boolValue
+		case "FrtBreakerEnabled":
+			common.FrtBreakerEnabled = boolValue
+		case "FrtBreakerHalfOpenEnabled":
+			common.FrtBreakerHalfOpenEnabled = boolValue
 		case "LogConsumeEnabled":
 			common.LogConsumeEnabled = boolValue
 		case "DisplayInCurrencyEnabled":
@@ -567,6 +580,20 @@ func updateOptionMap(key string, value string) (err error) {
 	//	common.ChatLink2 = value
 	case "ChannelDisableThreshold":
 		common.ChannelDisableThreshold, _ = strconv.ParseFloat(value, 64)
+	case "FrtBreakerThresholdSec":
+		common.FrtBreakerThresholdSec, _ = strconv.Atoi(value)
+	case "FrtBreakerStrikes":
+		common.FrtBreakerStrikes, _ = strconv.Atoi(value)
+	case "FrtBreakerWindowSec":
+		common.FrtBreakerWindowSec, _ = strconv.Atoi(value)
+	case "FrtBreakerCooldownSec":
+		common.FrtBreakerCooldownSec, _ = strconv.Atoi(value)
+	case "FrtBreakerHalfOpenWindowSec":
+		common.FrtBreakerHalfOpenWindowSec, _ = strconv.Atoi(value)
+	case "FrtBreakerHalfOpenStrikes":
+		common.FrtBreakerHalfOpenStrikes, _ = strconv.Atoi(value)
+	case "FrtBreakerHalfOpenSweepSec":
+		common.FrtBreakerHalfOpenSweepSec, _ = strconv.Atoi(value)
 	case "QuotaPerUnit":
 		common.QuotaPerUnit, _ = strconv.ParseFloat(value, 64)
 	case "SensitiveWords":

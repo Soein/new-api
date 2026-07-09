@@ -33,17 +33,6 @@ import (
 //     集群内任一节点承接半开后的慢请求时都能识别半开并按半开规则重新禁用
 //   - 半开只接管「禁因是 FRT 熔断」的渠道，错误关键词禁用、手动禁用一概不碰
 var (
-	frtBreakerEnabled      = common.GetEnvOrDefaultBool("FRT_BREAKER_ENABLED", false)
-	frtBreakerThresholdSec = common.GetEnvOrDefault("FRT_BREAKER_THRESHOLD_SEC", 15)
-	frtBreakerStrikes      = common.GetEnvOrDefault("FRT_BREAKER_STRIKES", 3)
-	frtBreakerWindowSec    = common.GetEnvOrDefault("FRT_BREAKER_WINDOW_SEC", 300)
-	frtBreakerCooldownSec  = common.GetEnvOrDefault("FRT_BREAKER_COOLDOWN_SEC", 600)
-
-	frtBreakerHalfOpenEnabled   = common.GetEnvOrDefaultBool("FRT_BREAKER_HALF_OPEN_ENABLED", false)
-	frtBreakerHalfOpenWindowSec = common.GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_WINDOW_SEC", 300)
-	frtBreakerHalfOpenStrikes   = common.GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_STRIKES", 1)
-	frtBreakerHalfOpenSweepSec  = common.GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_SWEEP_SEC", 30)
-
 	frtBreakerMu            sync.Mutex
 	frtBreakerStrikeTs      = make(map[int][]int64)
 	frtBreakerLastTrip      = make(map[int]int64)
@@ -59,27 +48,15 @@ const (
 )
 
 func init() {
-	// 连击数下限 1：0 或负数会退化成单次超阈即熔断
-	if frtBreakerStrikes < 1 {
-		frtBreakerStrikes = 1
-	}
-	if frtBreakerHalfOpenStrikes < 1 {
-		frtBreakerHalfOpenStrikes = 1
-	}
-	if frtBreakerHalfOpenSweepSec < 5 {
-		frtBreakerHalfOpenSweepSec = 5
-	}
-	if frtBreakerEnabled && frtBreakerHalfOpenEnabled {
-		go frtBreakerHalfOpenLoop()
-	}
+	go frtBreakerHalfOpenLoop()
 }
 
 // FrtBreakerStrike 在每条真实请求完成、frt 已知时调用（渠道测试流量不应调用）。
 func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresholdSec float64, autoBan bool) {
-	if !frtBreakerEnabled || channelId <= 0 || frtMs < 0 {
+	if !common.FrtBreakerEnabled || channelId <= 0 || frtMs < 0 {
 		return
 	}
-	thresholdSec := float64(frtBreakerThresholdSec)
+	thresholdSec := float64(frtBreakerThresholdSec())
 	if channelThresholdSec > 0 {
 		thresholdSec = channelThresholdSec
 	}
@@ -96,11 +73,12 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 	defer frtBreakerMu.Unlock()
 
 	// 冷却期内不重复触发，等定时测试自动启用或半开探测来做恢复
-	if now-frtBreakerLastTrip[channelId] < int64(frtBreakerCooldownSec) {
+	if now-frtBreakerLastTrip[channelId] < int64(frtBreakerCooldownSec()) {
 		return
 	}
 
-	cutoff := now - int64(frtBreakerWindowSec)
+	windowSec := frtBreakerWindowSec()
+	cutoff := now - int64(windowSec)
 	kept := frtBreakerStrikeTs[channelId][:0]
 	for _, ts := range frtBreakerStrikeTs[channelId] {
 		if ts > cutoff {
@@ -110,12 +88,13 @@ func FrtBreakerStrike(channelId int, channelType int, frtMs int64, channelThresh
 	kept = append(kept, now)
 	frtBreakerStrikeTs[channelId] = kept
 
-	if len(kept) < frtBreakerStrikes {
+	strikes := frtBreakerStrikes()
+	if len(kept) < strikes {
 		return
 	}
 
 	reason := fmt.Sprintf("%s：%ds 内 %d 次首字超过 %.0fs（最近一次 %.1fs）",
-		frtBreakerReasonPrefix, frtBreakerWindowSec, frtBreakerStrikes, thresholdSec, float64(frtMs)/1000.0)
+		frtBreakerReasonPrefix, windowSec, strikes, thresholdSec, float64(frtMs)/1000.0)
 	tripFrtBreakerLocked(channelId, channelType, now, reason, autoBan)
 }
 
@@ -126,7 +105,7 @@ func frtBreakerHandleHalfOpen(channelId int, channelType int, frtMs int64, thres
 	if handled {
 		return true
 	}
-	if !frtBreakerHalfOpenEnabled || !frtBreakerLoadHalfOpenFromDB(channelId, now) {
+	if !common.FrtBreakerHalfOpenEnabled || !frtBreakerLoadHalfOpenFromDB(channelId, now) {
 		return false
 	}
 	frtBreakerMu.Lock()
@@ -146,7 +125,7 @@ func frtBreakerHandleHalfOpenLocked(channelId int, channelType int, frtMs int64,
 			return false
 		} else {
 			frtBreakerHalfOpenHits[channelId]++
-			if frtBreakerHalfOpenHits[channelId] < frtBreakerHalfOpenStrikes {
+			if frtBreakerHalfOpenHits[channelId] < frtBreakerHalfOpenStrikes() {
 				return true
 			}
 			reason := fmt.Sprintf("%s：半开观察期内首字 %.1fs 超过 %.0fs", frtBreakerHalfOpenReasonPrefix, float64(frtMs)/1000.0, thresholdSec)
@@ -174,13 +153,13 @@ func frtBreakerLoadHalfOpenFromDB(channelId int, now int64) bool {
 	if statusTime <= 0 {
 		return false
 	}
-	until := statusTime + int64(frtBreakerHalfOpenWindowSec)
+	until := statusTime + int64(frtBreakerHalfOpenWindowSec())
 	if now >= until {
 		frtBreakerClearHalfOpenMarker(channel, info, now)
 		return false
 	}
 	frtBreakerMu.Lock()
-	if now-frtBreakerLastTrip[channelId] < int64(frtBreakerCooldownSec) {
+	if now-frtBreakerLastTrip[channelId] < int64(frtBreakerCooldownSec()) {
 		frtBreakerMu.Unlock()
 		return false
 	}
@@ -217,9 +196,11 @@ var gopoolGo = func(f func()) { gopool.Go(f) }
 // frtBreakerHalfOpenLoop 周期扫描被本节点 FRT 禁用且冷却期满的渠道，
 // 重新启用进入半开观察窗，用真实用户流量探测恢复。
 func frtBreakerHalfOpenLoop() {
-	ticker := time.NewTicker(time.Duration(frtBreakerHalfOpenSweepSec) * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		time.Sleep(time.Duration(frtBreakerHalfOpenSweepSec()) * time.Second)
+		if !common.FrtBreakerEnabled || !common.FrtBreakerHalfOpenEnabled {
+			continue
+		}
 		frtBreakerHalfOpenSweep(time.Now().Unix())
 	}
 }
@@ -230,6 +211,9 @@ func frtBreakerHalfOpenLoop() {
 // 半开启用使用 DB 快照条件更新，多节点并发扫描时只有一个节点能抢到恢复权；
 // 半开状态也写入 DB，其他节点承接慢请求时可按需加载并执行半开失败禁用。
 func frtBreakerHalfOpenSweep(now int64) {
+	if !common.FrtBreakerEnabled || !common.FrtBreakerHalfOpenEnabled {
+		return
+	}
 	if model.DB == nil {
 		return
 	}
@@ -257,19 +241,20 @@ func frtBreakerHalfOpenSweep(now int64) {
 			continue
 		}
 		statusTime := frtBreakerStatusTime(info)
-		if statusTime <= 0 || now-statusTime < int64(frtBreakerCooldownSec) {
+		if statusTime <= 0 || now-statusTime < int64(frtBreakerCooldownSec()) {
 			continue
 		}
-		activeReason := fmt.Sprintf("%s：%ds 内用真实流量探测首字", frtBreakerHalfOpenActivePrefix, frtBreakerHalfOpenWindowSec)
+		halfOpenWindowSec := frtBreakerHalfOpenWindowSec()
+		activeReason := fmt.Sprintf("%s：%ds 内用真实流量探测首字", frtBreakerHalfOpenActivePrefix, halfOpenWindowSec)
 		if !model.UpdateChannelStatusFromSnapshot(channel, common.ChannelStatusAutoDisabled, common.ChannelStatusEnabled, activeReason, now) {
 			continue
 		}
 		frtBreakerMu.Lock()
-		frtBreakerHalfOpenUntil[channel.Id] = now + int64(frtBreakerHalfOpenWindowSec)
+		frtBreakerHalfOpenUntil[channel.Id] = now + int64(halfOpenWindowSec)
 		delete(frtBreakerHalfOpenHits, channel.Id)
 		frtBreakerMu.Unlock()
 
-		msg := fmt.Sprintf("通道「%s」（#%d）熔断冷却期满，已半开启用，%ds 内用真实流量探测首字", channel.Name, channel.Id, frtBreakerHalfOpenWindowSec)
+		msg := fmt.Sprintf("通道「%s」（#%d）熔断冷却期满，已半开启用，%ds 内用真实流量探测首字", channel.Name, channel.Id, halfOpenWindowSec)
 		common.SysLog(msg)
 		channelId, channelName := channel.Id, channel.Name
 		gopoolGo(func() {
@@ -318,9 +303,54 @@ func frtBreakerCleanupExpiredHalfOpenMarkers(now int64) {
 			continue
 		}
 		statusTime := frtBreakerStatusTime(info)
-		if statusTime <= 0 || now-statusTime < int64(frtBreakerHalfOpenWindowSec) {
+		if statusTime <= 0 || now-statusTime < int64(frtBreakerHalfOpenWindowSec()) {
 			continue
 		}
 		frtBreakerClearHalfOpenMarker(channel, info, now)
 	}
+}
+
+func frtBreakerPositiveInt(value int, fallback int) int {
+	if value < 1 {
+		return fallback
+	}
+	return value
+}
+
+func frtBreakerNonNegativeInt(value int, fallback int) int {
+	if value < 0 {
+		return fallback
+	}
+	return value
+}
+
+func frtBreakerThresholdSec() int {
+	return frtBreakerPositiveInt(common.FrtBreakerThresholdSec, 15)
+}
+
+func frtBreakerStrikes() int {
+	return frtBreakerPositiveInt(common.FrtBreakerStrikes, 1)
+}
+
+func frtBreakerWindowSec() int {
+	return frtBreakerPositiveInt(common.FrtBreakerWindowSec, 300)
+}
+
+func frtBreakerCooldownSec() int {
+	return frtBreakerNonNegativeInt(common.FrtBreakerCooldownSec, 600)
+}
+
+func frtBreakerHalfOpenWindowSec() int {
+	return frtBreakerPositiveInt(common.FrtBreakerHalfOpenWindowSec, 300)
+}
+
+func frtBreakerHalfOpenStrikes() int {
+	return frtBreakerPositiveInt(common.FrtBreakerHalfOpenStrikes, 1)
+}
+
+func frtBreakerHalfOpenSweepSec() int {
+	if common.FrtBreakerHalfOpenSweepSec < 5 {
+		return 5
+	}
+	return common.FrtBreakerHalfOpenSweepSec
 }

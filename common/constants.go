@@ -151,6 +151,15 @@ var QuotaForInvitee = 0
 var ChannelDisableThreshold = 5.0
 var AutomaticDisableChannelEnabled = false
 var AutomaticEnableChannelEnabled = false
+var FrtBreakerEnabled = GetEnvOrDefaultBool("FRT_BREAKER_ENABLED", false)
+var FrtBreakerThresholdSec = GetEnvOrDefault("FRT_BREAKER_THRESHOLD_SEC", 15)
+var FrtBreakerStrikes = GetEnvOrDefault("FRT_BREAKER_STRIKES", 3)
+var FrtBreakerWindowSec = GetEnvOrDefault("FRT_BREAKER_WINDOW_SEC", 300)
+var FrtBreakerCooldownSec = GetEnvOrDefault("FRT_BREAKER_COOLDOWN_SEC", 600)
+var FrtBreakerHalfOpenEnabled = GetEnvOrDefaultBool("FRT_BREAKER_HALF_OPEN_ENABLED", false)
+var FrtBreakerHalfOpenWindowSec = GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_WINDOW_SEC", 300)
+var FrtBreakerHalfOpenStrikes = GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_STRIKES", 1)
+var FrtBreakerHalfOpenSweepSec = GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_SWEEP_SEC", 30)
 var QuotaRemindThreshold = 1000
 var PreConsumedQuota = 500
 

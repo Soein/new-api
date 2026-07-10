@@ -5171,6 +5171,15 @@
     "When billed as {{group}}": "{{group}} として課金時",
     "Worked example": "具体例",
     "Response Time Threshold (seconds)": "応答時間しきい値（秒）",
-    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "定期テストの応答時間と本番の初回トークン遮断器の全体しきい値を上書きします。0 は全体設定を使用します"
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "定期テストの応答時間と本番の初回トークン遮断器の全体しきい値を上書きします。0 は全体設定を使用します",
+    "Batch deleted {{count}} users": "{{count}} 人のユーザーを一括削除しました",
+    "Comparison": "比較条件",
+    "Delete selected users": "選択したユーザーを削除",
+    "Delete selected users?": "選択したユーザーを削除しますか？",
+    "Failed to delete selected users": "選択したユーザーを削除できませんでした",
+    "This will permanently delete {{count}} selected user(s). This action cannot be undone.": "選択した {{count}} 人のユーザーを完全に削除します。この操作は元に戻せません。",
+    "{{count}} user(s) deleted": "{{count}} 人のユーザーを削除しました",
+    "Requested batch deletion of {{count}} users": "{{count}} 人のユーザーの一括削除をリクエストしました",
+    "Batch user deletion failed for {{count}} users: {{reason}}": "{{count}} 人のユーザーの一括削除に失敗しました：{{reason}}"
   }
 }

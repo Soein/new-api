@@ -20,38 +20,46 @@ const UserNameMaxLength = 20
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
-	Id               int                        `json:"id"`
-	Username         string                     `json:"username" gorm:"unique;index" validate:"max=20"`
-	Password         string                     `json:"password" gorm:"not null;" validate:"min=8,max=20"`
-	OriginalPassword string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
-	DisplayName      string                     `json:"display_name" gorm:"index" validate:"max=20"`
-	Role             int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
-	Status           int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
-	Email            string                     `json:"email" gorm:"index" validate:"max=50"`
-	GitHubId         string                     `json:"github_id" gorm:"column:github_id;index"`
-	DiscordId        string                     `json:"discord_id" gorm:"column:discord_id;index"`
-	OidcId           string                     `json:"oidc_id" gorm:"column:oidc_id;index"`
-	WeChatId         string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
-	TelegramId       string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
-	VerificationCode string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
-	AccessToken      *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
-	Quota            int                        `json:"quota" gorm:"type:int;default:0"`
-	UsedQuota        int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
-	RequestCount     int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
-	Group            string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
-	AffCode          string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
-	AffCount         int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
-	AffQuota         int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
-	AffHistoryQuota  int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
-	InviterId        int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
-	DeletedAt        gorm.DeletedAt             `gorm:"index"`
-	LinuxDOId        string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
-	Setting          string                     `json:"setting" gorm:"type:text;column:setting"`
-	Remark           string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
-	StripeCustomer   string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
-	CreatedAt        int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
-	LastLoginAt      int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
-	AdminPermissions map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
+	Id                int                        `json:"id"`
+	Username          string                     `json:"username" gorm:"unique;index" validate:"max=20"`
+	Password          string                     `json:"password" gorm:"not null;" validate:"min=8,max=20"`
+	OriginalPassword  string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
+	DisplayName       string                     `json:"display_name" gorm:"index" validate:"max=20"`
+	Role              int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
+	Status            int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
+	Email             string                     `json:"email" gorm:"index" validate:"max=50"`
+	GitHubId          string                     `json:"github_id" gorm:"column:github_id;index"`
+	DiscordId         string                     `json:"discord_id" gorm:"column:discord_id;index"`
+	OidcId            string                     `json:"oidc_id" gorm:"column:oidc_id;index"`
+	WeChatId          string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
+	TelegramId        string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
+	VerificationCode  string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
+	AccessToken       *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
+	Quota             int                        `json:"quota" gorm:"type:int;default:0"`
+	UsedQuota         int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
+	RequestCount      int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
+	Group             string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
+	AffCode           string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
+	AffCount          int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
+	AffQuota          int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
+	AffHistoryQuota   int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
+	InviterId         int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
+	DeletedAt         gorm.DeletedAt             `gorm:"index"`
+	LinuxDOId         string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
+	Setting           string                     `json:"setting" gorm:"type:text;column:setting"`
+	Remark            string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
+	StripeCustomer    string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+	CreatedAt         int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+	LastLoginAt       int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
+	SessionGeneration string                     `json:"identity_generation" gorm:"type:char(32);column:session_generation"`
+	AdminPermissions  map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
+}
+
+func (user *User) BeforeCreate(_ *gorm.DB) error {
+	if user.SessionGeneration == "" {
+		user.SessionGeneration = common.GetUUID()
+	}
+	return nil
 }
 
 func (user *User) ToBaseUser() *UserBase {
@@ -76,6 +84,22 @@ func (user *User) GetAccessToken() string {
 
 func (user *User) SetAccessToken(token string) {
 	user.AccessToken = &token
+}
+
+func UpdateUserAccessToken(userID int, expectedGeneration string, token string) error {
+	if userID <= 0 || expectedGeneration == "" || token == "" {
+		return ErrUserNotFound
+	}
+	result := DB.Model(&User{}).
+		Where("id = ? AND session_generation = ?", userID, expectedGeneration).
+		Update("access_token", token)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrUserNotFound
+	}
+	return nil
 }
 
 func (user *User) GetSetting() dto.UserSetting {
@@ -319,10 +343,13 @@ func GetAllUsers(pageInfo *common.PageInfo) (users []*User, total int64, err err
 	return users, total, nil
 }
 
-func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int) ([]*User, int64, error) {
+func SearchUsers(keyword string, group string, role *int, status *int, quotaOperator string, quotaValue *int, startIdx int, num int) ([]*User, int64, error) {
 	var users []*User
 	var total int64
 	var err error
+	if (quotaOperator == "") != (quotaValue == nil) {
+		return nil, 0, errors.New("quota operator and value must be provided together")
+	}
 
 	// 开始事务
 	tx := DB.Begin()
@@ -364,6 +391,23 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 			query = query.Where("deleted_at IS NULL").Where("status = ?", *status)
 		}
 	}
+	if quotaValue != nil {
+		switch quotaOperator {
+		case "lt":
+			query = query.Where("quota < ?", *quotaValue)
+		case "lte":
+			query = query.Where("quota <= ?", *quotaValue)
+		case "eq":
+			query = query.Where("quota = ?", *quotaValue)
+		case "gte":
+			query = query.Where("quota >= ?", *quotaValue)
+		case "gt":
+			query = query.Where("quota > ?", *quotaValue)
+		default:
+			tx.Rollback()
+			return nil, 0, errors.New("invalid quota operator")
+		}
+	}
 
 	// 获取总数
 	err = query.Count(&total).Error
@@ -401,6 +445,83 @@ func GetUserById(id int, selectAll bool) (*User, error) {
 	return &user, err
 }
 
+// GetUserAuthStatus reads the primary database directly so authorization does
+// not depend on asynchronously refreshed or evictable cache data.
+func GetUserAuthStatus(id int) (int, error) {
+	if id <= 0 {
+		return 0, ErrUserNotFound
+	}
+	var user User
+	if err := DB.Select("status").First(&user, "id = ?", id).Error; err != nil {
+		return 0, err
+	}
+	return user.Status, nil
+}
+
+// EnsureUserSessionGeneration upgrades users created before the generation
+// column existed. Existing cookies without the generation remain invalid and
+// must log in again; only a successful login receives the stored value.
+func EnsureUserSessionGeneration(user *User) error {
+	if user == nil || user.Id <= 0 {
+		return ErrUserNotFound
+	}
+	if user.SessionGeneration != "" {
+		return nil
+	}
+
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var current User
+		if err := lockForUpdate(tx).
+			Select("id", "username", "session_generation").
+			First(&current, "id = ?", user.Id).Error; err != nil {
+			return err
+		}
+		// A non-empty generation on the database row with an empty generation
+		// on the caller indicates a stale or incomplete identity snapshot. Never
+		// adopt it, because the numeric ID may already belong to someone else.
+		if current.Username != user.Username || current.SessionGeneration != "" {
+			return ErrUserNotFound
+		}
+
+		generation := common.GetUUID()
+		if err := tx.Model(&User{}).
+			Where("id = ? AND (session_generation = ? OR session_generation IS NULL)", user.Id, "").
+			Update("session_generation", generation).Error; err != nil {
+			return err
+		}
+		user.SessionGeneration = generation
+		return nil
+	})
+}
+
+func backfillUserSessionGenerations() error {
+	const batchSize = 500
+	for {
+		var ids []int
+		if err := DB.Unscoped().Model(&User{}).
+			Where("session_generation = ? OR session_generation IS NULL", "").
+			Limit(batchSize).
+			Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		if err := DB.Transaction(func(tx *gorm.DB) error {
+			for _, id := range ids {
+				if err := tx.Unscoped().Model(&User{}).
+					Where("id = ? AND (session_generation = ? OR session_generation IS NULL)", id, "").
+					Update("session_generation", common.GetUUID()).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+}
+
 func GetUserIdByAffCode(affCode string) (int, error) {
 	if affCode == "" {
 		return 0, errors.New("affCode 为空！")
@@ -418,16 +539,90 @@ func DeleteUserById(id int) (err error) {
 	return user.Delete()
 }
 
-func HardDeleteUserById(id int) error {
-	if id == 0 {
-		return errors.New("id 为空！")
+type UserDeletionTarget struct {
+	Id                 int    `json:"id"`
+	IdentityGeneration string `json:"identity_generation"`
+}
+
+func HardDeleteUsersByIds(targets []UserDeletionTarget, actorId int, actorGeneration string) ([]*User, error) {
+	if len(targets) == 0 || actorId <= 0 || actorGeneration == "" {
+		return nil, ErrUserNotFound
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
-		if err := deleteUserOAuthBindingsByUserId(tx, id); err != nil {
+	ids := make([]int, 0, len(targets))
+	for _, target := range targets {
+		if target.Id <= 0 || target.IdentityGeneration == "" {
+			return nil, ErrUserNotFound
+		}
+		ids = append(ids, target.Id)
+	}
+
+	var users []*User
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		lockIds := make([]int, 0, len(ids)+1)
+		lockIds = append(lockIds, actorId)
+		lockIds = append(lockIds, ids...)
+		var lockedUsers []*User
+		if err := lockForUpdate(tx).Where("id IN ?", lockIds).Order("id asc").Find(&lockedUsers).Error; err != nil {
 			return err
 		}
-		return tx.Unscoped().Delete(&User{}, "id = ?", id).Error
+
+		usersById := make(map[int]*User, len(lockedUsers))
+		for _, user := range lockedUsers {
+			usersById[user.Id] = user
+		}
+		actor, exists := usersById[actorId]
+		if !exists || actor.SessionGeneration != actorGeneration || actor.Status != common.UserStatusEnabled || actor.Role < common.RoleAdminUser {
+			return ErrUserNoPermission
+		}
+
+		users = make([]*User, 0, len(targets))
+		for _, target := range targets {
+			user, exists := usersById[target.Id]
+			if !exists {
+				return ErrUserNotFound
+			}
+			if user.SessionGeneration != target.IdentityGeneration {
+				return ErrUserNotFound
+			}
+			if actor.Role <= user.Role {
+				return ErrUserNoPermission
+			}
+			users = append(users, user)
+		}
+		if err := tx.Where("user_id IN ?", ids).Delete(&UserOAuthBinding{}).Error; err != nil {
+			return err
+		}
+		// Authentication factors must not outlive the numeric user ID. Hard
+		// delete them so a future account that reuses the ID cannot inherit an
+		// old passkey, TOTP secret, or backup code.
+		if err := tx.Unscoped().Where("user_id IN ?", ids).Delete(&PasskeyCredential{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("user_id IN ?", ids).Delete(&TwoFABackupCode{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("user_id IN ?", ids).Delete(&TwoFA{}).Error; err != nil {
+			return err
+		}
+		// Revoke every API credential before removing the identity. Keeping the
+		// soft-deleted token rows lets post-commit cache invalidation find their
+		// keys, while normal token lookups can no longer authenticate them.
+		if err := tx.Where("user_id IN ?", ids).Delete(&Token{}).Error; err != nil {
+			return err
+		}
+		result := tx.Unscoped().Where("id IN ?", ids).Delete(&User{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(ids)) {
+			return fmt.Errorf("deleted %d users, expected %d", result.RowsAffected, len(ids))
+		}
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return users, nil
 }
 
 func inviteUser(inviterId int) (err error) {

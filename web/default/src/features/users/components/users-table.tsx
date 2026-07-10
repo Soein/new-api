@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
+import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -29,18 +30,23 @@ import {
 } from '@/components/data-table'
 import { useMediaQuery } from '@/hooks'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
+import { quotaUnitsFromDisplayAmount } from '@/lib/format'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getUsers, searchUsers } from '../api'
 import {
   USER_STATUS,
+  canBulkDeleteUser,
   getUserStatusOptions,
   getUserRoleOptions,
   isUserDeleted,
+  normalizeQuotaComparisonValue,
 } from '../constants'
-import type { User } from '../types'
+import type { QuotaComparisonOperator, User } from '../types'
 import { DataTableBulkActions } from './data-table-bulk-actions'
 import { useUsersColumns } from './users-columns'
 import { useUsers } from './users-provider'
+import { UsersQuotaFilter } from './users-quota-filter'
 
 const route = getRouteApi('/_authenticated/users/')
 
@@ -53,6 +59,19 @@ export function UsersTable() {
   const columns = useUsersColumns()
   const { refreshTrigger } = useUsers()
   const isMobile = useMediaQuery('(max-width: 640px)')
+  const currentUser = useAuthStore((state) => state.auth.user)
+  const search = route.useSearch()
+  const navigate = route.useNavigate()
+  const quotaOperator = search.quotaOperator
+  const quotaAmount = search.quotaAmount
+  const hasQuotaFilter =
+    quotaOperator !== undefined && quotaAmount !== undefined
+  const quotaValue = hasQuotaFilter
+    ? normalizeQuotaComparisonValue(
+        quotaOperator,
+        quotaUnitsFromDisplayAmount(quotaAmount)
+      )
+    : undefined
 
   const {
     globalFilter,
@@ -63,8 +82,8 @@ export function UsersTable() {
     onPaginationChange,
     ensurePageInRange,
   } = useTableUrlState({
-    search: route.useSearch(),
-    navigate: route.useNavigate(),
+    search,
+    navigate,
     pagination: { defaultPage: 1, defaultPageSize: isMobile ? 10 : 20 },
     globalFilter: { enabled: true, key: 'filter' },
     columnFilters: [
@@ -84,6 +103,17 @@ export function UsersTable() {
   const groupFilter =
     (columnFilters.find((filter) => filter.id === 'group')?.value as string) ??
     ''
+  const selectionScope = JSON.stringify([
+    pagination.pageIndex,
+    pagination.pageSize,
+    globalFilter,
+    statusFilter,
+    roleFilter,
+    groupFilter,
+    quotaOperator,
+    quotaAmount,
+    refreshTrigger,
+  ])
 
   // Fetch data with React Query
   const { data, isLoading, isFetching } = useQuery({
@@ -95,12 +125,20 @@ export function UsersTable() {
       statusFilter,
       roleFilter,
       groupFilter,
+      quotaOperator,
+      quotaAmount,
       refreshTrigger,
     ],
     queryFn: async () => {
+      if (hasQuotaFilter && quotaValue === null) {
+        return { items: [], total: 0 }
+      }
       const hasFilter = globalFilter?.trim()
       const hasColumnFilter =
-        statusFilter.length > 0 || roleFilter.length > 0 || Boolean(groupFilter)
+        statusFilter.length > 0 ||
+        roleFilter.length > 0 ||
+        Boolean(groupFilter) ||
+        hasQuotaFilter
       const params = {
         p: pagination.pageIndex + 1,
         page_size: pagination.pageSize,
@@ -114,6 +152,8 @@ export function UsersTable() {
               status: statusFilter[0] ?? '',
               role: roleFilter[0] ?? '',
               group: groupFilter,
+              quota_operator: quotaOperator,
+              quota_value: quotaValue ?? undefined,
             })
           : await getUsers(params)
 
@@ -129,7 +169,6 @@ export function UsersTable() {
         total: result.data?.total || 0,
       }
     },
-    placeholderData: (previousData) => previousData,
   })
 
   const users = data?.items || []
@@ -137,7 +176,8 @@ export function UsersTable() {
   const { table } = useDataTable({
     data: users,
     columns,
-    enableRowSelection: true,
+    enableRowSelection: (row) => canBulkDeleteUser(currentUser, row.original),
+    getRowId: (user) => String(user.id),
     columnFilters,
     globalFilter,
     pagination,
@@ -162,6 +202,10 @@ export function UsersTable() {
     totalCount: data?.total || 0,
     ensurePageInRange,
   })
+
+  useEffect(() => {
+    table.resetRowSelection()
+  }, [selectionScope, table])
 
   return (
     <DataTablePage
@@ -191,15 +235,55 @@ export function UsersTable() {
             singleSelect: true,
           },
         ],
+        additionalSearch: (
+          <UsersQuotaFilter
+            operator={quotaOperator}
+            amount={quotaAmount}
+            onApply={(operator: QuotaComparisonOperator, amount: number) => {
+              navigate({
+                search: (previous) => ({
+                  ...previous,
+                  page: undefined,
+                  quotaOperator: operator,
+                  quotaAmount: amount,
+                }),
+              })
+            }}
+            onClear={() => {
+              navigate({
+                search: (previous) => ({
+                  ...previous,
+                  page: undefined,
+                  quotaOperator: undefined,
+                  quotaAmount: undefined,
+                }),
+              })
+            }}
+          />
+        ),
+        hasAdditionalFilters: hasQuotaFilter,
+        onReset: () => {
+          navigate({
+            search: (previous) => ({
+              ...previous,
+              page: undefined,
+              quotaOperator: undefined,
+              quotaAmount: undefined,
+            }),
+          })
+        },
       }}
-      getRowClassName={(row, { isMobile }) =>
-        isDisabledUserRow(row.original)
-          ? isMobile
-            ? DISABLED_ROW_MOBILE
-            : DISABLED_ROW_DESKTOP
-          : undefined
+      getRowClassName={(row, { isMobile }) => {
+        if (!isDisabledUserRow(row.original)) return undefined
+        return isMobile ? DISABLED_ROW_MOBILE : DISABLED_ROW_DESKTOP
+      }}
+      bulkActions={
+        <DataTableBulkActions
+          key={selectionScope}
+          table={table}
+          isUnavailable={isFetching}
+        />
       }
-      bulkActions={<DataTableBulkActions table={table} />}
     />
   )
 }

@@ -80,14 +80,14 @@ export function formatQuota(quota: number): string {
 /**
  * Parse quota from the current display input back to quota units.
  */
-export function parseQuotaFromDollars(amount: number): number {
+export function quotaUnitsFromDisplayAmount(amount: number): number {
   if (!Number.isFinite(amount)) return 0
 
   const { config, meta } = getCurrencyDisplay()
 
   // Tokens-only or raw quota mode
   if (meta.kind === 'tokens') {
-    return Math.round(amount)
+    return amount
   }
 
   const exchangeRate =
@@ -95,7 +95,11 @@ export function parseQuotaFromDollars(amount: number): number {
 
   const usdAmount = exchangeRate > 0 ? amount / exchangeRate : amount
 
-  return Math.round(usdAmount * config.quotaPerUnit)
+  return usdAmount * config.quotaPerUnit
+}
+
+export function parseQuotaFromDollars(amount: number): number {
+  return Math.round(quotaUnitsFromDisplayAmount(amount))
 }
 
 /**

@@ -20,6 +20,7 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
 import { Users } from '@/features/users'
+import { quotaComparisonOperatorSchema } from '@/features/users/types'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -36,6 +37,8 @@ const usersSearchSchema = z.object({
     .optional()
     .catch([]),
   group: z.string().optional().catch(''),
+  quotaOperator: quotaComparisonOperatorSchema.optional().catch(undefined),
+  quotaAmount: z.number().finite().optional().catch(undefined),
 })
 
 export const Route = createFileRoute('/_authenticated/users/')({

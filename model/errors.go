@@ -15,6 +15,9 @@ var (
 	ErrEmailNotFound         = errors.New("email not found")
 	ErrEmailAmbiguous        = errors.New("email matches multiple users")
 	ErrUserQuotaInsufficient = errors.New("user quota insufficient")
+	ErrUserNotFound          = errors.New("user not found")
+	ErrUserNoPermission      = errors.New("no permission to manage user")
+	ErrUserDisabled          = errors.New("user disabled")
 )
 
 // Token auth errors

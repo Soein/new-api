@@ -28,6 +28,7 @@ import type {
   ManageUserAction,
   ManageUserQuotaPayload,
   ApiResponse,
+  UserDeletionTarget,
 } from './types'
 
 // ============================================================================
@@ -56,6 +57,8 @@ export async function searchUsers(
     group = '',
     role = '',
     status = '',
+    quota_operator,
+    quota_value,
     p = 1,
     page_size = 10,
   } = params
@@ -64,6 +67,10 @@ export async function searchUsers(
   queryParams.set('group', group)
   if (role) queryParams.set('role', role)
   if (status) queryParams.set('status', status)
+  if (quota_operator && quota_value !== undefined) {
+    queryParams.set('quota_operator', quota_operator)
+    queryParams.set('quota_value', String(quota_value))
+  }
   queryParams.set('p', String(p))
   queryParams.set('page_size', String(page_size))
   const res = await api.get(`/api/user/search?${queryParams.toString()}`)
@@ -101,8 +108,22 @@ export async function updateUser(
 /**
  * Delete a single user (hard delete)
  */
-export async function deleteUser(id: number): Promise<ApiResponse> {
-  const res = await api.delete(`/api/user/${id}/`)
+export async function deleteUser(
+  target: UserDeletionTarget
+): Promise<ApiResponse> {
+  const res = await api.delete(`/api/user/${target.id}/`, {
+    params: { identity_generation: target.identity_generation },
+  })
+  return res.data
+}
+
+/**
+ * Permanently delete selected users as one atomic batch.
+ */
+export async function batchDeleteUsers(
+  users: UserDeletionTarget[]
+): Promise<ApiResponse<number>> {
+  const res = await api.post('/api/user/batch', { users })
   return res.data
 }
 

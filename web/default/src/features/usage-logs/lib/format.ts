@@ -314,6 +314,10 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'user.create': 'Created user {{username}} (role {{role}})',
   'user.update': 'Updated user {{username}} (ID: {{id}})',
   'user.delete': 'Deleted user {{username}} (ID: {{id}})',
+  'user.delete_batch_request': 'Requested batch deletion of {{count}} users',
+  'user.delete_batch_failure':
+    'Batch user deletion failed for {{count}} users: {{reason}}',
+  'user.delete_batch': 'Batch deleted {{count}} users',
   'user.manage': 'Performed {{action}} on user {{username}} (ID: {{id}})',
   'user.quota_add': 'Increased user quota by {{quota}}',
   'user.quota_subtract': 'Decreased user quota by {{quota}}',

@@ -196,7 +196,10 @@ func ValidateUserToken(key string) (token *Token, err error) {
 	if key == "" {
 		return nil, ErrTokenNotProvided
 	}
-	token, err = GetTokenByKey(key, false)
+	// Authentication always verifies the token against the primary database.
+	// Redis remains a performance cache for mutable token data, but a stale
+	// credential must never survive deletion or user-ID reuse.
+	token, err = GetTokenByKey(key, true)
 	if err == nil {
 		if token.Status == common.TokenStatusExhausted ||
 			token.Status == common.TokenStatusExpired ||
@@ -222,6 +225,16 @@ func ValidateUserToken(key string) (token *Token, err error) {
 				}
 			}
 			return token, ErrTokenInvalid
+		}
+		userStatus, userErr := GetUserAuthStatus(token.UserId)
+		if userErr != nil {
+			if errors.Is(userErr, gorm.ErrRecordNotFound) || errors.Is(userErr, ErrUserNotFound) {
+				return nil, ErrTokenInvalid
+			}
+			return nil, fmt.Errorf("%w: %v", ErrDatabase, userErr)
+		}
+		if userStatus != common.UserStatusEnabled {
+			return token, ErrUserDisabled
 		}
 		return token, nil
 	}
@@ -283,10 +296,25 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	return token, err
 }
 
-func (token *Token) Insert() error {
-	var err error
-	err = DB.Create(token).Error
-	return err
+func (token *Token) Insert(expectedUserGeneration string) error {
+	if token.UserId <= 0 || expectedUserGeneration == "" {
+		return ErrUserNotFound
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).
+			Select("id", "status", "session_generation").
+			First(&user, "id = ?", token.UserId).Error; err != nil {
+			return err
+		}
+		if user.SessionGeneration != expectedUserGeneration {
+			return ErrUserNotFound
+		}
+		if user.Status != common.UserStatusEnabled {
+			return ErrUserDisabled
+		}
+		return tx.Create(token).Error
+	})
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values

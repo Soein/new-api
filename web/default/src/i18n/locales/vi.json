@@ -5171,6 +5171,15 @@
     "When billed as {{group}}": "Khi tính phí theo {{group}}",
     "Worked example": "Ví dụ minh họa",
     "Response Time Threshold (seconds)": "Ngưỡng thời gian phản hồi (giây)",
-    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Ghi đè ngưỡng toàn cục cho thời gian phản hồi của kiểm tra định kỳ và bộ ngắt token đầu tiên trong sản xuất, 0 nghĩa là dùng cài đặt toàn cục"
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Ghi đè ngưỡng toàn cục cho thời gian phản hồi của kiểm tra định kỳ và bộ ngắt token đầu tiên trong sản xuất, 0 nghĩa là dùng cài đặt toàn cục",
+    "Batch deleted {{count}} users": "Đã xóa hàng loạt {{count}} người dùng",
+    "Comparison": "Phép so sánh",
+    "Delete selected users": "Xóa người dùng đã chọn",
+    "Delete selected users?": "Xóa người dùng đã chọn?",
+    "Failed to delete selected users": "Không thể xóa người dùng đã chọn",
+    "This will permanently delete {{count}} selected user(s). This action cannot be undone.": "Thao tác này sẽ xóa vĩnh viễn {{count}} người dùng đã chọn và không thể hoàn tác.",
+    "{{count}} user(s) deleted": "Đã xóa {{count}} người dùng",
+    "Requested batch deletion of {{count}} users": "Đã yêu cầu xóa hàng loạt {{count}} người dùng",
+    "Batch user deletion failed for {{count}} users: {{reason}}": "Không thể xóa hàng loạt {{count}} người dùng: {{reason}}"
   }
 }

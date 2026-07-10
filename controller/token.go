@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -222,7 +223,7 @@ func AddToken(c *gin.Context) {
 		Group:              token.Group,
 		CrossGroupRetry:    token.CrossGroupRetry,
 	}
-	err = cleanToken.Insert()
+	err = cleanToken.Insert(common.GetContextKeyString(c, constant.ContextKeyUserSessionGeneration))
 	if err != nil {
 		common.ApiError(c, err)
 		return

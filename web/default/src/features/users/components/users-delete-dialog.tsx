@@ -37,7 +37,10 @@ export function UsersDeleteDialog() {
 
     setIsDeleting(true)
     try {
-      const result = await deleteUser(currentRow.id)
+      const result = await deleteUser({
+        id: currentRow.id,
+        identity_generation: currentRow.identity_generation,
+      })
       if (result.success) {
         toast.success(t(getUserActionMessage('delete')))
         setOpen(null)

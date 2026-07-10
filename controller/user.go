@@ -135,6 +135,11 @@ func recordLoginAudit(user *model.User, c *gin.Context) {
 
 // setup session & cookies and then return user info
 func setupLogin(user *model.User, c *gin.Context) {
+	if err := model.EnsureUserSessionGeneration(user); err != nil {
+		common.SysLog(fmt.Sprintf("failed to establish session generation for user %d: %v", user.Id, err))
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
 	model.UpdateUserLastLoginAt(user.Id)
 	session := sessions.Default(c)
 	session.Set("id", user.Id)
@@ -142,6 +147,7 @@ func setupLogin(user *model.User, c *gin.Context) {
 	session.Set("role", user.Role)
 	session.Set("status", user.Status)
 	session.Set("group", user.Group)
+	session.Set(constant.SessionKeyUserGeneration, user.SessionGeneration)
 	err := session.Save()
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserSessionSaveFailed)
@@ -286,7 +292,7 @@ func Register(c *gin.Context) {
 		if setting.DefaultUseAutoGroup {
 			token.Group = "auto"
 		}
-		if err := token.Insert(); err != nil {
+		if err := token.Insert(insertedUser.SessionGeneration); err != nil {
 			common.ApiErrorI18n(c, i18n.MsgCreateDefaultTokenErr)
 			return
 		}
@@ -329,8 +335,30 @@ func SearchUsers(c *gin.Context) {
 			status = &parsed
 		}
 	}
+	quotaOperator, hasQuotaOperator := c.GetQuery("quota_operator")
+	quotaValueStr, hasQuotaValue := c.GetQuery("quota_value")
+	if hasQuotaOperator != hasQuotaValue {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	var quotaValue *int
+	if hasQuotaOperator {
+		switch quotaOperator {
+		case "lt", "lte", "eq", "gte", "gt":
+		default:
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		parsed, err := strconv.ParseInt(quotaValueStr, 10, 32)
+		if err != nil {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		value := int(parsed)
+		quotaValue = &value
+	}
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	users, total, err := model.SearchUsers(keyword, group, role, status, quotaOperator, quotaValue, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -373,11 +401,6 @@ func GetUser(c *gin.Context) {
 
 func GenerateAccessToken(c *gin.Context) {
 	id := c.GetInt("id")
-	user, err := model.GetUserById(id, true)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
 	// get rand int 28-32
 	randI := common.GetRandomInt(4)
 	key, err := common.GenerateRandomKey(29 + randI)
@@ -386,14 +409,21 @@ func GenerateAccessToken(c *gin.Context) {
 		common.SysLog("failed to generate key: " + err.Error())
 		return
 	}
-	user.SetAccessToken(key)
-
-	if model.DB.Where("access_token = ?", user.AccessToken).First(user).RowsAffected != 0 {
+	var existing int64
+	if err := model.DB.Unscoped().Model(&model.User{}).Where("access_token = ?", key).Count(&existing).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if existing != 0 {
 		common.ApiErrorI18n(c, i18n.MsgUuidDuplicate)
 		return
 	}
 
-	if err := user.Update(false); err != nil {
+	if err := model.UpdateUserAccessToken(
+		id,
+		common.GetContextKeyString(c, constant.ContextKeyUserSessionGeneration),
+		key,
+	); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -401,7 +431,7 @@ func GenerateAccessToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    user.AccessToken,
+		"data":    key,
 	})
 	return
 }
@@ -900,21 +930,29 @@ func DeleteUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	originUser, err := model.GetUserById(id, false)
+	identityGeneration := c.Query("identity_generation")
+	if identityGeneration == "" {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	users, err := model.HardDeleteUsersByIds(
+		[]model.UserDeletionTarget{{Id: id, IdentityGeneration: identityGeneration}},
+		c.GetInt("id"),
+		common.GetContextKeyString(c, constant.ContextKeyUserSessionGeneration),
+	)
 	if err != nil {
-		common.ApiError(c, err)
+		switch {
+		case errors.Is(err, model.ErrUserNotFound):
+			common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+		case errors.Is(err, model.ErrUserNoPermission):
+			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
+		default:
+			common.ApiError(c, err)
+		}
 		return
 	}
-	myRole := c.GetInt("role")
-	if myRole <= originUser.Role {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
-		return
-	}
-	err = model.HardDeleteUserById(id)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
+	originUser := users[0]
+	invalidateDeletedUserCaches(users)
 	recordManageAuditFor(c, originUser.Id, "user.delete", map[string]interface{}{
 		"username": originUser.Username,
 		"id":       originUser.Id,
@@ -924,6 +962,109 @@ func DeleteUser(c *gin.Context) {
 		"message": "",
 	})
 	return
+}
+
+type UserBatch struct {
+	Users []model.UserDeletionTarget `json:"users"`
+}
+
+func invalidateDeletedUserCaches(users []*model.User) {
+	for _, user := range users {
+		if err := model.InvalidateUserTokensCache(user.Id); err != nil {
+			common.SysError(fmt.Sprintf("failed to invalidate token cache for deleted user %d: %v", user.Id, err))
+		}
+		if err := model.InvalidateUserCache(user.Id); err != nil {
+			common.SysError(fmt.Sprintf("failed to invalidate cache for deleted user %d: %v", user.Id, err))
+		}
+	}
+}
+
+func DeleteUsersBatch(c *gin.Context) {
+	request := UserBatch{}
+	if err := c.ShouldBindJSON(&request); err != nil || len(request.Users) == 0 {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	if len(request.Users) > 100 {
+		common.ApiErrorI18n(c, i18n.MsgBatchTooMany, map[string]any{"Max": 100})
+		return
+	}
+
+	targets := make([]model.UserDeletionTarget, 0, len(request.Users))
+	ids := make([]int, 0, len(request.Users))
+	seen := make(map[int]string, len(request.Users))
+	for _, target := range request.Users {
+		if target.Id <= 0 || target.IdentityGeneration == "" {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		if generation, exists := seen[target.Id]; exists {
+			if generation != target.IdentityGeneration {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+			continue
+		}
+		seen[target.Id] = target.IdentityGeneration
+		targets = append(targets, target)
+		ids = append(ids, target.Id)
+	}
+	auditParams := map[string]interface{}{
+		"count": len(ids),
+		"ids":   ids,
+	}
+	if requestID := c.GetString(common.RequestIdKey); requestID != "" {
+		auditParams["request_id"] = requestID
+	}
+	if err := recordManageAudit(c, "user.delete_batch_request", auditParams); err != nil {
+		common.SysError("failed to record batch deletion audit: " + err.Error())
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
+
+	users, err := model.HardDeleteUsersByIds(
+		targets,
+		c.GetInt("id"),
+		common.GetContextKeyString(c, constant.ContextKeyUserSessionGeneration),
+	)
+	if err != nil {
+		failureParams := map[string]interface{}{
+			"count":  len(ids),
+			"ids":    ids,
+			"reason": err.Error(),
+		}
+		if requestID, ok := auditParams["request_id"]; ok {
+			failureParams["request_id"] = requestID
+		}
+		_ = recordManageAudit(c, "user.delete_batch_failure", failureParams)
+		switch {
+		case errors.Is(err, model.ErrUserNotFound):
+			common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+		case errors.Is(err, model.ErrUserNoPermission):
+			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
+		default:
+			common.ApiError(c, err)
+		}
+		return
+	}
+
+	invalidateDeletedUserCaches(users)
+
+	completionParams := map[string]interface{}{
+		"count": len(users),
+		"ids":   ids,
+	}
+	if requestID, ok := auditParams["request_id"]; ok {
+		completionParams["request_id"] = requestID
+	}
+	if err := recordManageAudit(c, "user.delete_batch", completionParams); err != nil {
+		common.SysError("failed to record completed batch deletion audit: " + err.Error())
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    len(users),
+	})
 }
 
 func DeleteSelf(c *gin.Context) {

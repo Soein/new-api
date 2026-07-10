@@ -5189,6 +5189,15 @@
     "When billed as {{group}}": "按 {{group}} 计费时",
     "Worked example": "完整示例",
     "Response Time Threshold (seconds)": "响应时间阈值（秒）",
-    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "覆盖定时测试响应时间与生产首字熔断的全局阈值，0 表示使用全局设置"
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "覆盖定时测试响应时间与生产首字熔断的全局阈值，0 表示使用全局设置",
+    "Batch deleted {{count}} users": "批量删除了 {{count}} 个用户",
+    "Comparison": "比较方式",
+    "Delete selected users": "删除所选用户",
+    "Delete selected users?": "删除所选用户？",
+    "Failed to delete selected users": "删除所选用户失败",
+    "This will permanently delete {{count}} selected user(s). This action cannot be undone.": "将永久删除所选的 {{count}} 个用户。此操作无法撤销。",
+    "{{count}} user(s) deleted": "已删除 {{count}} 个用户",
+    "Requested batch deletion of {{count}} users": "请求批量删除 {{count}} 个用户",
+    "Batch user deletion failed for {{count}} users: {{reason}}": "批量删除 {{count}} 个用户失败：{{reason}}"
   }
 }

@@ -348,11 +348,12 @@ func TestSetupLoginDoesNotTouchPasswordWhenPasswordFieldOmitted(t *testing.T) {
 	router.Use(sessions.Sessions("session", store))
 	router.GET("/", func(c *gin.Context) {
 		setupLogin(&model.User{
-			Id:       user.Id,
-			Username: user.Username,
-			Role:     user.Role,
-			Status:   user.Status,
-			Group:    user.Group,
+			Id:                user.Id,
+			Username:          user.Username,
+			Role:              user.Role,
+			Status:            user.Status,
+			Group:             user.Group,
+			SessionGeneration: user.SessionGeneration,
 		}, c)
 	})
 

@@ -5171,6 +5171,15 @@
     "When billed as {{group}}": "Facturé sous {{group}}",
     "Worked example": "Exemple détaillé",
     "Response Time Threshold (seconds)": "Seuil de temps de réponse (secondes)",
-    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Remplace le seuil global du temps de réponse des tests planifiés et du disjoncteur de premier jeton en production, 0 signifie utiliser le paramètre global"
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Remplace le seuil global du temps de réponse des tests planifiés et du disjoncteur de premier jeton en production, 0 signifie utiliser le paramètre global",
+    "Batch deleted {{count}} users": "Suppression groupée de {{count}} utilisateur(s)",
+    "Comparison": "Comparaison",
+    "Delete selected users": "Supprimer les utilisateurs sélectionnés",
+    "Delete selected users?": "Supprimer les utilisateurs sélectionnés ?",
+    "Failed to delete selected users": "Échec de la suppression des utilisateurs sélectionnés",
+    "This will permanently delete {{count}} selected user(s). This action cannot be undone.": "Cette action supprimera définitivement {{count}} utilisateur(s) sélectionné(s). Elle est irréversible.",
+    "{{count}} user(s) deleted": "{{count}} utilisateur(s) supprimé(s)",
+    "Requested batch deletion of {{count}} users": "Demande de suppression groupée de {{count}} utilisateur(s)",
+    "Batch user deletion failed for {{count}} users: {{reason}}": "Échec de la suppression groupée de {{count}} utilisateur(s) : {{reason}}"
   }
 }

@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { Shield, User, Users } from 'lucide-react'
 
-import type { User as UserType } from './types'
+import type { QuotaComparisonOperator, User as UserType } from './types'
 
 // ============================================================================
 // User Utilities
@@ -26,6 +26,53 @@ import type { User as UserType } from './types'
 
 export const isUserDeleted = (user: UserType): boolean => {
   return user.DeletedAt != null
+}
+
+export const canBulkDeleteUser = (
+  currentUser: { id: number; role: number } | null | undefined,
+  targetUser: UserType
+): boolean => {
+  if (!currentUser || currentUser.id === targetUser.id) return false
+  if (isUserDeleted(targetUser)) return false
+  return currentUser.role > targetUser.role
+}
+
+const MIN_QUOTA_VALUE = -2_147_483_648
+const MAX_QUOTA_VALUE = 2_147_483_647
+
+export const normalizeQuotaComparisonValue = (
+  operator: QuotaComparisonOperator,
+  rawQuotaValue: number
+): number | null => {
+  if (!Number.isFinite(rawQuotaValue)) return null
+
+  const nearestInteger = Math.round(rawQuotaValue)
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(rawQuotaValue)) * 8
+  const value =
+    Math.abs(rawQuotaValue - nearestInteger) <= tolerance
+      ? nearestInteger
+      : rawQuotaValue
+
+  let normalizedValue: number
+  switch (operator) {
+    case 'lt':
+    case 'gte':
+      normalizedValue = Math.ceil(value)
+      break
+    case 'lte':
+    case 'gt':
+      normalizedValue = Math.floor(value)
+      break
+    case 'eq':
+      if (!Number.isInteger(value)) return null
+      normalizedValue = value
+      break
+  }
+
+  if (normalizedValue < MIN_QUOTA_VALUE || normalizedValue > MAX_QUOTA_VALUE) {
+    return null
+  }
+  return Object.is(normalizedValue, -0) ? 0 : normalizedValue
 }
 
 // ============================================================================

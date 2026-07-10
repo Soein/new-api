@@ -177,12 +177,27 @@ func GetPasskeyByCredentialID(credentialID []byte) (*PasskeyCredential, error) {
 	return &credential, nil
 }
 
-func UpsertPasskeyCredential(credential *PasskeyCredential) error {
-	if credential == nil {
-		common.SysLog("UpsertPasskeyCredential: nil credential provided")
+func UpsertPasskeyCredential(credential *PasskeyCredential, expectedUserGeneration string) error {
+	if credential == nil || expectedUserGeneration == "" {
+		common.SysLog("UpsertPasskeyCredential: missing credential or owner generation")
 		return fmt.Errorf("Passkey 保存失败，请重试")
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).
+			Select("id", "status", "session_generation").
+			First(&user, "id = ?", credential.UserID).Error; err != nil {
+			common.SysLog(fmt.Sprintf("UpsertPasskeyCredential: owner %d is unavailable: %v", credential.UserID, err))
+			return fmt.Errorf("Passkey 保存失败，请重试")
+		}
+		if user.SessionGeneration != expectedUserGeneration {
+			common.SysLog(fmt.Sprintf("UpsertPasskeyCredential: owner generation changed for user %d", credential.UserID))
+			return fmt.Errorf("Passkey 保存失败，请重试")
+		}
+		if user.Status != common.UserStatusEnabled {
+			common.SysLog(fmt.Sprintf("UpsertPasskeyCredential: owner %d is disabled", credential.UserID))
+			return fmt.Errorf("Passkey 保存失败，请重试")
+		}
 		// 使用Unscoped()进行硬删除，避免唯一索引冲突
 		if err := tx.Unscoped().Where("user_id = ?", credential.UserID).Delete(&PasskeyCredential{}).Error; err != nil {
 			common.SysLog(fmt.Sprintf("UpsertPasskeyCredential: failed to delete existing credential for user %d: %v", credential.UserID, err))

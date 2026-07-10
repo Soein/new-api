@@ -57,6 +57,7 @@ export const userSchema = z.object({
   created_at: z.number().optional(),
   updated_at: z.number().optional(),
   last_login_at: z.number().optional(),
+  identity_generation: z.string(),
   DeletedAt: z.any().nullable().optional(),
   remark: z.string().optional(),
   admin_permissions: z
@@ -66,6 +67,19 @@ export const userSchema = z.object({
 export type User = z.infer<typeof userSchema>
 
 export const userListSchema = z.array(userSchema)
+
+export const quotaComparisonOperatorSchema = z.enum([
+  'lt',
+  'lte',
+  'eq',
+  'gte',
+  'gt',
+])
+export type QuotaComparisonOperator = z.infer<
+  typeof quotaComparisonOperatorSchema
+>
+
+export type UserDeletionTarget = Pick<User, 'id' | 'identity_generation'>
 
 // ============================================================================
 // API Request/Response Types
@@ -99,6 +113,8 @@ export interface SearchUsersParams {
   group?: string
   role?: string
   status?: string
+  quota_operator?: QuotaComparisonOperator
+  quota_value?: number
   p?: number
   page_size?: number
 }

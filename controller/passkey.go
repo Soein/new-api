@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	passkeysvc "github.com/QuantumNous/new-api/service/passkey"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -138,7 +140,7 @@ func PasskeyRegisterFinish(c *gin.Context) {
 		return
 	}
 
-	if err := model.UpsertPasskeyCredential(passkeyCredential); err != nil {
+	if err := model.UpsertPasskeyCredential(passkeyCredential, user.SessionGeneration); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -331,7 +333,7 @@ func PasskeyLoginFinish(c *gin.Context) {
 	}
 	now := time.Now()
 	updatedCredential.LastUsedAt = &now
-	if err := model.UpsertPasskeyCredential(updatedCredential); err != nil {
+	if err := model.UpsertPasskeyCredential(updatedCredential, modelUser.SessionGeneration); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -487,7 +489,7 @@ func PasskeyVerifyFinish(c *gin.Context) {
 	// 更新凭证的最后使用时间
 	now := time.Now()
 	credential.LastUsedAt = &now
-	if err := model.UpsertPasskeyCredential(credential); err != nil {
+	if err := model.UpsertPasskeyCredential(credential, user.SessionGeneration); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -509,14 +511,10 @@ func PasskeyVerifyFinish(c *gin.Context) {
 }
 
 func getSessionUser(c *gin.Context) (*model.User, error) {
-	session := sessions.Default(c)
-	idRaw := session.Get("id")
-	if idRaw == nil {
+	id := c.GetInt("id")
+	expectedGeneration := common.GetContextKeyString(c, constant.ContextKeyUserSessionGeneration)
+	if id <= 0 || expectedGeneration == "" {
 		return nil, errors.New("未登录")
-	}
-	id, ok := idRaw.(int)
-	if !ok {
-		return nil, errors.New("无效的会话信息")
 	}
 	user := &model.User{Id: id}
 	if err := user.FillUserById(); err != nil {
@@ -524,6 +522,9 @@ func getSessionUser(c *gin.Context) (*model.User, error) {
 	}
 	if user.Status != common.UserStatusEnabled {
 		return nil, errors.New("该用户已被禁用")
+	}
+	if subtle.ConstantTimeCompare([]byte(expectedGeneration), []byte(user.SessionGeneration)) != 1 {
+		return nil, errors.New("会话已过期，请重新登录")
 	}
 	return user, nil
 }

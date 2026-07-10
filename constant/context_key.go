@@ -2,6 +2,8 @@ package constant
 
 type ContextKey string
 
+const SessionKeyUserGeneration = "user_session_generation"
+
 const (
 	ContextKeyTokenCountMeta  ContextKey = "token_count_meta"
 	ContextKeyPromptTokens    ContextKey = "prompt_tokens"
@@ -43,14 +45,15 @@ const (
 	ContextKeyAutoGroupRetryIndex ContextKey = "auto_group_retry_index"
 
 	/* user related keys */
-	ContextKeyUserId      ContextKey = "id"
-	ContextKeyUserSetting ContextKey = "user_setting"
-	ContextKeyUserQuota   ContextKey = "user_quota"
-	ContextKeyUserStatus  ContextKey = "user_status"
-	ContextKeyUserEmail   ContextKey = "user_email"
-	ContextKeyUserGroup   ContextKey = "user_group"
-	ContextKeyUsingGroup  ContextKey = "group"
-	ContextKeyUserName    ContextKey = "username"
+	ContextKeyUserId                ContextKey = "id"
+	ContextKeyUserSetting           ContextKey = "user_setting"
+	ContextKeyUserQuota             ContextKey = "user_quota"
+	ContextKeyUserStatus            ContextKey = "user_status"
+	ContextKeyUserEmail             ContextKey = "user_email"
+	ContextKeyUserGroup             ContextKey = "user_group"
+	ContextKeyUsingGroup            ContextKey = "group"
+	ContextKeyUserName              ContextKey = "username"
+	ContextKeyUserSessionGeneration ContextKey = "user_session_generation"
 
 	ContextKeyLocalCountTokens ContextKey = "local_count_tokens"
 

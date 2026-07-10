@@ -5189,6 +5189,15 @@
     "When billed as {{group}}": "When billed as {{group}}",
     "Worked example": "Worked example",
     "Response Time Threshold (seconds)": "Response Time Threshold (seconds)",
-    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting"
+    "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting": "Overrides the global threshold for scheduled-test response time and the production first-token breaker, 0 means use the global setting",
+    "Batch deleted {{count}} users": "Batch deleted {{count}} users",
+    "Comparison": "Comparison",
+    "Delete selected users": "Delete selected users",
+    "Delete selected users?": "Delete selected users?",
+    "Failed to delete selected users": "Failed to delete selected users",
+    "This will permanently delete {{count}} selected user(s). This action cannot be undone.": "This will permanently delete {{count}} selected user(s). This action cannot be undone.",
+    "{{count}} user(s) deleted": "{{count}} user(s) deleted",
+    "Requested batch deletion of {{count}} users": "Requested batch deletion of {{count}} users",
+    "Batch user deletion failed for {{count}} users: {{reason}}": "Batch user deletion failed for {{count}} users: {{reason}}"
   }
 }

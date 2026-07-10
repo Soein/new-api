@@ -6,10 +6,14 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func withHeaderNavModules(t *testing.T, raw string) {
@@ -36,6 +40,30 @@ func withHeaderNavModules(t *testing.T, raw string) {
 
 func performHeaderNavRequest(t *testing.T, handler gin.HandlerFunc, authenticated bool) *httptest.ResponseRecorder {
 	t.Helper()
+	userSessionGeneration := ""
+	if authenticated {
+		previousDB := model.DB
+		db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+		require.NoError(t, err)
+		require.NoError(t, db.AutoMigrate(&model.User{}))
+		user := &model.User{
+			Id:       1,
+			Username: "tester",
+			Role:     common.RoleCommonUser,
+			Status:   common.UserStatusEnabled,
+			Group:    "default",
+		}
+		require.NoError(t, db.Create(user).Error)
+		userSessionGeneration = user.SessionGeneration
+		model.DB = db
+		defer func() {
+			model.DB = previousDB
+			sqlDB, sqlErr := db.DB()
+			if sqlErr == nil {
+				_ = sqlDB.Close()
+			}
+		}()
+	}
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -47,6 +75,7 @@ func performHeaderNavRequest(t *testing.T, handler gin.HandlerFunc, authenticate
 		session.Set("id", 1)
 		session.Set("status", common.UserStatusEnabled)
 		session.Set("group", "default")
+		session.Set(constant.SessionKeyUserGeneration, userSessionGeneration)
 		if err := session.Save(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false})
 			return

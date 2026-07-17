@@ -18,7 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
-import { useEffect } from 'react'
+import type { OnChangeFn, SortingState } from '@tanstack/react-table'
+import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -42,13 +43,22 @@ import {
   isUserDeleted,
   normalizeQuotaComparisonValue,
 } from '../constants'
-import type { QuotaComparisonOperator, User } from '../types'
+import type { QuotaComparisonOperator, User, UserSortBy } from '../types'
 import { DataTableBulkActions } from './data-table-bulk-actions'
 import { useUsersColumns } from './users-columns'
 import { useUsers } from './users-provider'
 import { UsersQuotaFilter } from './users-quota-filter'
 
 const route = getRouteApi('/_authenticated/users/')
+
+const USER_SORTABLE_COLUMNS = new Set<UserSortBy>([
+  'id',
+  'username',
+  'quota',
+  'group',
+  'created_at',
+  'last_login_at',
+])
 
 function isDisabledUserRow(user: User) {
   return isUserDeleted(user) || user.status === USER_STATUS.DISABLED
@@ -72,6 +82,7 @@ export function UsersTable() {
         quotaUnitsFromDisplayAmount(quotaAmount)
       )
     : undefined
+  const [sorting, setSorting] = useState<SortingState>([])
 
   const {
     globalFilter,
@@ -112,8 +123,31 @@ export function UsersTable() {
     groupFilter,
     quotaOperator,
     quotaAmount,
+    sorting,
     refreshTrigger,
   ])
+
+  const sortParams = useMemo(() => {
+    const activeSort = sorting[0]
+    if (
+      !activeSort ||
+      !USER_SORTABLE_COLUMNS.has(activeSort.id as UserSortBy)
+    ) {
+      return {}
+    }
+
+    return {
+      sort_by: activeSort.id as UserSortBy,
+      sort_order: activeSort.desc ? 'desc' : 'asc',
+    } as const
+  }, [sorting])
+
+  const handleSortingChange: OnChangeFn<SortingState> = (updater) => {
+    setSorting(updater)
+    if (pagination.pageIndex > 0) {
+      onPaginationChange({ ...pagination, pageIndex: 0 })
+    }
+  }
 
   // Fetch data with React Query
   const { data, isLoading, isFetching } = useQuery({
@@ -127,6 +161,7 @@ export function UsersTable() {
       groupFilter,
       quotaOperator,
       quotaAmount,
+      sortParams,
       refreshTrigger,
     ],
     queryFn: async () => {
@@ -142,6 +177,7 @@ export function UsersTable() {
       const params = {
         p: pagination.pageIndex + 1,
         page_size: pagination.pageSize,
+        ...sortParams,
       }
 
       const result =
@@ -169,6 +205,7 @@ export function UsersTable() {
         total: result.data?.total || 0,
       }
     },
+    placeholderData: (previousData) => previousData,
   })
 
   const users = data?.items || []
@@ -181,6 +218,7 @@ export function UsersTable() {
     columnFilters,
     globalFilter,
     pagination,
+    sorting,
     globalFilterFn: (row, _columnId, filterValue) => {
       const searchValue = String(filterValue).toLowerCase()
       const fields = [
@@ -197,8 +235,10 @@ export function UsersTable() {
     onPaginationChange,
     onGlobalFilterChange,
     onColumnFiltersChange,
+    onSortingChange: handleSortingChange,
     manualPagination: true,
     manualFiltering: true,
+    manualSorting: true,
     totalCount: data?.total || 0,
     ensurePageInRange,
   })

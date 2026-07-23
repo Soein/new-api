@@ -673,6 +673,9 @@ func HardDeleteUsersByIds(targets []UserDeletionTarget, actorId int, actorGenera
 		if err := tx.Where("user_id IN ?", ids).Delete(&UserOAuthBinding{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("user_id IN ?", ids).Delete(&UserQuotaDebt{}).Error; err != nil {
+			return err
+		}
 		// Remove every authentication-control record introduced by versioned
 		// dashboard sessions so no login state can outlive the deleted identity.
 		for _, authenticationData := range []any{
@@ -760,17 +763,20 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 		return errors.New("邀请额度不足！")
 	}
 
-	// 更新用户额度
-	user.AffQuota -= quota
-	user.Quota += quota
-
-	// 保存用户状态
-	if err := tx.Save(user).Error; err != nil {
+	if err := tx.Model(&User{}).Where("id = ?", user.Id).
+		Update("aff_quota", gorm.Expr("aff_quota - ?", quota)).Error; err != nil {
+		return err
+	}
+	_, err = CreditUserQuotaWithTx(tx, user.Id, quota)
+	if err != nil {
 		return err
 	}
 
-	// 提交事务
-	return tx.Commit().Error
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	invalidateUserQuotaCacheAfterCommit(user.Id)
+	return nil
 }
 
 func (user *User) prepareForInsert(tx *gorm.DB) error {
@@ -1163,6 +1169,9 @@ func deleteUserAuthenticationData(tx *gorm.DB, userId int) error {
 			return err
 		}
 	}
+	if err := tx.Where("user_id = ?", userId).Delete(&UserQuotaDebt{}).Error; err != nil {
+		return err
+	}
 	return deleteUserOAuthBindingsByUserId(tx, userId)
 }
 
@@ -1469,30 +1478,27 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if err := increaseUserQuota(id, quota); err != nil {
-		return err
-	}
-	updateUserQuotaCacheDelta(id, quota)
-	return nil
-}
-
-func increaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", quota)).Error
-	if err != nil {
-		return err
-	}
-	return err
+	return withUserQuotaMutation(id, func() error {
+		quotaDelta, err := creditUserQuota(id, quota)
+		if err != nil {
+			return err
+		}
+		updateUserQuotaCacheDelta(id, quotaDelta)
+		return nil
+	})
 }
 
 func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if err := decreaseUserQuota(id, quota); err != nil {
-		return err
-	}
-	updateUserQuotaCacheDelta(id, -quota)
-	return nil
+	return withUserQuotaMutation(id, func() error {
+		if err := decreaseUserQuota(id, quota); err != nil {
+			return err
+		}
+		updateUserQuotaCacheDelta(id, -quota)
+		return nil
+	})
 }
 
 // DecreaseUserQuotaForSettlement records costs that have already happened
@@ -1502,11 +1508,14 @@ func DecreaseUserQuotaForSettlement(id int, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if err := decreaseUserQuotaAllowNegative(id, quota); err != nil {
-		return err
-	}
-	updateUserQuotaCacheDelta(id, -quota)
-	return nil
+	return withUserQuotaMutation(id, func() error {
+		quotaDelta, err := debitUserQuotaForSettlement(id, quota)
+		if err != nil {
+			return err
+		}
+		updateUserQuotaCacheDelta(id, quotaDelta)
+		return nil
+	})
 }
 
 func decreaseUserQuota(id int, quota int) (err error) {
@@ -1518,19 +1527,6 @@ func decreaseUserQuota(id int, quota int) (err error) {
 	}
 	if result.RowsAffected == 0 {
 		return ErrUserQuotaInsufficient
-	}
-	return nil
-}
-
-func decreaseUserQuotaAllowNegative(id int, quota int) (err error) {
-	result := DB.Model(&User{}).
-		Where("id = ?", id).
-		Update("quota", gorm.Expr("quota - ?", quota))
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
 	}
 	return nil
 }
@@ -1584,12 +1580,14 @@ func UpdateUserUsedQuotaAndRequestCount(id int, quota int) {
 }
 
 func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
-			"used_quota":    gorm.Expr("used_quota + ?", quota),
-			"request_count": gorm.Expr("request_count + ?", count),
-		},
-	).Error
+	err := withUserQuotaMutation(id, func() error {
+		return DB.Model(&User{}).Where("id = ?", id).Updates(
+			map[string]interface{}{
+				"used_quota":    gorm.Expr("used_quota + ?", quota),
+				"request_count": gorm.Expr("request_count + ?", count),
+			},
+		).Error
+	})
 	if err != nil {
 		common.SysLog("failed to update user used quota and request count: " + err.Error())
 		return
@@ -1606,31 +1604,37 @@ func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, r
 		return
 	}
 
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
-			"quota":         gorm.Expr("quota + ?", quota),
-			"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
-			"request_count": gorm.Expr("request_count + ?", requestCount),
-		},
-	).Error
+	err := withUserQuotaMutation(id, func() error {
+		return DB.Model(&User{}).Where("id = ?", id).Updates(
+			map[string]interface{}{
+				"quota":         gorm.Expr("quota + ?", quota),
+				"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
+				"request_count": gorm.Expr("request_count + ?", requestCount),
+			},
+		).Error
+	})
 	if err != nil {
 		common.SysLog("failed to batch update user quota, used quota and request count: " + err.Error())
 	}
 }
 
 func updateUserUsedQuota(id int, quota int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
-			"used_quota": gorm.Expr("used_quota + ?", quota),
-		},
-	).Error
+	err := withUserQuotaMutation(id, func() error {
+		return DB.Model(&User{}).Where("id = ?", id).Updates(
+			map[string]interface{}{
+				"used_quota": gorm.Expr("used_quota + ?", quota),
+			},
+		).Error
+	})
 	if err != nil {
 		common.SysLog("failed to update user used quota: " + err.Error())
 	}
 }
 
 func updateUserRequestCount(id int, count int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Update("request_count", gorm.Expr("request_count + ?", count)).Error
+	err := withUserQuotaMutation(id, func() error {
+		return DB.Model(&User{}).Where("id = ?", id).Update("request_count", gorm.Expr("request_count + ?", count)).Error
+	})
 	if err != nil {
 		common.SysLog("failed to update user request count: " + err.Error())
 	}

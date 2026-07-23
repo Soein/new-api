@@ -42,6 +42,7 @@ func TestMain(m *testing.M) {
 	if err := db.AutoMigrate(
 		&model.Task{},
 		&model.User{},
+		&model.UserQuotaDebt{},
 		&model.Token{},
 		&model.Log{},
 		&model.Channel{},
@@ -65,6 +66,7 @@ func truncate(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
 		model.DB.Exec("DELETE FROM tasks")
+		model.DB.Exec("DELETE FROM user_quota_debts")
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
 		model.DB.Exec("DELETE FROM logs")
@@ -478,7 +480,10 @@ func TestRecalculate_PositiveDeltaRecordsWalletDebt(t *testing.T) {
 	RecalculateTaskQuota(ctx, task, actualQuota, "adaptor adjustment")
 
 	delta := actualQuota - preConsumed
-	assert.Equal(t, currentQuota-delta, getUserQuota(t, userID))
+	assert.Zero(t, getUserQuota(t, userID))
+	debt, err := model.GetUserQuotaDebt(userID)
+	require.NoError(t, err)
+	assert.EqualValues(t, delta-currentQuota, debt)
 	assert.Equal(t, tokenRemain-delta, getTokenRemainQuota(t, tokenID))
 	assert.Equal(t, actualQuota, task.Quota)
 

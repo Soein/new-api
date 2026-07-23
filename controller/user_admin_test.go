@@ -22,6 +22,7 @@ func setupUserAdminControllerTestDB(t *testing.T) *gorm.DB {
 	db := openTokenControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(
 		&model.User{},
+		&model.UserQuotaDebt{},
 		&model.Token{},
 		&model.UserOAuthBinding{},
 		&model.ExternalIdentityClaim{},

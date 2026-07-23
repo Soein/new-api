@@ -150,8 +150,11 @@ func TestWalletTrustBypassReleasesInflightAfterSettle(t *testing.T) {
 	require.Zero(t, walletTrustInflightQuotaForTest(userID))
 }
 
-func TestWalletFundingSettleRecordsOverageAsNegativeBalance(t *testing.T) {
+func TestWalletFundingSettleRecordsOverageAsBoundedDebt(t *testing.T) {
 	truncate(t)
+	previousMaxDebt := common.UserQuotaMaxDebtUsd
+	common.UserQuotaMaxDebtUsd = 0
+	t.Cleanup(func() { common.UserQuotaMaxDebtUsd = previousMaxDebt })
 
 	const userID = 2001
 	seedUser(t, userID, 10)
@@ -161,7 +164,40 @@ func TestWalletFundingSettleRecordsOverageAsNegativeBalance(t *testing.T) {
 
 	var quota int
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Select("quota").Scan(&quota).Error)
-	require.Equal(t, -15, quota)
+	require.Zero(t, quota)
+
+	debt, err := model.GetUserQuotaDebt(userID)
+	require.NoError(t, err)
+	require.EqualValues(t, 15, debt)
+}
+
+func TestBillingSessionSettleIsIdempotent(t *testing.T) {
+	truncate(t)
+	previousMaxDebt := common.UserQuotaMaxDebtUsd
+	common.UserQuotaMaxDebtUsd = 0
+	t.Cleanup(func() { common.UserQuotaMaxDebtUsd = previousMaxDebt })
+
+	const userID = 2004
+	seedUser(t, userID, 100)
+	session := &BillingSession{
+		relayInfo: &relaycommon.RelayInfo{UserId: userID, IsPlayground: true},
+		funding:   &WalletFunding{userId: userID},
+	}
+
+	require.NoError(t, session.Settle(25))
+	require.NoError(t, session.Settle(25))
+
+	var quota int
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Select("quota").Scan(&quota).Error)
+	require.Equal(t, 75, quota)
+	require.Zero(t, mustUserDebt(t, userID))
+}
+
+func mustUserDebt(t *testing.T, userID int) int64 {
+	t.Helper()
+	debt, err := model.GetUserQuotaDebt(userID)
+	require.NoError(t, err)
+	return debt
 }
 
 func setWalletTrustBypassConfig(t *testing.T, enabled bool, minUsd float64, maxInflightUsd float64) {

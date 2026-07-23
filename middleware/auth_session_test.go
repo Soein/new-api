@@ -8,17 +8,15 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/gin-contrib/sessions"
-	"github.com/gin-contrib/sessions/cookie"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
 
-func setupAdminSessionAuthTest(t *testing.T) (*gorm.DB, *gin.Engine, *model.User) {
+func setupAdminSessionAuthTest(t *testing.T) (*gorm.DB, *gin.Engine, *model.User, string) {
 	t.Helper()
 
 	previousDB := model.DB
@@ -26,15 +24,17 @@ func setupAdminSessionAuthTest(t *testing.T) (*gorm.DB, *gin.Engine, *model.User
 	previousMainDBType := common.MainDatabaseType()
 	previousLogDBType := common.LogDatabaseType()
 	previousRedisEnabled := common.RedisEnabled
+	previousSessionSecret := common.SessionSecret
 
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
+	common.SessionSecret = "admin-session-auth-test-secret"
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	model.DB = db
 	model.LOG_DB = db
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Log{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Log{}))
 
 	user := &model.User{
 		Username: "session-admin",
@@ -43,21 +43,11 @@ func setupAdminSessionAuthTest(t *testing.T) (*gorm.DB, *gin.Engine, *model.User
 		Group:    "default",
 	}
 	require.NoError(t, db.Create(user).Error)
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "auth-session-test")
+	require.NoError(t, err)
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.Use(sessions.Sessions("session", cookie.NewStore([]byte("auth-session-test"))))
-	router.GET("/login", func(c *gin.Context) {
-		session := sessions.Default(c)
-		session.Set("username", user.Username)
-		session.Set("role", user.Role)
-		session.Set("id", user.Id)
-		session.Set("status", user.Status)
-		session.Set("group", user.Group)
-		session.Set(constant.SessionKeyUserGeneration, user.SessionGeneration)
-		require.NoError(t, session.Save())
-		c.Status(http.StatusNoContent)
-	})
 	router.GET("/admin", AdminAuth(), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"success": true})
 	})
@@ -67,51 +57,37 @@ func setupAdminSessionAuthTest(t *testing.T) (*gorm.DB, *gin.Engine, *model.User
 		model.LOG_DB = previousLogDB
 		common.SetDatabaseTypes(previousMainDBType, previousLogDBType)
 		common.RedisEnabled = previousRedisEnabled
+		common.SessionSecret = previousSessionSecret
 		sqlDB, sqlErr := db.DB()
 		if sqlErr == nil {
 			_ = sqlDB.Close()
 		}
 	})
 
-	return db, router, user
+	return db, router, user, bundle.AccessToken
 }
 
-func adminSessionCookies(t *testing.T, router *gin.Engine) []*http.Cookie {
-	t.Helper()
-
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/login", nil)
-	router.ServeHTTP(recorder, request)
-	require.Equal(t, http.StatusNoContent, recorder.Code)
-	return recorder.Result().Cookies()
-}
-
-func performAdminSessionRequest(t *testing.T, router *gin.Engine, userID int, cookies []*http.Cookie) *httptest.ResponseRecorder {
+func performAdminSessionRequest(t *testing.T, router *gin.Engine, accessToken string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/admin", nil)
-	request.Header.Set("New-Api-User", fmt.Sprintf("%d", userID))
-	for _, sessionCookie := range cookies {
-		request.AddCookie(sessionCookie)
-	}
+	request.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(recorder, request)
 	return recorder
 }
 
 func TestAdminAuthRejectsDeletedSessionUser(t *testing.T) {
-	db, router, user := setupAdminSessionAuthTest(t)
-	cookies := adminSessionCookies(t, router)
+	db, router, user, accessToken := setupAdminSessionAuthTest(t)
 
 	require.NoError(t, db.Unscoped().Delete(&model.User{}, user.Id).Error)
-	recorder := performAdminSessionRequest(t, router, user.Id, cookies)
+	recorder := performAdminSessionRequest(t, router, accessToken)
 
 	require.Equal(t, http.StatusUnauthorized, recorder.Code)
 }
 
 func TestAdminAuthRejectsReusedUserID(t *testing.T) {
-	db, router, user := setupAdminSessionAuthTest(t)
-	cookies := adminSessionCookies(t, router)
+	db, router, user, accessToken := setupAdminSessionAuthTest(t)
 
 	require.NoError(t, db.Unscoped().Delete(&model.User{}, user.Id).Error)
 	require.NoError(t, db.Create(&model.User{
@@ -123,27 +99,25 @@ func TestAdminAuthRejectsReusedUserID(t *testing.T) {
 		Group:    "default",
 		AffCode:  "replacement-admin",
 	}).Error)
-	recorder := performAdminSessionRequest(t, router, user.Id, cookies)
+	recorder := performAdminSessionRequest(t, router, accessToken)
 
 	require.Equal(t, http.StatusUnauthorized, recorder.Code)
 }
 
 func TestAdminAuthUsesCurrentUserRole(t *testing.T) {
-	db, router, user := setupAdminSessionAuthTest(t)
-	cookies := adminSessionCookies(t, router)
+	db, router, user, accessToken := setupAdminSessionAuthTest(t)
 
 	require.NoError(t, db.Model(&model.User{}).Where("id = ?", user.Id).Update("role", common.RoleCommonUser).Error)
-	recorder := performAdminSessionRequest(t, router, user.Id, cookies)
+	recorder := performAdminSessionRequest(t, router, accessToken)
 
-	require.Equal(t, http.StatusOK, recorder.Code)
-	require.Contains(t, recorder.Body.String(), `"success":false`)
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"code":"AUTH_INSUFFICIENT_PRIVILEGE"`)
 }
 
 func TestAdminAuthAllowsExistingAdminSession(t *testing.T) {
-	_, router, user := setupAdminSessionAuthTest(t)
-	cookies := adminSessionCookies(t, router)
+	_, router, _, accessToken := setupAdminSessionAuthTest(t)
 
-	recorder := performAdminSessionRequest(t, router, user.Id, cookies)
+	recorder := performAdminSessionRequest(t, router, accessToken)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Contains(t, recorder.Body.String(), `"success":true`)

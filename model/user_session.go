@@ -18,7 +18,7 @@ const (
 	UserSessionStatusRevoking = "revoking"
 	UserSessionStatusRevoked  = "revoked"
 
-	userSessionCacheSchema      = 1
+	userSessionCacheSchema      = 2
 	userSessionListLimit        = 100
 	userSessionRevokeBatchSize  = 500
 	userSessionCleanupScanLimit = 1000
@@ -269,7 +269,7 @@ func getUserSessionCache(sid string) (*userSessionCacheEntry, error) {
 	if err := common.RedisHGetObj(userSessionCacheKey(sid), &entry); err != nil {
 		return nil, err
 	}
-	if entry.CacheSchema != userSessionCacheSchema || entry.SID != sid || entry.UserID <= 0 || entry.Version <= 0 || entry.UserAuthVersion <= 0 {
+	if entry.CacheSchema != userSessionCacheSchema || entry.SID != sid || entry.UserID <= 0 || entry.Version <= 0 || entry.UserAuthVersion <= 0 || entry.UserGeneration == "" {
 		return nil, fmt.Errorf("user session cache schema is stale")
 	}
 	if entry.Status != UserSessionStatusActive || entry.RevokedAt != 0 || entry.ExpiresAt <= time.Now().Unix() {
@@ -336,17 +336,18 @@ redis.call('HSET', KEYS[1],
   'UserAuthVersion', ARGV[4], 'Status', ARGV[5],
   'LoginMethod', ARGV[6], 'IP', ARGV[7], 'UserAgent', ARGV[8],
   'CreatedAt', ARGV[9], 'LastActiveAt', ARGV[10], 'ExpiresAt', ARGV[11],
-  'RevokedAt', ARGV[12], 'RevokedReason', ARGV[13], 'CacheSchema', ARGV[14])
+  'RevokedAt', ARGV[12], 'RevokedReason', ARGV[13], 'CacheSchema', ARGV[14],
+  'UserGeneration', ARGV[15])
 if ARGV[5] == 'active' then
-  redis.call('PEXPIREAT', KEYS[1], ARGV[15])
+  redis.call('PEXPIREAT', KEYS[1], ARGV[16])
 else
-  redis.call('PEXPIRE', KEYS[1], ARGV[15])
+  redis.call('PEXPIRE', KEYS[1], ARGV[16])
 end
 return 1`
 	result, err := common.RDB.Eval(context.Background(), script, []string{userSessionCacheKey(entry.SID)},
 		entry.SID, entry.UserID, entry.Version, entry.UserAuthVersion, entry.Status,
 		entry.LoginMethod, entry.IP, entry.UserAgent, entry.CreatedAt, entry.LastActiveAt,
-		entry.ExpiresAt, entry.RevokedAt, entry.RevokedReason, entry.CacheSchema, redisExpiration,
+		entry.ExpiresAt, entry.RevokedAt, entry.RevokedReason, entry.CacheSchema, entry.UserGeneration, redisExpiration,
 	).Int()
 	if err != nil {
 		return err

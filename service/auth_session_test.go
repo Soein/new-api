@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -353,6 +354,41 @@ func TestLoginSessionCreateRefreshAndRevoke(t *testing.T) {
 	require.NoError(t, RevokeByRefreshToken(refreshed.RefreshToken, refreshed.Session.SID, "logout"))
 	_, _, err = ValidateLoginSession(identity)
 	assert.True(t, errors.Is(err, ErrLoginSessionRevoked))
+}
+
+func TestLoginSessionRemainsValidWhenServedFromRedisCache(t *testing.T) {
+	useTestSessionSecret(t)
+	user := setupAuthSessionTestDB(t)
+	_, client, _, _ := useIndependentAuthSessionRedis(t)
+	common.RDB = client
+
+	bundle, err := CreateLoginSession(user.Id, "password", "127.0.0.1", "redis-cache-test")
+	require.NoError(t, err)
+	identity, err := ParseAccessToken(bundle.AccessToken)
+	require.NoError(t, err)
+
+	_, cachedUser, err := ValidateLoginSession(identity)
+	require.NoError(t, err)
+	assert.Equal(t, user.Id, cachedUser.Id)
+}
+
+func TestLoginSessionRepairsCachedAuthenticationWithoutUserGeneration(t *testing.T) {
+	useTestSessionSecret(t)
+	user := setupAuthSessionTestDB(t)
+	server, client, _, _ := useIndependentAuthSessionRedis(t)
+	common.RDB = client
+
+	bundle, err := CreateLoginSession(user.Id, "password", "127.0.0.1", "redis-cache-repair-test")
+	require.NoError(t, err)
+	identity, err := ParseAccessToken(bundle.AccessToken)
+	require.NoError(t, err)
+
+	require.NoError(t, common.RDB.HDel(context.Background(), cachedLoginSessionKey(t, server), "UserGeneration").Err())
+	require.NoError(t, common.RDB.HDel(context.Background(), fmt.Sprintf("user:%d", user.Id), "SessionGeneration").Err())
+
+	_, cachedUser, err := ValidateLoginSession(identity)
+	require.NoError(t, err)
+	assert.Equal(t, user.Id, cachedUser.Id)
 }
 
 func TestIndependentRedisSessionRevokeConvergesAfterCacheTTL(t *testing.T) {

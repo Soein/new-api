@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const userCacheSchemaVersion = 3
+const userCacheSchemaVersion = 4
 
 type UserBase struct {
 	Id                int    `json:"id"`
@@ -131,7 +131,7 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if err != nil {
 		return nil, err
 	}
-	if userCache.Id != userId || userCache.CacheSchema != userCacheSchemaVersion || userCache.AuthVersion <= 0 {
+	if userCache.Id != userId || userCache.CacheSchema != userCacheSchemaVersion || userCache.AuthVersion <= 0 || userCache.SessionGeneration == "" {
 		return nil, fmt.Errorf("user cache schema is stale")
 	}
 	floor, err := getUserAuthVersionFloor(userId)

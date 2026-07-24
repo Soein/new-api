@@ -83,6 +83,7 @@ func newTestUserSession(sid string, userID int, now int64) *UserSession {
 	return &UserSession{
 		SID:             sid,
 		UserID:          userID,
+		UserGeneration:  "test-user-generation",
 		Version:         1,
 		UserAuthVersion: 1,
 		Status:          UserSessionStatusActive,

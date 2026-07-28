@@ -111,6 +111,13 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 		if quota <= 0 {
 			quota = snap.EstimatedQuotaAfterGroup
 		}
+		if snap.ToolPreConsumedQuota > 0 {
+			if quota <= snap.ToolPreConsumedQuota {
+				quota = 0
+			} else {
+				quota -= snap.ToolPreConsumedQuota
+			}
+		}
 		return true, quota, nil
 	}
 

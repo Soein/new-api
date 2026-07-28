@@ -8,7 +8,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 )
 
 var reservedBillableToolNames = map[string]struct{}{
@@ -46,7 +45,7 @@ func (info *RelayInfo) CountBillableToolCall(itemType string, functionName strin
 		if _, reserved := reservedBillableToolNames[functionName]; reserved {
 			return
 		}
-		if operation_setting.GetToolPriceForModel(functionName, info.OriginModelName) <= 0 {
+		if info.GetToolPrice(functionName) <= 0 {
 			return
 		}
 		info.incrementBillableToolCall(functionName)

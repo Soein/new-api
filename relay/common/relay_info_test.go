@@ -6,9 +6,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,6 +68,64 @@ func TestGenRelayInfoResponsesCapturesImageGenerationToolPricingFields(t *testin
 	require.Equal(t, dto.BuildInToolImageGeneration, imageTool.ToolName)
 	require.Equal(t, "high", imageTool.ImageGenerationQuality)
 	require.Equal(t, "1024x1536", imageTool.ImageGenerationSize)
+}
+
+func TestGenRelayInfoFreezesDeclaredCustomToolPrices(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("OpenAI tools", func(t *testing.T) {
+		const toolName = "lookup_openai_customer"
+		operation_setting.SetToolPriceForTest(toolName, 11)
+		t.Cleanup(func() { operation_setting.DeleteToolPriceForTest(toolName) })
+
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		ctx.Set(string(constant.ContextKeyOriginalModel), "frozen-openai-tool-model")
+		info := GenRelayInfoOpenAI(ctx, &dto.GeneralOpenAIRequest{
+			Tools: []dto.ToolCallRequest{{
+				Type:     "function",
+				Function: dto.FunctionRequest{Name: toolName},
+			}},
+		})
+
+		operation_setting.SetToolPriceForTest(toolName, 25)
+		require.Equal(t, 11.0, info.GetToolPrice(toolName))
+	})
+
+	t.Run("OpenAI legacy functions", func(t *testing.T) {
+		const toolName = "lookup_legacy_customer"
+		operation_setting.SetToolPriceForTest(toolName, 12)
+		t.Cleanup(func() { operation_setting.DeleteToolPriceForTest(toolName) })
+
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		ctx.Set(string(constant.ContextKeyOriginalModel), "frozen-legacy-tool-model")
+		info := GenRelayInfoOpenAI(ctx, &dto.GeneralOpenAIRequest{
+			Functions: json.RawMessage(`[{"name":"lookup_legacy_customer"}]`),
+		})
+
+		operation_setting.SetToolPriceForTest(toolName, 26)
+		require.Equal(t, 12.0, info.GetToolPrice(toolName))
+	})
+
+	t.Run("Claude tools", func(t *testing.T) {
+		const toolName = "lookup_claude_customer"
+		operation_setting.SetToolPriceForTest(toolName, 13)
+		t.Cleanup(func() { operation_setting.DeleteToolPriceForTest(toolName) })
+
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		ctx.Set(string(constant.ContextKeyOriginalModel), "frozen-claude-tool-model")
+		info := GenRelayInfoClaude(ctx, &dto.ClaudeRequest{
+			Tools: []any{map[string]any{"name": toolName}},
+		})
+
+		operation_setting.SetToolPriceForTest(toolName, 27)
+		require.Equal(t, 13.0, info.GetToolPrice(toolName))
+	})
 }
 
 func TestRelayInfoMetaTypedNilReceiver(t *testing.T) {

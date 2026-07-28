@@ -82,7 +82,7 @@ func estimateResponsesToolPreConsumeQuota(info *relaycommon.RelayInfo, groupRati
 		return 0
 	}
 
-	price := operation_setting.GetToolPriceForModel(dto.BuildInToolImageGeneration, info.OriginModelName) / 1000
+	price := info.GetToolPrice(dto.BuildInToolImageGeneration) / 1000
 	return common.QuotaFromFloat(price * common.QuotaPerUnit * groupRatio)
 }
 
@@ -332,8 +332,13 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 			freeModel = true
 		}
 	}
-	if toolPreConsumedQuota := estimateResponsesToolPreConsumeQuota(info, groupRatioInfo.GroupRatio); toolPreConsumedQuota > 0 {
-		preConsumedQuota += toolPreConsumedQuota
+	toolPreConsumedQuota := estimateResponsesToolPreConsumeQuota(info, groupRatioInfo.GroupRatio)
+	if toolPreConsumedQuota > 0 {
+		combinedQuota, err := common.QuotaFromFloatStrict(float64(preConsumedQuota) + float64(toolPreConsumedQuota))
+		if err != nil {
+			return hosttypes.PriceData{}, err
+		}
+		preConsumedQuota = combinedQuota
 		freeModel = false
 	}
 
@@ -348,6 +353,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 		EstimatedCompletionTokens: estimatedCompletionTokens,
 		EstimatedQuotaBeforeGroup: quotaBeforeGroup,
 		EstimatedQuotaAfterGroup:  preConsumedQuota,
+		ToolPreConsumedQuota:      toolPreConsumedQuota,
 		EstimatedTier:             trace.MatchedTier,
 		QuotaPerUnit:              common.QuotaPerUnit,
 		ExprVersion:               billingexpr.ExprVersion(exprStr),

@@ -100,11 +100,11 @@ func isLegacyClaudeDerivedOpenAIUsage(relayInfo *relaycommon.RelayInfo, usage *d
 	return usage.ClaudeCacheCreation5mTokens > 0 || usage.ClaudeCacheCreation1hTokens > 0
 }
 
-func collectToolSurchargeItem(items []ToolSurchargeItem, name string, count int, modelName string) []ToolSurchargeItem {
+func collectToolSurchargeItem(items []ToolSurchargeItem, relayInfo *relaycommon.RelayInfo, name string, count int) []ToolSurchargeItem {
 	if count <= 0 {
 		return items
 	}
-	price := operation_setting.GetToolPriceForModel(name, modelName)
+	price := relayInfo.GetToolPrice(name)
 	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
 		return items
 	}
@@ -156,23 +156,23 @@ func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.Rel
 			if tool == nil {
 				continue
 			}
-			items = collectToolSurchargeItem(items, name, tool.CallCount, summary.ModelName)
+			items = collectToolSurchargeItem(items, relayInfo, name, tool.CallCount)
 		}
 	}
 	if relayInfo.RelayMode != relayconstant.RelayModeResponses &&
 		strings.HasSuffix(summary.ModelName, "search-preview") {
-		items = collectToolSurchargeItem(items, dto.BuildInToolWebSearchPreview, 1, summary.ModelName)
+		items = collectToolSurchargeItem(items, relayInfo, dto.BuildInToolWebSearchPreview, 1)
 	}
 
 	items = collectToolSurchargeItem(
 		items,
+		relayInfo,
 		dto.BuildInToolWebSearch,
 		ctx.GetInt("claude_web_search_requests"),
-		summary.ModelName,
 	)
 
 	if ctx.GetBool("gemini_google_search_call") {
-		items = collectToolSurchargeItem(items, dto.BuildInToolGoogleSearch, 1, summary.ModelName)
+		items = collectToolSurchargeItem(items, relayInfo, dto.BuildInToolGoogleSearch, 1)
 	}
 
 	summary.ToolSurchargeItems = mergeToolSurchargeItems(items)

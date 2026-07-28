@@ -48,6 +48,7 @@ type BillingSnapshot struct {
 	EstimatedCompletionTokens int     `json:"estimated_completion_tokens"`
 	EstimatedQuotaBeforeGroup float64 `json:"estimated_quota_before_group"`
 	EstimatedQuotaAfterGroup  int     `json:"estimated_quota_after_group"`
+	ToolPreConsumedQuota      int     `json:"tool_pre_consumed_quota,omitempty"`
 	EstimatedTier             string  `json:"estimated_tier"`
 	QuotaPerUnit              float64 `json:"quota_per_unit"`
 	ExprVersion               int     `json:"expr_version"`

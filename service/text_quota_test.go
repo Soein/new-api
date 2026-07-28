@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
 	"net/http/httptest"
 	"testing"
@@ -602,6 +604,33 @@ func TestComposeTieredTextQuotaKeepsToolCallSurcharges(t *testing.T) {
 	require.Equal(t, 14000, quota)
 }
 
+func TestToolSurchargeUsesPriceFrozenAtRequestEntry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	operation_setting.SetToolPriceForTest(dto.BuildInToolImageGeneration, 11)
+	t.Cleanup(func() {
+		operation_setting.DeleteToolPriceForTest(dto.BuildInToolImageGeneration)
+	})
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	ctx.Set(string(constant.ContextKeyOriginalModel), "frozen-tool-price-model")
+	relayInfo := relaycommon.GenRelayInfoResponses(ctx, &dto.OpenAIResponsesRequest{
+		Model: "frozen-tool-price-model",
+		Tools: json.RawMessage(`[{"type":"image_generation"}]`),
+	})
+
+	operation_setting.SetToolPriceForTest(dto.BuildInToolImageGeneration, 25)
+	relayInfo.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount = 1
+	summary := textQuotaSummary{
+		ModelName:  relayInfo.OriginModelName,
+		GroupRatio: 1,
+	}
+
+	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, &summary)
+	require.Equal(t, int64(5500), surcharge.Round(0).IntPart())
+}
+
 func TestComposeTieredTextQuotaFallbackKeepsToolCallSurcharges(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -673,6 +702,41 @@ func TestComposeTieredTextQuotaErrorFallbackUsesPreConsumedQuota(t *testing.T) {
 
 	require.Equal(t, int64(12500), summary.ToolCallSurchargeQuota.Round(0).IntPart())
 	require.Equal(t, 14500, quota)
+}
+
+func TestTieredErrorFallbackBillsOnlyCompletedImageToolCalls(t *testing.T) {
+	const (
+		baseQuota        = 1_000
+		toolReserve      = 75_000
+		preConsumedQuota = baseQuota + toolReserve
+	)
+
+	for _, callCount := range []int{0, 1, 3} {
+		t.Run(fmt.Sprintf("completed_calls_%d", callCount), func(t *testing.T) {
+			relayInfo := &relaycommon.RelayInfo{
+				FinalPreConsumedQuota: preConsumedQuota,
+				TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+					BillingMode:               "tiered_expr",
+					ExprString:                `invalid expr!!!`,
+					ExprHash:                  billingexpr.ExprHashString(`invalid expr!!!`),
+					GroupRatio:                1,
+					EstimatedQuotaBeforeGroup: baseQuota,
+					EstimatedQuotaAfterGroup:  preConsumedQuota,
+					ToolPreConsumedQuota:      toolReserve,
+				},
+			}
+
+			ok, fallbackQuota, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{})
+			require.True(t, ok)
+			require.Nil(t, result)
+
+			summary := textQuotaSummary{
+				ToolCallSurchargeQuota: decimal.NewFromInt(int64(toolReserve * callCount)),
+			}
+			quota := composeTieredTextQuota(relayInfo, summary, fallbackQuota, result)
+			require.Equal(t, baseQuota+toolReserve*callCount, quota)
+		})
+	}
 }
 
 // TestTryTieredSettleRecordsClampOnOverflow guards that an oversized tiered

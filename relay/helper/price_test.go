@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -33,6 +34,7 @@ func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
 		"billing_setting.billing_mode": `{"tiered-test-model":"tiered_expr"}`,
 		"billing_setting.billing_expr": `{"tiered-test-model":"param(\"stream\") == true ? tier(\"stream\", p * 3) : tier(\"base\", p * 2)"}`,
+		"tool_price_setting.prices":    `{"image_generation":150}`,
 	}))
 
 	recorder := httptest.NewRecorder()
@@ -53,17 +55,75 @@ func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 			Headers: map[string]string{"Content-Type": "application/json"},
 			Body:    []byte(`{"stream":true}`),
 		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolImageGeneration: {
+					ToolName: dto.BuildInToolImageGeneration,
+				},
+			},
+		},
 	}
 
 	priceData, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{
 		BillingRatios: map[string]float64{"n": 3},
 	})
 	require.NoError(t, err)
-	require.Equal(t, 1500, priceData.QuotaToPreConsume)
+	require.Equal(t, 76500, priceData.QuotaToPreConsume)
 	require.NotNil(t, info.TieredBillingSnapshot)
+	require.Equal(t, 75000, info.TieredBillingSnapshot.ToolPreConsumedQuota)
 	require.Equal(t, "stream", info.TieredBillingSnapshot.EstimatedTier)
 	require.Equal(t, billing_setting.BillingModeTieredExpr, info.TieredBillingSnapshot.BillingMode)
 	require.Equal(t, common.QuotaPerUnit, info.TieredBillingSnapshot.QuotaPerUnit)
+}
+
+func TestModelPriceHelperTieredRejectsCombinedToolReserveOverflow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+
+	const modelName = "tiered-image-tool-overflow-model"
+	targetBaseQuota := common.MaxQuota - 1_000
+	rawCost := float64(targetBaseQuota) * 1_000_000 / common.QuotaPerUnit
+	exprJSON, err := common.Marshal(map[string]string{
+		modelName: fmt.Sprintf(`tier("base", %.12f)`, rawCost),
+	})
+	require.NoError(t, err)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"tiered-image-tool-overflow-model":"tiered_expr"}`,
+		"billing_setting.billing_expr": string(exprJSON),
+		"tool_price_setting.prices":    `{"image_generation":150}`,
+	}))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("group", "default")
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: modelName,
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolImageGeneration: {
+					ToolName: dto.BuildInToolImageGeneration,
+				},
+			},
+		},
+	}
+
+	_, err = ModelPriceHelper(ctx, info, 0, &types.TokenCountMeta{})
+	var clamp *common.QuotaClamp
+	require.ErrorAs(t, err, &clamp)
+	require.Equal(t, common.QuotaClampOverflow, clamp.Kind)
 }
 
 func TestModelPriceHelperPreConsumeMaxTokensFallback(t *testing.T) {

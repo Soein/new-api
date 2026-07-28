@@ -79,7 +79,9 @@ type QuotaSettingsSectionProps = {
   defaultValues: QuotaFormValues
 }
 
-export function QuotaSettingsSection({ defaultValues }: QuotaSettingsSectionProps) {
+export function QuotaSettingsSection({
+  defaultValues,
+}: QuotaSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
   const handleNumberChange =

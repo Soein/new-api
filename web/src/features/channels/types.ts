@@ -87,6 +87,8 @@ export interface ChannelSettings {
   system_prompt?: string
   system_prompt_override?: boolean
   response_time_threshold_sec?: number
+  http_protocol?: 'auto' | 'http1' | string
+  http2_connection_shards?: number
 }
 
 export interface ChannelOtherSettings {

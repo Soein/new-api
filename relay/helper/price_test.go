@@ -6,14 +6,14 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -147,6 +147,7 @@ func TestModelPriceHelperPreConsumesResponsesImageGenerationTool(t *testing.T) {
 
 	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"responses-image-tool-model":0.375}`))
 	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"gpt-T":0.1}`))
+	imageToolPrice := operation_setting.GetToolPriceForModel(dto.BuildInToolImageGeneration, "responses-image-tool-model") / 1000
 
 	cases := []struct {
 		name    string
@@ -158,23 +159,23 @@ func TestModelPriceHelperPreConsumesResponsesImageGenerationTool(t *testing.T) {
 			name:    "explicit high rectangular image tool",
 			quality: "high",
 			size:    "1024x1536",
-			price:   operation_setting.GPTImage1High1024x1536,
+			price:   imageToolPrice,
 		},
 		{
 			name:    "explicit low square image tool",
 			quality: "low",
 			size:    "1024x1024",
-			price:   operation_setting.GPTImage1Low1024x1024,
+			price:   imageToolPrice,
 		},
 		{
 			name:  "unknown image shape reserves max tool price",
-			price: operation_setting.GPTImage1High1024x1536,
+			price: imageToolPrice,
 		},
 		{
 			name:    "unknown non-empty image parameters reserve max tool price",
 			quality: "auto",
 			size:    "1536x1536",
-			price:   operation_setting.GPTImage1High1024x1536,
+			price:   imageToolPrice,
 		},
 	}
 
@@ -235,7 +236,8 @@ func TestModelPriceHelperFixedPricePreConsumesResponsesImageGenerationTool(t *te
 	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"gpt-T":0.1}`))
 
 	expectedModelQuota := common.QuotaFromFloat(0.02 * common.QuotaPerUnit * 0.1)
-	expectedToolQuota := common.QuotaFromFloat(operation_setting.GPTImage1High1024x1536 * common.QuotaPerUnit * 0.1)
+	imageToolPrice := operation_setting.GetToolPriceForModel(dto.BuildInToolImageGeneration, "responses-fixed-price-image-tool-model") / 1000
+	expectedToolQuota := common.QuotaFromFloat(imageToolPrice * common.QuotaPerUnit * 0.1)
 	cases := []struct {
 		name         string
 		model        string

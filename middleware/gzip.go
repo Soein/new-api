@@ -68,7 +68,12 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 			})
 			decompressed = true
 		case "zstd":
-			reader, err := zstd.NewReader(origBody)
+			reader, err := zstd.NewReader(
+				origBody,
+				zstd.WithDecoderMaxWindow(uint64(maxBytes)),
+				zstd.WithDecoderMaxMemory(uint64(maxBytes)),
+				zstd.WithDecoderConcurrency(1),
+			)
 			if err != nil {
 				_ = origBody.Close()
 				c.AbortWithStatus(http.StatusBadRequest)

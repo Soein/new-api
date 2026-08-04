@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ---------------------------------------------------------------------------
@@ -244,6 +247,66 @@ func TestRequestProbeMultipleRulesMultiply(t *testing.T) {
 	}
 	if math.Abs(cost-5) > 1e-6 {
 		t.Errorf("cost = %f, want 5", cost)
+	}
+}
+
+func TestV2PerImageUsesSystemCountAndTracesMatchedRules(t *testing.T) {
+	exprStr := `v2:tier("image", per_image(0.04)) * rule("size=1024x1536", param("size") == "1024x1536", 1.5) * rule("quality=high", param("quality") == "high", 2) * rule("background=transparent", param("background") == "transparent", 1.2)`
+
+	cost, trace, err := billingexpr.RunExprWithRequest(
+		exprStr,
+		billingexpr.TokenParams{ImageCount: 3},
+		billingexpr.RequestInput{
+			StructuredBody: []byte(`{"size":"1024x1536","quality":"high","background":"transparent","n":999}`),
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 432_000.0, cost)
+	assert.Equal(t, "image", trace.MatchedTier)
+	assert.Equal(t, []billingexpr.MatchedRule{
+		{Index: 0, Name: "size=1024x1536", Multiplier: 1.5},
+		{Index: 1, Name: "quality=high", Multiplier: 2},
+		{Index: 2, Name: "background=transparent", Multiplier: 1.2},
+	}, trace.MatchedRules)
+}
+
+func TestV2ParamPrefersStructuredBodyAndFallsBackToRawBody(t *testing.T) {
+	exprStr := `v2:rule("known", param("size") == "normalized", 2) * rule("vendor", param("vendor_mode") == "fast", 3)`
+
+	cost, trace, err := billingexpr.RunExprWithRequest(
+		exprStr,
+		billingexpr.TokenParams{},
+		billingexpr.RequestInput{
+			StructuredBody: []byte(`{"size":"normalized"}`),
+			Body:           []byte(`{"size":"raw","vendor_mode":"fast"}`),
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 6.0, cost)
+	assert.Len(t, trace.MatchedRules, 2)
+}
+
+func TestV2ImagePricingRejectsUntrustedValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		expr   string
+		params billingexpr.TokenParams
+	}{
+		{name: "v1 cannot use per_image", expr: `per_image(0.04)`, params: billingexpr.TokenParams{ImageCount: 1}},
+		{name: "negative price", expr: `v2:per_image(-0.04)`, params: billingexpr.TokenParams{ImageCount: 1}},
+		{name: "zero rule multiplier", expr: `v2:rule("bad", true, 0)`, params: billingexpr.TokenParams{}},
+		{name: "fractional image count", expr: `v2:per_image(0.04)`, params: billingexpr.TokenParams{ImageCount: 1.5}},
+		{name: "image count above bound", expr: `v2:per_image(0.04)`, params: billingexpr.TokenParams{ImageCount: dto.MaxImageN + 1}},
+		{name: "negative final result", expr: `p * -1`, params: billingexpr.TokenParams{P: 1}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := billingexpr.RunExpr(test.expr, test.params)
+			require.Error(t, err)
+		})
 	}
 }
 

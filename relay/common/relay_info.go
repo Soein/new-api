@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -196,6 +197,10 @@ type RelayInfo struct {
 	TieredBillingSnapshot *billingexpr.BillingSnapshot
 	BillingRequestInput   *billingexpr.RequestInput
 	ToolPriceSnapshot     map[string]float64
+	// ImageBillingCount is the validated image quantity used by fixed-price
+	// and expression billing. It starts from the request and may be replaced
+	// with a trusted upstream response count before settlement.
+	ImageBillingCount int
 
 	Request dto.Request
 
@@ -218,6 +223,39 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+// SetImageBillingCount records a bounded image quantity. Fixed-price billing
+// mirrors it through PriceData so legacy settlement keeps its existing path;
+// expression billing reads the system field directly and cannot be influenced
+// through param("n").
+func (info *RelayInfo) SetImageBillingCount(count int) bool {
+	if info == nil || count <= 0 || count > dto.MaxImageN {
+		return false
+	}
+	info.ImageBillingCount = count
+	if info.PriceData.UsePrice {
+		info.PriceData.AddOtherRatio("n", float64(count))
+	}
+	return true
+}
+
+// GetImageBillingCount returns the latest validated image quantity, falling
+// back to the frozen pre-consume snapshot for expression billing.
+func (info *RelayInfo) GetImageBillingCount() int {
+	if info == nil {
+		return 0
+	}
+	if info.ImageBillingCount > 0 && info.ImageBillingCount <= dto.MaxImageN {
+		return info.ImageBillingCount
+	}
+	if info.TieredBillingSnapshot != nil && info.TieredBillingSnapshot.ImageCount > 0 && info.TieredBillingSnapshot.ImageCount <= dto.MaxImageN {
+		return info.TieredBillingSnapshot.ImageCount
+	}
+	if ratio, ok := info.PriceData.OtherRatios()["n"]; ok && ratio > 0 && ratio <= dto.MaxImageN && math.Trunc(ratio) == ratio {
+		return int(ratio)
+	}
+	return 0
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {

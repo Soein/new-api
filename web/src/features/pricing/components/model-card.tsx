@@ -115,6 +115,11 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
               {t(entry.shortLabel)}{' '}
               <span className='text-foreground font-mono font-semibold'>
                 {entry.formatted}
+                {entry.unit === 'image' && (
+                  <span className='text-muted-foreground/60 ml-1 text-xs font-normal'>
+                    /{t('image')}
+                  </span>
+                )}
               </span>
             </span>
           ))}

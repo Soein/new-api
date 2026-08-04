@@ -93,6 +93,7 @@ import {
   createDefaultVisualConfig,
   evalExprLocally,
   exprUsesExtraVars,
+  exprUsesImageCount,
   generateExprFromVisualConfig,
   getTierCacheMode,
   normalizeVisualConfig,
@@ -122,6 +123,7 @@ const OPS: TierConditionInput['op'][] = ['<', '<=', '>', '>=']
 type Preset = {
   key: string
   label: string
+  labelKey?: string
   expr: string
   requestRules?: RequestRuleGroup[]
 }
@@ -180,6 +182,62 @@ const PRESET_GROUPS: PresetGroup[] = [
         key: 'gpt-image-1-mini',
         label: 'GPT Image 1 Mini',
         expr: 'tier("base", p * 2 + c * 8 + img * 2.5)',
+      },
+      {
+        key: 'image-per-image',
+        label: 'Per-image generation',
+        labelKey: 'Per-image generation',
+        expr: 'v2:tier("base", per_image(0.04))',
+        requestRules: [
+          {
+            name: 'size_1024x1536',
+            conditions: [
+              {
+                source: SOURCE_PARAM as 'param',
+                path: 'size',
+                mode: MATCH_EQ,
+                value: '1024x1536',
+              },
+            ],
+            multiplier: '1.5',
+          },
+          {
+            name: 'size_1536x1024',
+            conditions: [
+              {
+                source: SOURCE_PARAM as 'param',
+                path: 'size',
+                mode: MATCH_EQ,
+                value: '1536x1024',
+              },
+            ],
+            multiplier: '1.5',
+          },
+          {
+            name: 'quality_high',
+            conditions: [
+              {
+                source: SOURCE_PARAM as 'param',
+                path: 'quality',
+                mode: MATCH_EQ,
+                value: 'high',
+              },
+            ],
+            multiplier: '2',
+          },
+          {
+            name: 'background_transparent',
+            conditions: [
+              {
+                source: SOURCE_PARAM as 'param',
+                path: 'background',
+                mode: MATCH_EQ,
+                value: 'transparent',
+              },
+            ],
+            multiplier: '1.2',
+          },
+        ],
       },
       {
         key: 'gemini-2.5-flash',
@@ -332,8 +390,9 @@ function formatTokenHint(n: number | string | null | undefined): string {
 
 function formatNumberDraft(value: number | string): string {
   if (value === '') return ''
-  if (typeof value === 'number')
+  if (typeof value === 'number') {
     return Number.isFinite(value) ? String(value) : '0'
+  }
   return value
 }
 
@@ -436,12 +495,10 @@ function ConditionRow({ condition, onChange, onRemove }: ConditionRowProps) {
   return (
     <div className='flex items-center gap-2'>
       <Select
-        items={[
-          ...CONDITION_INPUT_OPTIONS.map((option) => ({
-            value: option.value,
-            label: t(option.labelKey),
-          })),
-        ]}
+        items={CONDITION_INPUT_OPTIONS.map((option) => ({
+          value: option.value,
+          label: t(option.labelKey),
+        }))}
         value={condition.var}
         onValueChange={(value) =>
           onChange({ ...condition, var: value as TierConditionInput['var'] })
@@ -667,6 +724,8 @@ function VisualTierCard({
         ) : (
           tier.conditions.map((condition, conditionIndex) => (
             <ConditionRow
+              // Conditions are only appended/removed and have no persisted ID.
+              // eslint-disable-next-line react/no-array-index-key
               key={conditionIndex}
               condition={condition}
               onChange={(next) => handleConditionChange(conditionIndex, next)}
@@ -849,6 +908,8 @@ function VisualEditor({ visualConfig, onChange }: VisualEditorProps) {
       </p>
       {config.tiers.map((tier, index) => (
         <VisualTierCard
+          // Tiers have no persisted ID; using content would remount inputs while typing.
+          // eslint-disable-next-line react/no-array-index-key
           key={index}
           tier={tier}
           index={index}
@@ -890,13 +951,15 @@ function RawExprEditor({ exprString, onChange }: RawExprEditorProps) {
             {t('Variables')}: <code>len</code>, <code>p</code>, <code>c</code>,{' '}
             <code>cr</code>, <code>cc</code>, <code>cc1h</code>,{' '}
             <code>img</code>, <code>img_o</code>, <code>ai</code>,{' '}
-            <code>ao</code>
+            <code>ao</code>, <code>image_count</code> ({t('v2 only')})
           </div>
           <div>
             {t('Functions')}: <code>tier(name, value)</code>, <code>max</code>,{' '}
             <code>min</code>, <code>ceil</code>, <code>floor</code>,{' '}
             <code>abs</code>, <code>header(name)</code>,{' '}
-            <code>param(path)</code>, <code>has(source, text)</code>
+            <code>param(path)</code>, <code>has(source, text)</code>,{' '}
+            <code>per_image(price)</code>,{' '}
+            <code>rule(name, condition, multiplier)</code> ({t('v2 only')})
           </div>
         </AlertDescription>
       </Alert>
@@ -967,12 +1030,9 @@ function RuleConditionRow({
         return timeFunc
     }
   }
-  const sourceLabel =
-    condition.source === SOURCE_PARAM
-      ? t('Body param')
-      : condition.source === SOURCE_HEADER
-        ? t('Header')
-        : t('Time')
+  let sourceLabel = t('Time')
+  if (condition.source === SOURCE_PARAM) sourceLabel = t('Body param')
+  if (condition.source === SOURCE_HEADER) sourceLabel = t('Header')
 
   const handleSourceChange = (source: string) => {
     if (source === SOURCE_TIME) {
@@ -992,12 +1052,10 @@ function RuleConditionRow({
   const renderTimeCondition = (timeCond: TimeCondition) => (
     <>
       <Select
-        items={[
-          ...TIME_FUNCS.map((fn) => ({
-            value: fn,
-            label: getTimeFuncLabel(fn),
-          })),
-        ]}
+        items={TIME_FUNCS.map((fn) => ({
+          value: fn,
+          label: getTimeFuncLabel(fn),
+        }))}
         value={timeCond.timeFunc}
         onValueChange={(value) =>
           onChange({ ...timeCond, timeFunc: value as TimeFunc })
@@ -1017,12 +1075,10 @@ function RuleConditionRow({
         </SelectContent>
       </Select>
       <Select
-        items={[
-          ...COMMON_TIMEZONES.map((tz) => ({
-            value: tz.value,
-            label: tz.label,
-          })),
-        ]}
+        items={COMMON_TIMEZONES.map((tz) => ({
+          value: tz.value,
+          label: tz.label,
+        }))}
         value={timeCond.timezone}
         onValueChange={(value) =>
           value !== null && onChange({ ...timeCond, timezone: value })
@@ -1045,12 +1101,10 @@ function RuleConditionRow({
         </SelectContent>
       </Select>
       <Select
-        items={[
-          ...matchOptions.map((option) => ({
-            value: option.value,
-            label: getMatchLabel(option.value),
-          })),
-        ]}
+        items={matchOptions.map((option) => ({
+          value: option.value,
+          label: getMatchLabel(option.value),
+        }))}
         value={timeCond.mode}
         onValueChange={(v) => v !== null && handleModeChange(v)}
       >
@@ -1111,12 +1165,10 @@ function RuleConditionRow({
         className='w-44'
       />
       <Select
-        items={[
-          ...matchOptions.map((option) => ({
-            value: option.value,
-            label: getMatchLabel(option.value),
-          })),
-        ]}
+        items={matchOptions.map((option) => ({
+          value: option.value,
+          label: getMatchLabel(option.value),
+        }))}
         value={phCond.mode}
         onValueChange={(v) => v !== null && handleModeChange(v)}
       >
@@ -1239,8 +1291,22 @@ function RuleGroupCard({
       </div>
 
       <div className='space-y-2'>
+        <div className='flex items-center gap-2'>
+          <Label className='w-24 text-xs'>{t('Rule name')}</Label>
+          <Input
+            value={group.name || ''}
+            maxLength={256}
+            onChange={(event) =>
+              onChange({ ...group, name: event.target.value })
+            }
+            placeholder={`rule_${index + 1}`}
+            className='max-w-xs'
+          />
+        </div>
         {group.conditions.map((condition, conditionIndex) => (
           <RuleConditionRow
+            // Conditions have no persisted ID; content keys break input focus.
+            // eslint-disable-next-line react/no-array-index-key
             key={conditionIndex}
             condition={condition}
             onChange={(next) => handleConditionChange(conditionIndex, next)}
@@ -1340,7 +1406,7 @@ function PresetSection({ applyPreset }: PresetSectionProps) {
                 className='h-7 text-xs'
                 onClick={() => applyPreset(preset)}
               >
-                {preset.label}
+                {preset.labelKey ? t(preset.labelKey) : preset.label}
               </Button>
             ))}
           </div>
@@ -1370,10 +1436,15 @@ function CostEstimator({ effectiveExpr }: EstimatorProps) {
     imageOutputTokens: 0,
     audioInputTokens: 0,
     audioOutputTokens: 0,
+    imageCount: 1,
   })
 
   const usesExtras = useMemo(
     () => exprUsesExtraVars(effectiveExpr),
+    [effectiveExpr]
+  )
+  const usesImageCount = useMemo(
+    () => exprUsesImageCount(effectiveExpr),
     [effectiveExpr]
   )
 
@@ -1413,6 +1484,18 @@ function CostEstimator({ effectiveExpr }: EstimatorProps) {
       </div>
       {usesExtras && (
         <div className='grid grid-cols-2 gap-3'>
+          {usesImageCount && (
+            <div className='space-y-1'>
+              <Label className='text-xs'>{t('Image count')}</Label>
+              <DraftNumberInput
+                min={0}
+                value={extras.imageCount}
+                onValueChange={(value) =>
+                  setExtras((prev) => ({ ...prev, imageCount: value }))
+                }
+              />
+            </div>
+          )}
           {BILLING_EXTRA_VARS.map((variable) => {
             // BILLING_EXTRA_VARS only contains pricing variables; they are
             // guaranteed to have a non-null `field` (the `len` condition-only
@@ -1495,6 +1578,11 @@ Output side:
 - img_o — image output token count
 - ao — audio output token count
 
+Image billing (v2 only):
+- image_count — validated generated-image count supplied by the system
+- per_image(price) — charges a fixed USD price for each generated image
+- rule(name, condition, multiplier) — applies and records a named request multiplier
+
 ### p/c Auto-exclusion
 
 p and c are fallback variables representing all tokens not separately priced in the expression. If the expression uses a sub-category variable (e.g., cr), those tokens are deducted from p to avoid double-billing. Unused sub-category tokens remain in p/c at base price.
@@ -1514,6 +1602,7 @@ Important: len is NOT affected by auto-exclusion. Tier conditions should use len
 ### Price Coefficients
 
 Numbers in the expression are $/1M tokens prices. For example, p * 2.5 means input $2.50/1M tokens.
+The price passed to per_image is USD per image. Prefix expressions using per_image or rule with v2:.
 
 ## Expression Examples
 
@@ -1530,6 +1619,9 @@ len <= 200000
 
 Image model:
 tier("base", p * 2 + c * 8 + img * 2.5)
+
+Fixed image price with a tracked quality multiplier:
+v2:tier("base", per_image(0.04)) * rule("quality_high", param("quality") == "high", 2)
 
 Multimodal with audio:
 tier("base", p * 0.43 + c * 3.06 + img * 0.78 + ai * 3.81 + ao * 15.11)
@@ -1549,6 +1641,7 @@ len <= 128000
 4. Multi-tier uses nested ternary: cond1 ? tier(...) : (cond2 ? tier(...) : tier(...))
 5. Price coefficients are the provider's official $/1M tokens prices
 6. If cache/image/audio don't need separate pricing, omit those variables; their tokens are included in p/c automatically
+7. Never create a request rule for n; per_image uses the validated system image_count
 
 Please generate a billing expression based on the model information and pricing requirements provided.`
 
@@ -1562,7 +1655,7 @@ function LlmPromptHelper({ modelName }: LlmPromptHelperProps) {
 
   const prompt = useMemo(() => {
     if (modelName) {
-      return LLM_PROMPT_TEMPLATE + `\n\nCurrent model: ${modelName}`
+      return `${LLM_PROMPT_TEMPLATE}\n\nCurrent model: ${modelName}`
     }
     return LLM_PROMPT_TEMPLATE
   }, [modelName])
@@ -1837,6 +1930,8 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
               <>
                 {requestRuleGroups.map((group, groupIndex) => (
                   <RuleGroupCard
+                    // Rule names are editable, so an index preserves input focus.
+                    // eslint-disable-next-line react/no-array-index-key
                     key={groupIndex}
                     group={group}
                     index={groupIndex}

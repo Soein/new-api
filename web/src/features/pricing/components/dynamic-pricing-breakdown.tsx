@@ -27,6 +27,7 @@ import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import {
   BILLING_PRICING_VARS,
+  PER_IMAGE_BILLING_VAR,
   MATCH_CONTAINS,
   MATCH_EQ,
   MATCH_EXISTS,
@@ -64,6 +65,12 @@ type DynamicPricingBreakdownProps = {
    * icon header and uses the dialog's small text sizes. Defaults to false.
    */
   compact?: boolean
+  /** Request rules recorded by the backend as matched for this billing run. */
+  matchedRequestRules?: Array<{
+    index?: number
+    name: string
+    multiplier: number
+  }> | null
 }
 
 const VAR_LABELS: Record<string, string> = {
@@ -158,6 +165,7 @@ export function DynamicPricingBreakdown({
   matchedTierLabel,
   hideCacheColumns = false,
   compact = false,
+  matchedRequestRules,
 }: DynamicPricingBreakdownProps) {
   const { t } = useTranslation()
   const expr = billingExpr || ''
@@ -222,7 +230,10 @@ export function DynamicPricingBreakdown({
     )
   }
 
-  const visiblePriceFields = BILLING_PRICING_VARS.filter((v) => {
+  const visiblePriceFields = [
+    ...BILLING_PRICING_VARS,
+    PER_IMAGE_BILLING_VAR,
+  ].filter((v) => {
     if (!hasTiers) return false
     if (hideCacheColumns && v.group === 'cache') return false
     return tiers.some(
@@ -260,7 +271,7 @@ export function DynamicPricingBreakdown({
             {t('Tiered price table')}
           </div>
           <div className='space-y-1.5 sm:hidden'>
-            {tiers.map((tier, i) => {
+            {tiers.map((tier) => {
               const condSummary = formatConditionSummary(tier.conditions, t)
               const isMatched =
                 matchedTierLabel != null &&
@@ -268,7 +279,7 @@ export function DynamicPricingBreakdown({
                 tier.label === matchedTierLabel
               return (
                 <div
-                  key={`tier-mobile-${i}`}
+                  key={`tier-mobile-${tier.label}-${JSON.stringify(tier.conditions)}`}
                   className={cn(
                     'rounded-md border p-2',
                     isMatched && 'border-emerald-500/40 bg-emerald-500/10'
@@ -311,9 +322,18 @@ export function DynamicPricingBreakdown({
                               compact ? 'text-xs' : 'text-sm font-semibold'
                             )}
                           >
-                            {value > 0
-                              ? `${symbol}${(value * rate).toFixed(4)}`
-                              : '-'}
+                            {value > 0 ? (
+                              <>
+                                {`${symbol}${(value * rate).toFixed(4)}`}
+                                {v.unit === 'image' && (
+                                  <span className='text-muted-foreground ml-1 text-[10px] font-normal'>
+                                    /{t('image')}
+                                  </span>
+                                )}
+                              </>
+                            ) : (
+                              '-'
+                            )}
                           </div>
                         </div>
                       )
@@ -386,7 +406,10 @@ export function DynamicPricingBreakdown({
               },
               ...visiblePriceFields.map((v, index) => ({
                 id: v.field ?? `price-${index}`,
-                header: t(v.shortLabel),
+                header:
+                  v.unit === 'image'
+                    ? `${t(v.shortLabel)} ($/${t('image')})`
+                    : t(v.shortLabel),
                 className: cn(
                   'text-muted-foreground py-2 text-right font-medium',
                   compact && 'h-8'
@@ -425,27 +448,50 @@ export function DynamicPricingBreakdown({
             {t('Conditional multipliers')}
           </div>
           <ul className='space-y-1.5'>
-            {ruleGroups.map((group, gi) => (
-              <li
-                key={`group-${gi}`}
-                className='bg-muted/50 flex items-center justify-between gap-3 rounded-md px-3 py-2'
-              >
-                <span
+            {ruleGroups.map((group, groupIndex) => {
+              const matchedRule = matchedRequestRules?.find(
+                (rule) =>
+                  rule.index === groupIndex ||
+                  (rule.index == null && rule.name === group.name)
+              )
+              return (
+                <li
+                  key={`group-${group.name || JSON.stringify(group)}`}
                   className={cn(
-                    'text-foreground break-all',
-                    compact ? 'text-xs' : 'text-sm'
+                    'bg-muted/50 flex items-center justify-between gap-3 rounded-md border border-transparent px-3 py-2',
+                    matchedRule && 'border-emerald-500/40 bg-emerald-500/10'
                   )}
                 >
-                  {describeGroup(group, t)}
-                </span>
-                <Badge
-                  variant='secondary'
-                  className='shrink-0 bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300'
-                >
-                  {group.multiplier}x
-                </Badge>
-              </li>
-            ))}
+                  <span
+                    className={cn(
+                      'text-foreground break-all',
+                      compact ? 'text-xs' : 'text-sm'
+                    )}
+                  >
+                    {group.name && (
+                      <span className='mr-1.5 font-semibold'>{group.name}</span>
+                    )}
+                    {describeGroup(group, t)}
+                  </span>
+                  <span className='flex shrink-0 items-center gap-1.5'>
+                    {matchedRule && (
+                      <Badge
+                        variant='secondary'
+                        className='bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'
+                      >
+                        {t('Matched')}
+                      </Badge>
+                    )}
+                    <Badge
+                      variant='secondary'
+                      className='bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300'
+                    >
+                      {matchedRule?.multiplier ?? group.multiplier}x
+                    </Badge>
+                  </span>
+                </li>
+              )
+            })}
           </ul>
         </div>
       )}

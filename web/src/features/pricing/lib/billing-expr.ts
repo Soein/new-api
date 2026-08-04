@@ -42,6 +42,7 @@ export type BillingVar = {
   isBase?: boolean
   isConditionOnly?: boolean
   group?: string
+  unit?: 'token' | 'image'
 }
 
 export const BILLING_VARS: BillingVar[] = [
@@ -155,6 +156,17 @@ export const BILLING_EXTRA_VARS: BillingVar[] = BILLING_VARS.filter(
   (v) => !v.isBase && !v.isConditionOnly
 )
 
+export const PER_IMAGE_BILLING_VAR: BillingVar = {
+  key: 'per_image',
+  field: 'perImagePrice',
+  tierField: null,
+  label: 'Price per image',
+  shortLabel: 'Per image',
+  side: 'output',
+  group: 'media',
+  unit: 'image',
+}
+
 export const BILLING_CACHE_VAR_MAP = BILLING_EXTRA_VARS.map((v) => ({
   field: v.tierField as string,
   exprVar: v.key,
@@ -224,6 +236,8 @@ export type TimeCondition = {
 export type RequestCondition = TimeCondition | ParamHeaderCondition
 
 export type RequestRuleGroup = {
+  /** Stable, administrator-authored label recorded in billing logs on match. */
+  name?: string
   conditions: RequestCondition[]
   multiplier: string
 }
@@ -237,6 +251,8 @@ export type TierCondition = {
 export type ParsedTier = {
   label: string
   conditions: TierCondition[]
+  /** Fixed USD price for one generated image (v2 `per_image`). */
+  perImagePrice?: number
   [field: string]: unknown
 }
 
@@ -262,6 +278,8 @@ function parseTierBody(bodyStr: string): Record<string, number> {
   for (const [varName, field] of Object.entries(BILLING_VAR_KEY_TO_FIELD)) {
     tier[field] = coeffs[varName] || 0
   }
+  const perImageMatch = bodyStr.match(/\bper_image\(\s*([\d.eE+-]+)\s*\)/)
+  if (perImageMatch) tier.perImagePrice = Number(perImageMatch[1])
   return tier
 }
 
@@ -269,11 +287,23 @@ export function parseTiersFromExpr(exprStr: string): ParsedTier[] {
   if (!exprStr) return []
   try {
     const { body } = stripExprVersion(exprStr)
+    const perImageMatch = body.match(/^\s*per_image\(\s*([\d.eE+-]+)\s*\)\s*$/)
+    if (perImageMatch) {
+      const perImagePrice = Number(perImageMatch[1])
+      if (!Number.isFinite(perImagePrice) || perImagePrice < 0) return []
+      return [
+        {
+          label: 'base',
+          conditions: [],
+          perImagePrice,
+        },
+      ]
+    }
     const condGroup =
       `((?:(?:p|c|len)\\s*(?:<|<=|>|>=)\\s*[\\d.eE+]+)` +
       `(?:\\s*&&\\s*(?:p|c|len)\\s*(?:<|<=|>|>=)\\s*[\\d.eE+]+)*)`
     const tierRe = new RegExp(
-      `(?:${condGroup}\\s*\\?\\s*)?tier\\("([^"]*)",\\s*([^)]+)\\)`,
+      `(?:${condGroup}\\s*\\?\\s*)?tier\\("([^"]*)",\\s*((?:[^()]|\\([^()]*\\))+)\\)`,
       'g'
     )
     const tiers: ParsedTier[] = []
@@ -307,9 +337,9 @@ export function parseTiersFromExpr(exprStr: string): ParsedTier[] {
 export function normalizeTierLabel(label: string | undefined): string {
   if (!label) return ''
   return label
-    .replace(/<[=＝]?|≤|＜[=＝]?/g, '<')
-    .replace(/>[=＝]?|≥|＞[=＝]?/g, '>')
-    .replace(/\s+/g, '')
+    .replaceAll(/<[=＝]?|≤|＜[=＝]?/g, '<')
+    .replaceAll(/>[=＝]?|≥|＞[=＝]?/g, '>')
+    .replaceAll(/\s+/g, '')
     .toLowerCase()
 }
 
@@ -317,40 +347,46 @@ export function normalizeTierLabel(label: string | undefined): string {
 // Request rule parser
 // ---------------------------------------------------------------------------
 
-function splitTopLevelMultiply(expr: string): string[] {
+function splitTopLevel(expr: string, operator: string): string[] {
   const parts: string[] = []
   let start = 0
   let depth = 0
+  let quote = ''
+  let escaped = false
   for (let index = 0; index < expr.length; index += 1) {
     const char = expr[index]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === quote) {
+        quote = ''
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
     if (char === '(') depth += 1
     if (char === ')') depth -= 1
-    if (depth === 0 && expr.slice(index, index + 3) === ' * ') {
+    if (depth === 0 && expr.startsWith(operator, index)) {
       parts.push(expr.slice(start, index).trim())
-      start = index + 3
-      index += 2
+      start = index + operator.length
+      index += operator.length - 1
     }
   }
   parts.push(expr.slice(start).trim())
   return parts.filter(Boolean)
 }
 
+function splitTopLevelMultiply(expr: string): string[] {
+  return splitTopLevel(expr, ' * ')
+}
+
 function splitTopLevelAnd(expr: string): string[] {
-  const parts: string[] = []
-  let start = 0
-  let depth = 0
-  for (let i = 0; i < expr.length; i += 1) {
-    const c = expr[i]
-    if (c === '(') depth += 1
-    if (c === ')') depth -= 1
-    if (depth === 0 && expr.slice(i, i + 4) === ' && ') {
-      parts.push(expr.slice(start, i).trim())
-      start = i + 4
-      i += 3
-    }
-  }
-  parts.push(expr.slice(start).trim())
-  return parts.filter(Boolean)
+  return splitTopLevel(expr, ' && ')
 }
 
 function parseExprLiteral(raw: string): string | null {
@@ -426,24 +462,26 @@ function tryParseRequestCondition(expr: string): RequestCondition | null {
   if (m) return { source: 'param', path: m[1], mode: MATCH_EXISTS, value: '' }
 
   m = expr.match(/^has\(header\("([^"]+)"\), ((?:"(?:[^"\\]|\\.)*"))\)$/)
-  if (m)
+  if (m) {
     return {
       source: 'header',
       path: m[1],
       mode: MATCH_CONTAINS,
       value: JSON.parse(m[2]) as string,
     }
+  }
 
   m = expr.match(
     /^param\("([^"]+)"\) != nil && has\(param\("([^"]+)"\), ((?:"(?:[^"\\]|\\.)*"))\)$/
   )
-  if (m && m[1] === m[2])
+  if (m && m[1] === m[2]) {
     return {
       source: 'param',
       path: m[1],
       mode: MATCH_CONTAINS,
       value: JSON.parse(m[3]) as string,
     }
+  }
 
   m = expr.match(
     /^param\("([^"]+)"\) != nil && param\("([^"]+)"\) (>|>=|<|<=) ([\d.eE+-]+)$/
@@ -474,11 +512,15 @@ function tryParseRequestCondition(expr: string): RequestCondition | null {
 }
 
 function tryParseRuleGroupFactor(part: string): RequestRuleGroup | null {
-  const m = part.match(/^\((.+) \? ([\d.eE+-]+) : 1\)$/s)
-  if (!m) return null
+  const tracked = part.match(
+    /^rule\(((?:"(?:[^"\\]|\\.)*")),\s*([\s\S]+),\s*([\d.eE+-]+)\)$/
+  )
+  const legacy = part.match(/^\((.+) \? ([\d.eE+-]+) : 1\)$/s)
+  if (!tracked && !legacy) return null
 
-  const conditionStr = m[1]
-  const multiplier = m[2]
+  const conditionStr = tracked?.[2] ?? legacy?.[1] ?? ''
+  const multiplier = tracked?.[3] ?? legacy?.[2] ?? ''
+  const name = tracked ? (JSON.parse(tracked[1]) as string) : ''
 
   const andParts = splitTopLevelAnd(conditionStr)
   const conditions: RequestCondition[] = []
@@ -488,7 +530,7 @@ function tryParseRuleGroupFactor(part: string): RequestRuleGroup | null {
     conditions.push(cond)
   }
   if (conditions.length === 0) return null
-  return { conditions, multiplier }
+  return { name, conditions, multiplier }
 }
 
 export function tryParseRequestRuleExpr(
@@ -537,7 +579,8 @@ export function splitBillingExprAndRequestRules(expr: string): {
   const trimmed = (expr || '').trim()
   if (!trimmed) return { billingExpr: '', requestRuleExpr: '' }
 
-  const parts = splitTopLevelMultiply(trimmed)
+  const { version, body } = stripExprVersion(trimmed)
+  const parts = splitTopLevelMultiply(body)
   if (parts.length <= 1) return { billingExpr: trimmed, requestRuleExpr: '' }
 
   const ruleParts: string[] = []
@@ -557,7 +600,10 @@ export function splitBillingExprAndRequestRules(expr: string): {
   }
 
   return {
-    billingExpr: unwrapOuterParens(baseParts[0]),
+    billingExpr:
+      version > 1
+        ? `v${version}:${unwrapOuterParens(baseParts[0])}`
+        : unwrapOuterParens(baseParts[0]),
     requestRuleExpr: ruleParts.join(' * '),
   }
 }
@@ -570,7 +616,13 @@ export function combineBillingExpr(
   const rules = (requestRuleExpr || '').trim()
   if (!base) return ''
   if (!rules) return base
-  return `(${base}) * ${rules}`
+  const { version, body } = stripExprVersion(base)
+  const requiresV2 = /(?:^|\s)rule\(/.test(rules)
+  const combinedVersion = requiresV2 ? Math.max(version, 2) : version
+  const combinedBody = `(${body}) * ${rules}`
+  return combinedVersion > 1
+    ? `v${combinedVersion}:${combinedBody}`
+    : combinedBody
 }
 
 // ---------------------------------------------------------------------------
@@ -594,11 +646,11 @@ export function createEmptyTimeCondition(): TimeCondition {
 }
 
 export function createEmptyRuleGroup(): RequestRuleGroup {
-  return { conditions: [createEmptyCondition()], multiplier: '' }
+  return { name: '', conditions: [createEmptyCondition()], multiplier: '' }
 }
 
 export function createEmptyTimeRuleGroup(): RequestRuleGroup {
-  return { conditions: [createEmptyTimeCondition()], multiplier: '' }
+  return { name: '', conditions: [createEmptyTimeCondition()], multiplier: '' }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,12 +694,9 @@ function isTimeFunc(value: unknown): value is TimeFunc {
 export function normalizeCondition(
   cond: Partial<RequestCondition> | null | undefined
 ): RequestCondition {
-  const source =
-    cond?.source === 'time'
-      ? 'time'
-      : cond?.source === 'header'
-        ? 'header'
-        : 'param'
+  let source: RequestCondition['source'] = 'param'
+  if (cond?.source === 'time') source = 'time'
+  if (cond?.source === 'header') source = 'header'
 
   if (source === 'time') {
     const timeCond = cond as Partial<TimeCondition> | null | undefined
@@ -759,7 +808,7 @@ function buildRequestConditionExpr(cond: RequestCondition): string {
   }
 }
 
-function buildRuleGroupFactor(group: RequestRuleGroup): string {
+function buildRuleGroupFactor(group: RequestRuleGroup, index: number): string {
   const multiplier = (group.multiplier || '').trim()
   if (!NUMERIC_LITERAL_REGEX.test(multiplier)) return ''
   const condExprs = (group.conditions || [])
@@ -771,7 +820,8 @@ function buildRuleGroupFactor(group: RequestRuleGroup): string {
     condExprs.length === 1
       ? condExprs[0]
       : condExprs.map((e) => (e.includes(' || ') ? `(${e})` : e)).join(' && ')
-  return `(${combined} ? ${multiplier} : 1)`
+  const name = (group.name?.trim() || `rule_${index + 1}`).slice(0, 256)
+  return `rule(${JSON.stringify(name)}, ${combined}, ${multiplier})`
 }
 
 export function buildRequestRuleExpr(groups: RequestRuleGroup[]): string {

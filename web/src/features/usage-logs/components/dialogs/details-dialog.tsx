@@ -229,13 +229,22 @@ function BillingBreakdown(props: {
       for (const entry of tieredSummary.priceEntries) {
         rows.push({
           label: t(entry.shortLabel),
-          value: `${fmtPrice(entry.price)}/M`,
+          value:
+            entry.unit === 'image'
+              ? `${fmtPrice(entry.price)}/${t('image')}`
+              : `${fmtPrice(entry.price)}/M`,
         })
       }
     } else {
       rows.push({
         label: t('Matched Tier'),
         value: t('No matching results'),
+      })
+    }
+    if (other.image_count != null) {
+      rows.push({
+        label: t('Image count'),
+        value: other.image_count.toLocaleString(),
       })
     }
   } else if (isPerCall) {
@@ -1062,6 +1071,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
               compact
               billingExpr={decodeBillingExprB64(other.expr_b64)}
               matchedTierLabel={other.matched_tier}
+              matchedRequestRules={other.matched_request_rules}
               hideCacheColumns={!hasAnyCacheTokens(other)}
             />
           </DetailSection>

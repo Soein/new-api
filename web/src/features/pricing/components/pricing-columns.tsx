@@ -151,6 +151,12 @@ export function usePricingColumns(
             )
           }
 
+          const primaryUnit = primaryEntries.every(
+            (entry) => entry.unit === primaryEntries[0]?.unit
+          )
+            ? primaryEntries[0]?.unit
+            : null
+
           return (
             <div className='max-w-full min-w-0'>
               <span className='font-mono text-sm tabular-nums'>
@@ -160,11 +166,19 @@ export function usePricingColumns(
                       <span className='text-muted-foreground/40 mx-1'>/</span>
                     )}
                     {stripTrailingZeros(entry.formatted)}
+                    {primaryUnit == null && (
+                      <span className='text-muted-foreground/50 ml-0.5 text-[10px]'>
+                        /{entry.unit === 'image' ? t('image') : tokenUnitLabel}
+                      </span>
+                    )}
                   </span>
                 ))}
               </span>
               <div className='text-muted-foreground/50 text-[10px]'>
-                / {tokenUnitLabel} tokens
+                /{' '}
+                {primaryUnit === 'image'
+                  ? t('image')
+                  : `${tokenUnitLabel} ${t('tokens')}`}
                 {dynamicSummary.tierCount > 1 &&
                   ` · ${t('{{count}} tiers', {
                     count: dynamicSummary.tierCount,

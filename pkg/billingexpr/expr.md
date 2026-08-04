@@ -46,6 +46,17 @@ Powered by [expr-lang/expr](https://github.com/expr-lang/expr). Expressions are 
 | `img_o` | 图片输出 token 数 |
 | `ao` | 音频输出 token 数 |
 
+### System Variables (v2)
+
+| Variable | Meaning |
+|----------|---------|
+| `image_count` | Validated billable image output count. The request value is bounded by `dto.MaxImageN`; a trusted upstream result may replace it before settlement. It is never read from `param("n")`. |
+
+`image_count` is system-maintained. Administrators may reference it, but clients
+cannot override it by adding `image_count` or changing `n` in the request body.
+Use `per_image(price)` for normal per-output billing instead of multiplying the
+variable manually.
+
 #### `p` 和 `c` 的自动排除机制
 
 `p` 和 `c` 是"兜底变量"——它们代表**所有没有被表达式单独定价的 token**。系统会根据表达式实际使用了哪些变量，自动从 `p` / `c` 中减去对应的子类别 token，避免重复计费。
@@ -89,6 +100,8 @@ Powered by [expr-lang/expr](https://github.com/expr-lang/expr). Expressions are 
 | `abs` | `abs(x) → float64` | Absolute value |
 | `ceil` | `ceil(x) → float64` | Ceiling |
 | `floor` | `floor(x) → float64` | Floor |
+| `per_image` (v2) | `per_image(price) → float64` | Charges a real USD price per validated output image |
+| `rule` (v2) | `rule(name, condition, multiplier) → float64` | Returns the multiplier when matched and records it in the billing trace; otherwise returns `1` |
 
 ### Expression Examples
 
@@ -106,17 +119,29 @@ tier("base", p * 2 + c * 8 + img * 2.5)
 
 # Multimodal with audio
 tier("base", p * 0.43 + c * 3.06 + img * 0.78 + ai * 3.81 + ao * 15.11)
+
+# Per-image output pricing ($0.04/image, v2)
+v2:tier("image", per_image(0.04))
+
+# Per-image pricing with traceable request multipliers
+v2:tier("image", per_image(0.04))
+  * rule("size=1024x1536", param("size") == "1024x1536", 1.5)
+  * rule("quality=high", param("quality") == "high", 2)
 ```
 
-### Request Rules (appended after `|||`)
+### Request Rules
 
-Request-conditional multipliers are appended to the expression after a `|||` separator:
+Request-conditional multipliers are ordinary factors in the single stored
+expression. New visual rules use the v2 `rule()` function so settlement logs
+can show exactly which factors matched:
 
 ```
-tier("base", p * 5 + c * 25)|||when(header("anthropic-beta") has "fast-mode") * 6
+v2:tier("base", p * 5 + c * 25)
+  * rule("anthropic fast mode", has(header("anthropic-beta"), "fast-mode"), 6)
 ```
 
-These are parsed and applied separately by the request rule system.
+Legacy ternary factors such as `(condition ? 6 : 1)` remain executable and
+editable, but cannot report a matched-rule trace because they have no callback.
 
 ---
 
@@ -136,7 +161,7 @@ Two editing modes:
 - **Visual mode**: Fill in prices per variable, conditions per tier. Generates expression via `generateExprFromVisualConfig()`.
 - **Raw mode**: Edit the expression string directly. Includes preset templates for common models.
 
-The editor outputs a billing expression string and an optional request rule expression string. These are combined via `combineBillingExpr(billingExpr, requestRuleExpr)` before storage.
+The editor outputs a billing expression string and an optional request rule expression string. These are combined via `combineBillingExpr(billingExpr, requestRuleExpr)` before storage. The version prefix always remains at the start of the combined expression (`v2:(base) * rule(...)`).
 
 ### 2. Storage
 
@@ -156,8 +181,8 @@ On save, the expression is validated:
 
 When a request arrives and the model uses `tiered_expr` billing:
 1. Loads expression from `billing_setting.GetBillingExpr()`
-2. Builds `RequestInput` (headers + body) for `param()` / `header()` functions
-3. Runs expression with estimated tokens: `RunExprWithRequest(expr, {P, C}, requestInput)`
+2. Builds `RequestInput` (headers + raw JSON + normalized structured body) for `param()` / `header()` functions. Normalized fields take precedence, while unknown JSON fields fall back to the raw body; this also gives multipart image edits a JSON parameter view without storing file contents.
+3. Runs expression with estimated tokens and the validated image count: `RunExprWithRequest(expr, {P, C, ImageCount}, requestInput)`
 4. Converts output to quota: `rawCost / 1,000,000 * QuotaPerUnit`
 5. Creates `BillingSnapshot` and stores it on `RelayInfo`. Expression and request state stay frozen for settlement. An auto-group retry refreshes group-dependent fields from the selected group before the next upstream attempt. If a free initial group skipped pre-consume and the retry selects a paid group, the billing session is created before that attempt. If an existing session moves to a more expensive group, its reservation is raised to that group's estimate before sending; cheaper groups are refunded only after actual usage is settled.
 
@@ -174,7 +199,7 @@ After the upstream response returns with actual token usage:
 
 2. `TryTieredSettle(relayInfo, params)`:
    - Uses the captured `BillingSnapshot`, whose group-dependent fields have been refreshed from the final selected group
-   - Re-runs the expression with actual token counts
+   - Re-runs the expression with actual token counts and the final bounded image count
    - Converts via `quotaConversion()` (version-dispatched)
    - Returns actual quota
 
@@ -182,7 +207,7 @@ After the upstream response returns with actual token usage:
 
 **Files**: `service/log_info_generate.go`, `web/src/helpers/render.jsx`
 
-Backend: `InjectTieredBillingInfo()` adds `billing_mode`, `expr_b64` (base64 expression), and `matched_tier` to the log's `other` JSON.
+Backend: `InjectTieredBillingInfo()` adds `billing_mode`, `expr_b64` (base64 expression), `matched_tier`, `image_count`, and traceable `matched_request_rules` to the log's `other` JSON.
 
 Frontend: Detects `billing_mode === "tiered_expr"`, decodes `expr_b64`, parses tiers via shared `parseTiersFromExpr()`, and renders pricing breakdown.
 
@@ -214,7 +239,9 @@ This ensures that heavy cache usage doesn't cause the tier condition to incorrec
 
 ### Quota Conversion
 
-Expression coefficients are $/1M tokens. Conversion to internal quota:
+Expression output uses the $/1M-token cost unit. Token coefficients are provider
+prices per 1M tokens; v2 `per_image(price)` internally scales the real USD/image
+price by 1,000,000 so token and image terms share the same conversion:
 
 ```
 quota = exprOutput / 1,000,000 * QuotaPerUnit * groupRatio
@@ -232,6 +259,9 @@ Version controls:
 - Quota conversion formula
 
 This enables future evolution without breaking existing expressions.
+
+- v1: token/media-token pricing plus legacy request conditions.
+- v2: v1-compatible environment plus `image_count`, `per_image()`, and traceable `rule()` multipliers.
 
 ---
 

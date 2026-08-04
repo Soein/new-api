@@ -23,10 +23,13 @@ import (
 )
 
 func updateOpenAIImageCount(info *relaycommon.RelayInfo, count int64) {
-	if info == nil || !info.PriceData.UsePrice || count <= 0 || count > int64(dto.MaxImageN) {
+	if info == nil || count <= 0 {
 		return
 	}
-	info.PriceData.AddOtherRatio("n", float64(count))
+	if count > int64(dto.MaxImageN) {
+		count = int64(dto.MaxImageN)
+	}
+	info.SetImageBillingCount(int(count))
 }
 
 // OpenaiImageHandler handles non-streaming OpenAI image responses
@@ -156,11 +159,11 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	if info.StreamStatus != nil {
 		upstreamFinished := info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone ||
 			info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF
-		requestedN := 1.0
-		if n, ok := info.PriceData.OtherRatios()["n"]; ok {
-			requestedN = n
+		requestedN := info.GetImageBillingCount()
+		if requestedN == 0 {
+			requestedN = 1
 		}
-		if upstreamFinished || float64(completedImages) > requestedN {
+		if upstreamFinished || completedImages > int64(requestedN) {
 			updateOpenAIImageCount(info, completedImages)
 		}
 	}

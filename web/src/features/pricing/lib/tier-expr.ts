@@ -234,7 +234,7 @@ export function tryParseVisualConfig(
 
     const cfg = normalizeVisualConfig({ tiers })
     const regenerated = generateExprFromVisualConfig(cfg)
-    if (regenerated.replace(/\s+/g, '') !== body.replace(/\s+/g, '')) {
+    if (regenerated.replaceAll(/\s+/g, '') !== body.replaceAll(/\s+/g, '')) {
       return null
     }
     return cfg
@@ -260,7 +260,7 @@ const ESTIMATOR_VARS = [
 export type ExtraTokenValues = Record<
   (typeof ESTIMATOR_VARS)[number]['stateKey'],
   number
->
+> & { imageCount: number }
 
 export type EvalResult = {
   cost: number
@@ -278,6 +278,8 @@ export function evalExprLocally(
     if (!exprStr || !exprStr.trim()) {
       return { cost: 0, matchedTier: '', error: null }
     }
+    const versionMatch = exprStr.match(/^v\d+:([\s\S]*)$/)
+    const expressionBody = versionMatch ? versionMatch[1] : exprStr
     let matchedTier = ''
     const tierFn = (name: string, value: number) => {
       matchedTier = name
@@ -298,13 +300,18 @@ export function evalExprLocally(
       abs: Math.abs,
       ceil: Math.ceil,
       floor: Math.floor,
+      image_count: extraTokenValues.imageCount || 0,
+      per_image: (price: number) =>
+        price * (extraTokenValues.imageCount || 0) * 1_000_000,
+      rule: (_name: string, matched: boolean, multiplier: number) =>
+        matched ? multiplier : 1,
     }
     for (const field of ESTIMATOR_VARS) {
       env[field.var] = extraTokenValues[field.stateKey] || 0
     }
     const fn = new Function(
       ...Object.keys(env),
-      `"use strict"; return (${exprStr});`
+      `"use strict"; return (${expressionBody});`
     )
     const cost = Number(fn(...Object.values(env))) || 0
     return { cost, matchedTier, error: null }
@@ -317,7 +324,11 @@ export function evalExprLocally(
 export function exprUsesExtraVars(exprStr: string): boolean {
   if (!exprStr) return false
   const varNames = ESTIMATOR_VARS.map((f) => f.var).join('|')
-  return new RegExp(`\\b(${varNames})\\b`).test(exprStr)
+  return new RegExp(`\\b(${varNames}|image_count|per_image)\\b`).test(exprStr)
+}
+
+export function exprUsesImageCount(exprStr: string): boolean {
+  return /\b(?:image_count|per_image)\b/.test(exprStr)
 }
 
 export const ESTIMATOR_EXTRA_FIELDS = ESTIMATOR_VARS

@@ -9,6 +9,8 @@ import (
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
 	"github.com/tidwall/gjson"
+
+	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 // RunExpr compiles (with cache) and executes an expression string.
@@ -51,36 +53,83 @@ func RunExprByHashWithRequest(exprStr, hash string, params TokenParams, request 
 func runProgram(prog *vm.Program, params TokenParams, request RequestInput) (float64, TraceResult, error) {
 	trace := TraceResult{}
 	headers := normalizeHeaders(request.Headers)
+	var runtimeErr error
+	ruleIndex := 0
+	if params.ImageCount < 0 || params.ImageCount > dto.MaxImageN || math.IsNaN(params.ImageCount) || math.IsInf(params.ImageCount, 0) || math.Trunc(params.ImageCount) != params.ImageCount {
+		return 0, trace, fmt.Errorf("image_count must be an integer between 0 and %d", dto.MaxImageN)
+	}
 
 	env := map[string]interface{}{
-		"p":     params.P,
-		"c":     params.C,
-		"len":   params.Len,
-		"cr":    params.CR,
-		"cc":    params.CC,
-		"cc1h":  params.CC1h,
-		"img":   params.Img,
-		"img_o": params.ImgO,
-		"ai":    params.AI,
-		"ao":    params.AO,
+		"p":           params.P,
+		"c":           params.C,
+		"len":         params.Len,
+		"cr":          params.CR,
+		"cc":          params.CC,
+		"cc1h":        params.CC1h,
+		"img":         params.Img,
+		"img_o":       params.ImgO,
+		"ai":          params.AI,
+		"ao":          params.AO,
+		"image_count": params.ImageCount,
 		"tier": func(name string, value float64) float64 {
 			trace.MatchedTier = name
 			trace.Cost = value
 			return value
+		},
+		"per_image": func(price float64) float64 {
+			if runtimeErr != nil {
+				return 0
+			}
+			if price < 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+				runtimeErr = fmt.Errorf("per_image price must be a finite non-negative number")
+				return 0
+			}
+			// v1 coefficients represent $/1M tokens. Scale a real per-image USD
+			// price into the same cost unit so token and image terms can coexist.
+			return price * params.ImageCount * 1_000_000
+		},
+		"rule": func(name string, matched bool, multiplier float64) float64 {
+			currentRuleIndex := ruleIndex
+			ruleIndex++
+			if runtimeErr != nil {
+				return 1
+			}
+			if multiplier <= 0 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+				runtimeErr = fmt.Errorf("rule multiplier must be a finite positive number")
+				return 1
+			}
+			if !matched {
+				return 1
+			}
+			name = strings.TrimSpace(name)
+			nameRunes := []rune(name)
+			if len(nameRunes) > 256 {
+				name = string(nameRunes[:256])
+			}
+			trace.MatchedRules = append(trace.MatchedRules, MatchedRule{Index: currentRuleIndex, Name: name, Multiplier: multiplier})
+			return multiplier
 		},
 		"header": func(key string) string {
 			return headers[strings.ToLower(strings.TrimSpace(key))]
 		},
 		"param": func(path string) interface{} {
 			path = strings.TrimSpace(path)
-			if path == "" || len(request.Body) == 0 {
+			if path == "" {
 				return nil
 			}
-			result := gjson.GetBytes(request.Body, path)
-			if !result.Exists() {
-				return nil
+			if len(request.StructuredBody) > 0 {
+				result := gjson.GetBytes(request.StructuredBody, path)
+				if result.Exists() {
+					return result.Value()
+				}
 			}
-			return result.Value()
+			if len(request.Body) > 0 {
+				result := gjson.GetBytes(request.Body, path)
+				if result.Exists() {
+					return result.Value()
+				}
+			}
+			return nil
 		},
 		"has": func(source interface{}, substr string) bool {
 			if source == nil || substr == "" {
@@ -104,9 +153,15 @@ func runProgram(prog *vm.Program, params TokenParams, request RequestInput) (flo
 	if err != nil {
 		return 0, trace, fmt.Errorf("expr run error: %w", err)
 	}
+	if runtimeErr != nil {
+		return 0, trace, fmt.Errorf("expr run error: %w", runtimeErr)
+	}
 	f, ok := out.(float64)
 	if !ok {
 		return 0, trace, fmt.Errorf("expr result is %T, want float64", out)
+	}
+	if f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, trace, fmt.Errorf("expr result must be a finite non-negative number")
 	}
 	return f, trace, nil
 }

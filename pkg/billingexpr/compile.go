@@ -23,6 +23,9 @@ func ParseExprVersion(exprStr string) (version int, body string) {
 	if strings.HasPrefix(exprStr, "v1:") {
 		return 1, exprStr[3:]
 	}
+	if strings.HasPrefix(exprStr, "v2:") {
+		return 2, exprStr[3:]
+	}
 	return DefaultExprVersion, exprStr
 }
 
@@ -65,8 +68,23 @@ var compileEnvPrototypeV1 = map[string]interface{}{
 	"floor":   math.Floor,
 }
 
+// v2 extends v1 with image-output pricing primitives. per_image() uses the
+// validated system image count and rule() records applied request multipliers.
+var compileEnvPrototypeV2 = func() map[string]interface{} {
+	env := make(map[string]interface{}, len(compileEnvPrototypeV1)+3)
+	for key, value := range compileEnvPrototypeV1 {
+		env[key] = value
+	}
+	env["image_count"] = float64(0)
+	env["per_image"] = func(float64) float64 { return 0 }
+	env["rule"] = func(string, bool, float64) float64 { return 1 }
+	return env
+}()
+
 func getCompileEnv(version int) map[string]interface{} {
 	switch version {
+	case 2:
+		return compileEnvPrototypeV2
 	default:
 		return compileEnvPrototypeV1
 	}

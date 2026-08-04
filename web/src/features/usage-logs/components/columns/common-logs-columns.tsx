@@ -192,6 +192,7 @@ function buildTypeDetailSegments(
       const otherEntries = tieredSummary.priceEntries
         .filter(
           (entry) =>
+            entry.unit !== 'image' &&
             ![
               'inputPrice',
               'outputPrice',
@@ -204,6 +205,19 @@ function buildTypeDetailSegments(
       if (otherEntries.length > 0) {
         segments.push({
           text: otherEntries.join(' · '),
+          muted: true,
+        })
+      }
+
+      const imageEntries = tieredSummary.priceEntries
+        .filter((entry) => entry.unit === 'image')
+        .map(
+          (entry) =>
+            `${t(entry.shortLabel)} ${formatPriceCompact(entry.price)}/${t('image')}`
+        )
+      if (imageEntries.length > 0) {
+        segments.push({
+          text: imageEntries.join(' · '),
           muted: true,
         })
       }

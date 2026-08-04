@@ -92,6 +92,57 @@ func TestTryTieredSettleUsesFrozenRequestInput(t *testing.T) {
 	}
 }
 
+func TestTryTieredSettleUsesTrustedActualImageCount(t *testing.T) {
+	exprStr := `v2:tier("image", per_image(0.04)) * rule("size", param("size") == "1024x1536", 1.5)`
+	relayInfo := &relaycommon.RelayInfo{
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:  "tiered_expr",
+			ExprString:   exprStr,
+			ExprHash:     billingexpr.ExprHashString(exprStr),
+			GroupRatio:   1,
+			ImageCount:   3,
+			QuotaPerUnit: testQuotaPerUnit,
+		},
+		BillingRequestInput: &billingexpr.RequestInput{
+			StructuredBody: []byte(`{"size":"1024x1536","n":3}`),
+		},
+	}
+	require.True(t, relayInfo.SetImageBillingCount(2))
+
+	ok, quota, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{ImageCount: 99})
+
+	require.True(t, ok)
+	require.NotNil(t, result)
+	assert.Equal(t, billingexpr.QuotaRound(0.04*2*1.5*testQuotaPerUnit), quota)
+	assert.Equal(t, 2, result.ImageCount)
+	assert.Equal(t, []billingexpr.MatchedRule{{Name: "size", Multiplier: 1.5}}, result.MatchedRules)
+	require.False(t, relayInfo.SetImageBillingCount(dto.MaxImageN+1))
+	assert.Equal(t, 2, relayInfo.GetImageBillingCount())
+}
+
+func TestInjectTieredBillingInfoIncludesImageRuleTrace(t *testing.T) {
+	relayInfo := &relaycommon.RelayInfo{
+		ImageBillingCount: 3,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			ExprString: `v2:tier("image", per_image(0.04))`,
+		},
+	}
+	result := &billingexpr.TieredResult{
+		MatchedTier:  "image",
+		ImageCount:   3,
+		MatchedRules: []billingexpr.MatchedRule{{Name: "quality=high", Multiplier: 2}},
+	}
+	other := map[string]interface{}{}
+
+	InjectTieredBillingInfo(other, relayInfo, result)
+
+	assert.Equal(t, "tiered_expr", other["billing_mode"])
+	assert.Equal(t, "image", other["matched_tier"])
+	assert.Equal(t, 3, other["image_count"])
+	assert.Equal(t, result.MatchedRules, other["matched_request_rules"])
+	assert.NotEmpty(t, other["expr_b64"])
+}
+
 func TestTryTieredSettleFallsBackToFrozenPreConsumeOnExprError(t *testing.T) {
 	relayInfo := &relaycommon.RelayInfo{
 		FinalPreConsumedQuota: 321,

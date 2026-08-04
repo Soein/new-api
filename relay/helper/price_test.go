@@ -16,8 +16,67 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestModelPriceHelperTieredPerImageUsesValidatedCountAndParameters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		savedConfig[key] = value
+		return nil
+	}))
+	savedGroupRatio := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroupRatio))
+	})
+
+	const modelName = "tiered-image-output-model"
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"tiered-image-output-model":"tiered_expr"}`,
+		"billing_setting.billing_expr": `{"tiered-image-output-model":"v2:tier(\"image\", per_image(0.04)) * rule(\"size\", param(\"size\") == \"1024x1536\", 1.5) * rule(\"quality\", param(\"quality\") == \"high\", 2) * rule(\"background\", param(\"background\") == \"transparent\", 1.2)"}`,
+	}))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+
+	request := &dto.ImageRequest{
+		Model:      modelName,
+		N:          common.GetPointer(uint(3)),
+		Size:       "1024x1536",
+		Quality:    "high",
+		Background: []byte(`"transparent"`),
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("group", "default")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: modelName,
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		Request:         request,
+		RequestHeaders:  map[string]string{"Content-Type": "application/json"},
+	}
+
+	priceData, err := ModelPriceHelper(ctx, info, 0, request.GetTokenCountMeta())
+	require.NoError(t, err)
+	wantQuota := billingexpr.QuotaRound(0.04 * 3 * 1.5 * 2 * 1.2 * common.QuotaPerUnit)
+	assert.Equal(t, wantQuota, priceData.QuotaToPreConsume)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	assert.Equal(t, 3, info.TieredBillingSnapshot.ImageCount)
+	assert.Equal(t, 3, info.GetImageBillingCount())
+}
+
+func TestModelPriceHelperRejectsUnboundedImageBillingRatio(t *testing.T) {
+	info := &relaycommon.RelayInfo{}
+	_, err := ModelPriceHelper(nil, info, 0, &types.TokenCountMeta{
+		BillingRatios: map[string]float64{"n": dto.MaxImageN + 1},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "n must be an integer")
+}
 
 func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)

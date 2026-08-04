@@ -8,32 +8,44 @@ import (
 )
 
 type RequestInput struct {
-	Headers map[string]string
-	Body    []byte
+	Headers        map[string]string
+	Body           []byte
+	StructuredBody []byte
 }
 
 // TokenParams holds all token dimensions passed into an Expr evaluation.
 // Fields beyond P and C are optional — when absent they default to 0,
 // which means cache-unaware expressions keep working unchanged.
 type TokenParams struct {
-	P    float64 // prompt tokens (text) — auto-excludes sub-categories priced separately
-	C    float64 // completion tokens (text) — auto-excludes sub-categories priced separately
-	Len  float64 // total input context length for tier conditions (non-Claude: raw prompt_tokens; Claude: text + cache read + cache creation)
-	CR   float64 // cache read (hit) tokens
-	CC   float64 // cache creation tokens (5-min TTL for Claude, generic for others)
-	CC1h float64 // cache creation tokens — 1-hour TTL (Claude only)
-	Img  float64 // image input tokens
-	ImgO float64 // image output tokens
-	AI   float64 // audio input tokens
-	AO   float64 // audio output tokens
+	P          float64 // prompt tokens (text) — auto-excludes sub-categories priced separately
+	C          float64 // completion tokens (text) — auto-excludes sub-categories priced separately
+	Len        float64 // total input context length for tier conditions (non-Claude: raw prompt_tokens; Claude: text + cache read + cache creation)
+	CR         float64 // cache read (hit) tokens
+	CC         float64 // cache creation tokens (5-min TTL for Claude, generic for others)
+	CC1h       float64 // cache creation tokens — 1-hour TTL (Claude only)
+	Img        float64 // image input tokens
+	ImgO       float64 // image output tokens
+	AI         float64 // audio input tokens
+	AO         float64 // audio output tokens
+	ImageCount float64 // validated system image count; never sourced from param("n")
+}
+
+// MatchedRule records a traceable request multiplier that matched during an
+// expression run. Name comes from the administrator-authored expression;
+// Multiplier is the validated factor that was applied.
+type MatchedRule struct {
+	Index      int     `json:"index"`
+	Name       string  `json:"name"`
+	Multiplier float64 `json:"multiplier"`
 }
 
 // TraceResult holds side-channel info captured by the tier() function
 // during Expr execution. This replaces the old Breakdown mechanism —
 // the Expr itself is the single source of truth for billing logic.
 type TraceResult struct {
-	MatchedTier string  `json:"matched_tier"`
-	Cost        float64 `json:"cost"`
+	MatchedTier  string        `json:"matched_tier"`
+	MatchedRules []MatchedRule `json:"matched_rules,omitempty"`
+	Cost         float64       `json:"cost"`
 }
 
 // BillingSnapshot captures billing state at pre-consume time. Expression and
@@ -51,6 +63,7 @@ type BillingSnapshot struct {
 	EstimatedQuotaBeforeGroup float64 `json:"estimated_quota_before_group"`
 	EstimatedQuotaAfterGroup  int     `json:"estimated_quota_after_group"`
 	ToolPreConsumedQuota      int     `json:"tool_pre_consumed_quota,omitempty"`
+	ImageCount                int     `json:"image_count,omitempty"`
 	EstimatedTier             string  `json:"estimated_tier"`
 	QuotaPerUnit              float64 `json:"quota_per_unit"`
 	ExprVersion               int     `json:"expr_version"`
@@ -58,10 +71,12 @@ type BillingSnapshot struct {
 
 // TieredResult holds everything needed after running tiered settlement.
 type TieredResult struct {
-	ActualQuotaBeforeGroup float64 `json:"actual_quota_before_group"`
-	ActualQuotaAfterGroup  int     `json:"actual_quota_after_group"`
-	MatchedTier            string  `json:"matched_tier"`
-	CrossedTier            bool    `json:"crossed_tier"`
+	ActualQuotaBeforeGroup float64       `json:"actual_quota_before_group"`
+	ActualQuotaAfterGroup  int           `json:"actual_quota_after_group"`
+	MatchedTier            string        `json:"matched_tier"`
+	MatchedRules           []MatchedRule `json:"matched_rules,omitempty"`
+	ImageCount             int           `json:"image_count,omitempty"`
+	CrossedTier            bool          `json:"crossed_tier"`
 	// Clamp records an int32 saturation event during quota conversion so the
 	// caller can surface it on the consume log for admin auditing. Nil when no
 	// clamping occurred. Not serialized: the marker is attached separately via

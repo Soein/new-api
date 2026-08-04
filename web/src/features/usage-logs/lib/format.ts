@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { StatusBadgeProps } from '@/components/status-badge'
 import {
   BILLING_PRICING_VARS,
+  PER_IMAGE_BILLING_VAR,
   normalizeTierLabel,
   parseTiersFromExpr,
   type ParsedTier,
@@ -291,7 +292,12 @@ export function resolveMatchedTier(
 export interface TieredBillingSummary {
   tiers: ParsedTier[]
   tier: ParsedTier
-  priceEntries: Array<{ field: string; shortLabel: string; price: number }>
+  priceEntries: Array<{
+    field: string
+    shortLabel: string
+    price: number
+    unit: 'token' | 'image'
+  }>
 }
 
 /**
@@ -324,7 +330,7 @@ export function getTieredBillingSummary(
   const cacheTokensPresent = hasAnyCacheTokens(other)
 
   const priceEntries: TieredBillingSummary['priceEntries'] = []
-  for (const v of BILLING_PRICING_VARS) {
+  for (const v of [...BILLING_PRICING_VARS, PER_IMAGE_BILLING_VAR]) {
     if (!v.field) continue
     if (v.group === 'cache' && !cacheTokensPresent) continue
     const raw = tier[v.field as keyof ParsedTier]
@@ -334,6 +340,7 @@ export function getTieredBillingSummary(
         field: v.field,
         shortLabel: v.shortLabel,
         price,
+        unit: v.unit ?? 'token',
       })
     }
   }

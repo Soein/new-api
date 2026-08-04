@@ -2,8 +2,11 @@ package billing_setting
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/samber/lo"
 )
@@ -74,12 +77,32 @@ func SmokeTestExpr(exprStr string) error {
 	return smokeTestExpr(exprStr)
 }
 
+// ValidateBillingExprJSON validates every model expression before the option
+// is persisted, preventing a malformed or unsafe rule from failing only when
+// the first production request reaches pre-consume.
+func ValidateBillingExprJSON(jsonStr string) error {
+	expressions := make(map[string]string)
+	if err := common.UnmarshalJsonStr(jsonStr, &expressions); err != nil {
+		return fmt.Errorf("invalid billing expression map: %w", err)
+	}
+	for modelName, exprStr := range expressions {
+		if strings.TrimSpace(exprStr) == "" {
+			return fmt.Errorf("model %s has an empty billing expression", modelName)
+		}
+		if err := smokeTestExpr(exprStr); err != nil {
+			return fmt.Errorf("model %s billing expression is invalid: %w", modelName, err)
+		}
+	}
+	return nil
+}
+
 func smokeTestExpr(exprStr string) error {
 	vectors := []billingexpr.TokenParams{
-		{P: 0, C: 0, Len: 0},
-		{P: 1000, C: 1000, Len: 1000},
-		{P: 100000, C: 100000, Len: 100000},
-		{P: 1000000, C: 1000000, Len: 1000000},
+		{P: 0, C: 0, Len: 0, ImageCount: 1},
+		{P: 1000, C: 1000, Len: 1000, ImageCount: 1},
+		{P: 100000, C: 100000, Len: 100000, ImageCount: 1},
+		{P: 1000000, C: 1000000, Len: 1000000, ImageCount: 1},
+		{P: 1000, C: 1000, Len: 1000, ImageCount: dto.MaxImageN},
 	}
 	requests := []billingexpr.RequestInput{
 		{},
@@ -88,6 +111,9 @@ func smokeTestExpr(exprStr string) error {
 				"anthropic-beta": "fast-mode-2026-02-01",
 			},
 			Body: []byte(`{"service_tier":"fast","stream_options":{"include_usage":true},"messages":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21]}`),
+		},
+		{
+			StructuredBody: []byte(`{"size":"1024x1536","quality":"high","background":"transparent","output_format":"webp","n":128}`),
 		},
 	}
 

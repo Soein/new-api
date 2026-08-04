@@ -20,6 +20,24 @@ func ResolveIncomingBillingExprRequestInput(c *gin.Context, info *relaycommon.Re
 		input.Headers = merged
 		return input, nil
 	}
+	// Image edits commonly arrive as multipart/form-data, which has no JSON
+	// body for param(). Serialize the already validated DTO for both JSON and
+	// multipart image requests so request rules see the same normalized fields
+	// and defaults on every image endpoint.
+	if info != nil {
+		if _, ok := info.Request.(*dto.ImageRequest); ok {
+			input, err := BuildBillingExprRequestInputFromRequest(info.Request, info.RequestHeaders)
+			if err != nil {
+				return billingexpr.RequestInput{}, err
+			}
+			bodyBytes, err := readIncomingBillingExprBody(c)
+			if err != nil {
+				return billingexpr.RequestInput{}, err
+			}
+			input.Body = bodyBytes
+			return input, nil
+		}
+	}
 
 	input := billingexpr.RequestInput{}
 	if info != nil {
@@ -46,7 +64,7 @@ func BuildBillingExprRequestInputFromRequest(request dto.Request, headers map[st
 	if err != nil {
 		return billingexpr.RequestInput{}, err
 	}
-	input.Body = bodyBytes
+	input.StructuredBody = bodyBytes
 	return input, nil
 }
 
@@ -67,6 +85,9 @@ func cloneRequestInput(src billingexpr.RequestInput) billingexpr.RequestInput {
 	}
 	if len(src.Body) > 0 {
 		input.Body = append([]byte(nil), src.Body...)
+	}
+	if len(src.StructuredBody) > 0 {
+		input.StructuredBody = append([]byte(nil), src.StructuredBody...)
 	}
 	return input
 }

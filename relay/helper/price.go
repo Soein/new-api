@@ -2,6 +2,7 @@ package helper
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -87,6 +88,9 @@ func estimateResponsesToolPreConsumeQuota(info *relaycommon.RelayInfo, groupRati
 }
 
 func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta) (hosttypes.PriceData, error) {
+	if err := captureImageBillingCount(info, meta); err != nil {
+		return hosttypes.PriceData{}, err
+	}
 	modelPrice, usePrice := ratio_setting.GetModelPrice(info.OriginModelName, false)
 
 	groupRatioInfo := HandleGroupRatio(c, info)
@@ -210,6 +214,27 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	return priceData, nil
 }
 
+// captureImageBillingCount promotes the validated request quantity out of the
+// generic multiplier map into relay-owned state. The expression engine uses
+// this value instead of param("n"), and response handlers may safely replace
+// it with an actual upstream image count before settlement.
+func captureImageBillingCount(info *relaycommon.RelayInfo, meta *types.TokenCountMeta) error {
+	if info == nil || meta == nil || meta.BillingRatios == nil {
+		return nil
+	}
+	count, ok := meta.BillingRatios["n"]
+	if !ok {
+		return nil
+	}
+	if count < 1 || count > dto.MaxImageN || math.IsNaN(count) || math.IsInf(count, 0) || math.Trunc(count) != count {
+		return fmt.Errorf("n must be an integer between 1 and %d", dto.MaxImageN)
+	}
+	if !info.SetImageBillingCount(int(count)) {
+		return fmt.Errorf("n must be an integer between 1 and %d", dto.MaxImageN)
+	}
+	return nil
+}
+
 // ModelPriceHelperPerCall 按次/按量计费的 PriceHelper (MJ、Task)
 func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hosttypes.PriceData, error) {
 	groupRatioInfo := HandleGroupRatio(c, info)
@@ -310,9 +335,10 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 	}
 
 	rawCost, trace, err := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{
-		P:   float64(promptTokens),
-		C:   float64(estimatedCompletionTokens),
-		Len: float64(promptTokens),
+		P:          float64(promptTokens),
+		C:          float64(estimatedCompletionTokens),
+		Len:        float64(promptTokens),
+		ImageCount: float64(info.GetImageBillingCount()),
 	}, requestInput)
 	if err != nil {
 		return hosttypes.PriceData{}, fmt.Errorf("model %s tiered expr run failed: %w", info.OriginModelName, err)
@@ -354,6 +380,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 		EstimatedQuotaBeforeGroup: quotaBeforeGroup,
 		EstimatedQuotaAfterGroup:  preConsumedQuota,
 		ToolPreConsumedQuota:      toolPreConsumedQuota,
+		ImageCount:                info.GetImageBillingCount(),
 		EstimatedTier:             trace.MatchedTier,
 		QuotaPerUnit:              common.QuotaPerUnit,
 		ExprVersion:               billingexpr.ExprVersion(exprStr),

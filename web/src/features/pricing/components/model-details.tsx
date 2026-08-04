@@ -665,7 +665,7 @@ function PriceSection(props: {
                 <div className='text-foreground mt-1 font-mono text-base font-semibold tabular-nums'>
                   {entry.formatted}
                   <span className='text-muted-foreground/40 ml-1 text-xs font-normal'>
-                    / {tokenUnitLabel}
+                    / {entry.unit === 'image' ? t('image') : tokenUnitLabel}
                   </span>
                 </div>
               </div>
@@ -690,7 +690,7 @@ function PriceSection(props: {
                   <span className='text-muted-foreground font-mono text-sm tabular-nums'>
                     {entry.formatted}
                     <span className='text-muted-foreground/40 ml-1 text-xs font-normal'>
-                      / {tokenUnitLabel}
+                      / {entry.unit === 'image' ? t('image') : tokenUnitLabel}
                     </span>
                   </span>
                 </div>
@@ -947,6 +947,9 @@ function GroupPricingSection(props: {
       usdExchangeRate: props.usdExchangeRate,
       groupRatioMultiplier: 1,
     })
+    const hasTokenPriceFields = priceFields.some(
+      (fieldEntry) => fieldEntry.unit !== 'image'
+    )
     const formattedPricesByGroup = new Map(
       availableGroups.map((group) => {
         const ratio = props.groupRatio[group] || 1
@@ -1000,7 +1003,10 @@ function GroupPricingSection(props: {
                     },
                     ...priceFields.map((fieldEntry) => ({
                       id: fieldEntry.field,
-                      header: t(fieldEntry.shortLabel),
+                      header:
+                        fieldEntry.unit === 'image'
+                          ? `${t(fieldEntry.shortLabel)} ($/${t('image')})`
+                          : t(fieldEntry.shortLabel),
                       className: `${thClass} text-right`,
                       cellClassName: 'py-2.5 text-right font-mono',
                       cell: (tier: (typeof dynamicTiers)[number]) =>
@@ -1013,9 +1019,11 @@ function GroupPricingSection(props: {
               </div>
             )
           })}
-          <p className='text-muted-foreground/40 mt-1.5 text-[10px]'>
-            {t('Prices shown per')} {tokenUnitLabel} tokens
-          </p>
+          {hasTokenPriceFields && (
+            <p className='text-muted-foreground/40 mt-1.5 text-[10px]'>
+              {t('Prices shown per')} {tokenUnitLabel} {t('tokens')}
+            </p>
+          )}
         </div>
       </section>
     )

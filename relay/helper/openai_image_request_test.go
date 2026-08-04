@@ -70,6 +70,48 @@ func TestGetAndValidOpenAIImageRequestMultipartStream(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "invalid stream value")
 	})
+
+	t.Run("billing parameters are normalized into the image DTO", func(t *testing.T) {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		for key, value := range map[string]string{
+			"model":              "gpt-image-1",
+			"prompt":             "edit this image",
+			"n":                  "3",
+			"size":               "1024x1536",
+			"quality":            "high",
+			"background":         "transparent",
+			"output_format":      "webp",
+			"input_fidelity":     "high",
+			"output_compression": "80",
+			"partial_images":     "2",
+		} {
+			require.NoError(t, writer.WriteField(key, value))
+		}
+		require.NoError(t, writer.Close())
+
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+
+		req, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesEdits)
+		require.NoError(t, err)
+		require.Equal(t, uint(3), *req.N)
+		require.Equal(t, "1024x1536", req.Size)
+		require.Equal(t, "high", req.Quality)
+		var background, outputFormat, inputFidelity string
+		var outputCompression, partialImages int
+		require.NoError(t, common.Unmarshal(req.Background, &background))
+		require.NoError(t, common.Unmarshal(req.OutputFormat, &outputFormat))
+		require.NoError(t, common.Unmarshal(req.InputFidelity, &inputFidelity))
+		require.NoError(t, common.Unmarshal(req.OutputCompression, &outputCompression))
+		require.NoError(t, common.Unmarshal(req.PartialImages, &partialImages))
+		require.Equal(t, "transparent", background)
+		require.Equal(t, "webp", outputFormat)
+		require.Equal(t, "high", inputFidelity)
+		require.Equal(t, 80, outputCompression)
+		require.Equal(t, 2, partialImages)
+	})
 }
 
 // TestGetAndValidOpenAIImageRequestNBounds guards the billing invariant that
@@ -156,5 +198,20 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 		_, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesEdits)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), boundErr)
+	})
+
+	t.Run("nested parameters n is promoted before billing", func(t *testing.T) {
+		c := newJSONContext(t, `{"model":"wan-image","prompt":"a cat","parameters":{"n":3}}`)
+		req, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+		require.NoError(t, err)
+		require.Equal(t, uint(3), *req.N)
+		require.Equal(t, 3.0, req.GetTokenCountMeta().BillingRatios["n"])
+	})
+
+	t.Run("nested parameters n above max is rejected", func(t *testing.T) {
+		c := newJSONContext(t, fmt.Sprintf(`{"model":"wan-image","prompt":"a cat","parameters":{"n":%d}}`, dto.MaxImageN+1))
+		_, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "parameters.n")
 	})
 }

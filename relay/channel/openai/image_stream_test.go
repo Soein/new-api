@@ -321,28 +321,32 @@ func TestOpenaiImageHandlerUsesPositiveActualCountForFixedPrice(t *testing.T) {
 	longImage := strings.Repeat("a", 4096)
 
 	tests := []struct {
-		name      string
-		body      string
-		usePrice  bool
-		wantCount float64
+		name             string
+		body             string
+		usePrice         bool
+		wantCount        float64
+		wantBillingCount int
 	}{
 		{
-			name:      "fixed price uses data length",
-			body:      `{"data":[{"b64_json":"` + longImage + `"},{"b64_json":"second"}]}`,
-			usePrice:  true,
-			wantCount: 2,
+			name:             "fixed price uses data length",
+			body:             `{"data":[{"b64_json":"` + longImage + `"},{"b64_json":"second"}]}`,
+			usePrice:         true,
+			wantCount:        2,
+			wantBillingCount: 2,
 		},
 		{
-			name:      "empty data keeps requested count",
-			body:      `{"data":[]}`,
-			usePrice:  true,
-			wantCount: 3,
+			name:             "empty data keeps requested count",
+			body:             `{"data":[]}`,
+			usePrice:         true,
+			wantCount:        3,
+			wantBillingCount: 3,
 		},
 		{
-			name:      "ratio billing ignores data length",
-			body:      `{"data":[{"b64_json":"first"},{"b64_json":"second"}]}`,
-			usePrice:  false,
-			wantCount: 3,
+			name:             "ratio billing ignores data length",
+			body:             `{"data":[{"b64_json":"first"},{"b64_json":"second"}]}`,
+			usePrice:         false,
+			wantCount:        3,
+			wantBillingCount: 2,
 		},
 	}
 
@@ -356,6 +360,7 @@ func TestOpenaiImageHandlerUsesPositiveActualCountForFixedPrice(t *testing.T) {
 
 			require.Nil(t, err)
 			require.Equal(t, tt.wantCount, info.PriceData.OtherRatios()["n"])
+			require.Equal(t, tt.wantBillingCount, info.GetImageBillingCount())
 			require.Equal(t, tt.body, recorder.Body.String())
 		})
 	}

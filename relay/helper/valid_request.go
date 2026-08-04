@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -203,6 +204,43 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 			}
 			imageRequest.Quality = formData.Get("quality")
 			imageRequest.Size = formData.Get("size")
+			imageRequest.ResponseFormat = formData.Get("response_format")
+			for field, target := range map[string]*json.RawMessage{
+				"style":          &imageRequest.Style,
+				"background":     &imageRequest.Background,
+				"moderation":     &imageRequest.Moderation,
+				"output_format":  &imageRequest.OutputFormat,
+				"input_fidelity": &imageRequest.InputFidelity,
+				"user":           &imageRequest.User,
+			} {
+				value := strings.TrimSpace(formData.Get(field))
+				if value == "" {
+					continue
+				}
+				encoded, err := common.Marshal(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid %s value: %w", field, err)
+				}
+				*target = encoded
+			}
+			for field, target := range map[string]*json.RawMessage{
+				"output_compression": &imageRequest.OutputCompression,
+				"partial_images":     &imageRequest.PartialImages,
+			} {
+				value := strings.TrimSpace(formData.Get(field))
+				if value == "" {
+					continue
+				}
+				number, err := strconv.Atoi(value)
+				if err != nil {
+					return nil, fmt.Errorf("%s must be an integer", field)
+				}
+				encoded, err := common.Marshal(number)
+				if err != nil {
+					return nil, fmt.Errorf("invalid %s value: %w", field, err)
+				}
+				*target = encoded
+			}
 			if streamValue := strings.TrimSpace(formData.Get("stream")); streamValue != "" {
 				stream, err := strconv.ParseBool(streamValue)
 				if err != nil {
@@ -235,6 +273,23 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 		err := common.UnmarshalBodyReusable(c, imageRequest)
 		if err != nil {
 			return nil, err
+		}
+		// Some compatible image providers place the output count under
+		// parameters.n. Promote that validated value before pre-consume so
+		// system image_count cannot under-reserve and later jump at settlement.
+		if rawParameters, ok := imageRequest.Extra["parameters"]; ok {
+			var parameters map[string]json.RawMessage
+			if err := common.Unmarshal(rawParameters, &parameters); err == nil {
+				if rawN, exists := parameters["n"]; exists {
+					var nestedN float64
+					if err := common.Unmarshal(rawN, &nestedN); err != nil || nestedN < 0 || nestedN > dto.MaxImageN || math.IsNaN(nestedN) || math.IsInf(nestedN, 0) || math.Trunc(nestedN) != nestedN {
+						return nil, fmt.Errorf("parameters.n must be an integer between 1 and %d", dto.MaxImageN)
+					}
+					if nestedN > 0 {
+						imageRequest.N = common.GetPointer(uint(nestedN))
+					}
+				}
+			}
 		}
 
 		if imageRequest.Model == "" {

@@ -94,6 +94,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+		// Record the upstream terminal event before forwarding it because the
+		// client may close as soon as it receives the event.
+		if streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" {
+			sr.Done()
+		}
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {
 		case "response.completed", "response.done":

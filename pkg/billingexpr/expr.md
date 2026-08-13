@@ -140,8 +140,43 @@ v2:tier("base", p * 5 + c * 25)
   * rule("anthropic fast mode", has(header("anthropic-beta"), "fast-mode"), 6)
 ```
 
-Legacy ternary factors such as `(condition ? 6 : 1)` remain executable and
-editable, but cannot report a matched-rule trace because they have no callback.
+The explicit v2 callback records matched rules by their administrator-authored
+names in `matched_request_rules`. Legacy ternary factors remain executable and
+editable, and are stored as ordinary multiplication in the final expression
+(for example, `(tier(...)) * (condition ? 6 : 1)`).
+
+### Legacy Request Rule Tracing
+
+At compile time, the engine instruments ternary factors with this exact shape:
+
+```
+<request-probe condition> ? <numeric literal> : 1
+```
+
+The condition must reference at least one request probe (`param`, `header`, `hour`, `minute`, `weekday`, `month`, or `day`). Both branches must be numeric literals and the fallback must equal `1`. Other conditionals, including `(condition ? 2 : 1.5)`, are evaluated normally but are not traced. Integer-only factors use an integer-preserving trace callback, so instrumentation does not change expressions that require an integer operand (for example, `%`). The internal trace callback names are reserved and cannot be used in stored expressions.
+
+The compiled cache stores the canonical condition and multiplier for every instrumented node. Each run starts with the full detected rule list marked as unmatched; callbacks mark rules that actually evaluate true. Rules skipped by normal expression short-circuiting remain unmatched. This keeps the expression's numeric result unchanged and avoids reparsing it on each request.
+
+Settlement copies the actual run's traces into the consume log as:
+
+```json
+{
+  "request_rules": [
+    { "cond": "param(\"service_tier\") == \"fast\"", "multiplier": 2, "matched": true }
+  ]
+}
+```
+
+For legacy ternary factors, the usage-log UI treats `request_rules` as the
+authoritative rule list and renders directly from it. It parses `cond` only to
+produce a friendly label and falls back to the canonical condition text when
+that parser does not recognize the condition. Pricing pages without log context
+continue to parse the stored expression for display.
+
+The two traces are complementary: v2 `rule()` emits the named matched-rule list,
+while instrumented legacy ternaries emit the complete matched/unmatched
+`request_rules` list. A single expression may use both, and settlement preserves
+both without changing the numeric result.
 
 ---
 
@@ -207,9 +242,9 @@ After the upstream response returns with actual token usage:
 
 **Files**: `service/log_info_generate.go`, `web/src/helpers/render.jsx`
 
-Backend: `InjectTieredBillingInfo()` adds `billing_mode`, `expr_b64` (base64 expression), `matched_tier`, `image_count`, and traceable `matched_request_rules` to the log's `other` JSON.
+Backend: `InjectTieredBillingInfo()` adds `billing_mode`, `expr_b64` (base64 expression), `matched_tier`, `image_count`, the v2 named `matched_request_rules`, and the structured legacy `request_rules` trace list to the log's `other` JSON.
 
-Frontend: Detects `billing_mode === "tiered_expr"`, decodes `expr_b64`, parses tiers via shared `parseTiersFromExpr()`, and renders pricing breakdown.
+Frontend: Detects `billing_mode === "tiered_expr"`, decodes `expr_b64`, parses tiers via shared `parseTiersFromExpr()`, and renders request multipliers from `request_rules` when present. Without log traces, it falls back to parsing the stored expression.
 
 ---
 

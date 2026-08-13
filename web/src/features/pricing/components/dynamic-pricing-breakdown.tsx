@@ -37,11 +37,13 @@ import {
   SOURCE_TIME,
   normalizeTierLabel,
   parseTiersFromExpr,
+  requestRuleGroupsFromTrace,
   splitBillingExprAndRequestRules,
   tryParseRequestRuleExpr,
   type ParsedTier,
   type RequestCondition,
   type RequestRuleGroup,
+  type RequestRuleTrace,
   type TierCondition,
 } from '../lib/billing-expr'
 
@@ -53,6 +55,8 @@ type DynamicPricingBreakdownProps = {
    * the usage-log details dialog to show which tier the engine selected.
    */
   matchedTierLabel?: string | null
+  /** Request-rule traces emitted by the settlement run. */
+  requestRules?: RequestRuleTrace[] | null
   /**
    * Hide cache-pricing columns regardless of the per-tier values. The log
    * details dialog passes this when the actual request did not consume any
@@ -155,14 +159,25 @@ function describeGroup(
   group: RequestRuleGroup,
   t: (key: string) => string
 ): string {
-  return (group.conditions || [])
-    .map((c) => describeCondition(c, t))
+  const description = (group.conditions || [])
+    .map((condition) => describeCondition(condition, t))
     .join(' && ')
+  return description || group.conditionText || ''
+}
+
+function nextOccurrenceKey(
+  baseKey: string,
+  occurrences: Map<string, number>
+): string {
+  const occurrence = occurrences.get(baseKey) || 0
+  occurrences.set(baseKey, occurrence + 1)
+  return `${baseKey}:${occurrence}`
 }
 
 export function DynamicPricingBreakdown({
   billingExpr,
   matchedTierLabel,
+  requestRules,
   hideCacheColumns = false,
   compact = false,
   matchedRequestRules,
@@ -187,12 +202,37 @@ export function DynamicPricingBreakdown({
   const { tiers, ruleGroups } = useMemo(() => {
     const split = splitBillingExprAndRequestRules(expr)
     const parsedTiers = parseTiersFromExpr(split.billingExpr)
-    const parsedRules = tryParseRequestRuleExpr(split.requestRuleExpr || '')
+    const expressionRules = tryParseRequestRuleExpr(split.requestRuleExpr || '')
+    let parsedRules: RequestRuleGroup[] | null = expressionRules
+
+    if (requestRules != null) {
+      parsedRules = requestRuleGroupsFromTrace(requestRules).map(
+        (group, index) => ({
+          ...group,
+          name: expressionRules?.[index]?.name,
+        })
+      )
+    } else if (expressionRules && matchedRequestRules) {
+      parsedRules = expressionRules.map((group, index) => {
+        const matchedRule = matchedRequestRules.find(
+          (rule) =>
+            rule.index === index ||
+            (rule.index == null && rule.name === group.name)
+        )
+        if (!matchedRule) return group
+        return {
+          ...group,
+          matched: true,
+          multiplier: String(matchedRule.multiplier),
+        }
+      })
+    }
+
     return {
       tiers: parsedTiers,
       ruleGroups: parsedRules || [],
     }
-  }, [expr])
+  }, [expr, matchedRequestRules, requestRules])
 
   const hasTiers = tiers.length > 0
   const hasRules = ruleGroups.length > 0
@@ -240,6 +280,8 @@ export function DynamicPricingBreakdown({
       (tier) => Number(tier[v.field as string as keyof ParsedTier] || 0) > 0
     )
   })
+  const mobileTierKeyOccurrences = new Map<string, number>()
+  const requestRuleKeyOccurrences = new Map<string, number>()
 
   return (
     <section className={cn('min-w-0', !compact && 'py-3 sm:py-4')}>
@@ -277,9 +319,13 @@ export function DynamicPricingBreakdown({
                 matchedTierLabel != null &&
                 matchedTierLabel !== '' &&
                 tier.label === matchedTierLabel
+              const rowKey = nextOccurrenceKey(
+                JSON.stringify(tier),
+                mobileTierKeyOccurrences
+              )
               return (
                 <div
-                  key={`tier-mobile-${tier.label}-${JSON.stringify(tier.conditions)}`}
+                  key={`tier-mobile-${rowKey}`}
                   className={cn(
                     'rounded-md border p-2',
                     isMatched && 'border-emerald-500/40 bg-emerald-500/10'
@@ -448,18 +494,18 @@ export function DynamicPricingBreakdown({
             {t('Conditional multipliers')}
           </div>
           <ul className='space-y-1.5'>
-            {ruleGroups.map((group, groupIndex) => {
-              const matchedRule = matchedRequestRules?.find(
-                (rule) =>
-                  rule.index === groupIndex ||
-                  (rule.index == null && rule.name === group.name)
+            {ruleGroups.map((group) => {
+              const isMatched = group.matched === true
+              const rowKey = nextOccurrenceKey(
+                `${group.conditionText || JSON.stringify(group.conditions)}:${group.multiplier}`,
+                requestRuleKeyOccurrences
               )
               return (
                 <li
-                  key={`group-${group.name || JSON.stringify(group)}`}
+                  key={`group-${rowKey}`}
                   className={cn(
                     'bg-muted/50 flex items-center justify-between gap-3 rounded-md border border-transparent px-3 py-2',
-                    matchedRule && 'border-emerald-500/40 bg-emerald-500/10'
+                    isMatched && 'border-emerald-500/40 bg-emerald-500/10'
                   )}
                 >
                   <span
@@ -473,22 +519,16 @@ export function DynamicPricingBreakdown({
                     )}
                     {describeGroup(group, t)}
                   </span>
-                  <span className='flex shrink-0 items-center gap-1.5'>
-                    {matchedRule && (
-                      <Badge
-                        variant='secondary'
-                        className='bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'
-                      >
-                        {t('Matched')}
-                      </Badge>
+                  <Badge
+                    variant='secondary'
+                    className={cn(
+                      'shrink-0 bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300',
+                      isMatched &&
+                        'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'
                     )}
-                    <Badge
-                      variant='secondary'
-                      className='bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300'
-                    >
-                      {matchedRule?.multiplier ?? group.multiplier}x
-                    </Badge>
-                  </span>
+                  >
+                    {group.multiplier}x{isMatched && ` · ${t('Matched')}`}
+                  </Badge>
                 </li>
               )
             })}

@@ -142,6 +142,7 @@ func Redeem(key string, userId int) (quota int, err error) {
 		return 0, errors.New("无效的 user id")
 	}
 	redemption := &Redemption{}
+	creditedQuota := 0
 
 	keyCol := "`key`"
 	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
@@ -175,14 +176,14 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if result.RowsAffected == 0 {
 			return errors.New("该兑换码已被使用")
 		}
-		_, err = CreditUserQuotaWithTx(tx, userId, redemption.Quota)
+		creditedQuota, err = CreditUserQuotaWithTx(tx, userId, redemption.Quota)
 		return err
 	})
 	if err != nil {
 		common.SysError("redemption failed: " + err.Error())
 		return 0, ErrRedeemFailed
 	}
-	invalidateUserQuotaCacheAfterCommit(userId)
+	syncCreditUserQuotaCache(userId, creditedQuota, "redemption")
 	RecordLog(userId, LogTypeTopup, fmt.Sprintf("通过兑换码充值 %s，兑换码ID %d", logger.LogQuota(redemption.Quota), redemption.Id))
 	return redemption.Quota, nil
 }

@@ -240,6 +240,14 @@ export type RequestRuleGroup = {
   name?: string
   conditions: RequestCondition[]
   multiplier: string
+  conditionText?: string
+  matched?: boolean
+}
+
+export type RequestRuleTrace = {
+  cond: string
+  multiplier: number
+  matched: boolean
 }
 
 export type TierCondition = {
@@ -511,6 +519,19 @@ function tryParseRequestCondition(expr: string): RequestCondition | null {
   return null
 }
 
+function tryParseRequestConditions(
+  conditionStr: string
+): RequestCondition[] | null {
+  const andParts = splitTopLevelAnd(conditionStr)
+  const conditions: RequestCondition[] = []
+  for (const part of andParts) {
+    const condition = tryParseRequestCondition(part.trim())
+    if (!condition) return null
+    conditions.push(condition)
+  }
+  return conditions.length > 0 ? conditions : null
+}
+
 function tryParseRuleGroupFactor(part: string): RequestRuleGroup | null {
   const tracked = part.match(
     /^rule\(((?:"(?:[^"\\]|\\.)*")),\s*([\s\S]+),\s*([\d.eE+-]+)\)$/
@@ -522,15 +543,23 @@ function tryParseRuleGroupFactor(part: string): RequestRuleGroup | null {
   const multiplier = tracked?.[3] ?? legacy?.[2] ?? ''
   const name = tracked ? (JSON.parse(tracked[1]) as string) : ''
 
-  const andParts = splitTopLevelAnd(conditionStr)
-  const conditions: RequestCondition[] = []
-  for (const ap of andParts) {
-    const cond = tryParseRequestCondition(ap.trim())
-    if (!cond) return null
-    conditions.push(cond)
-  }
-  if (conditions.length === 0) return null
+  const conditions = tryParseRequestConditions(conditionStr)
+  if (!conditions) return null
   return { name, conditions, multiplier }
+}
+
+export function requestRuleGroupsFromTrace(
+  requestRules: RequestRuleTrace[]
+): RequestRuleGroup[] {
+  return requestRules.map((rule) => {
+    const conditionText = rule.cond.trim()
+    return {
+      conditions: tryParseRequestConditions(conditionText) || [],
+      multiplier: String(rule.multiplier),
+      conditionText,
+      matched: rule.matched,
+    }
+  })
 }
 
 export function tryParseRequestRuleExpr(
@@ -695,8 +724,11 @@ export function normalizeCondition(
   cond: Partial<RequestCondition> | null | undefined
 ): RequestCondition {
   let source: RequestCondition['source'] = 'param'
-  if (cond?.source === 'time') source = 'time'
-  if (cond?.source === 'header') source = 'header'
+  if (cond?.source === 'time') {
+    source = 'time'
+  } else if (cond?.source === 'header') {
+    source = 'header'
+  }
 
   if (source === 'time') {
     const timeCond = cond as Partial<TimeCondition> | null | undefined

@@ -334,5 +334,8 @@ func InjectTieredBillingInfo(other map[string]interface{}, relayInfo *relaycommo
 		if len(result.MatchedRules) > 0 {
 			other["matched_request_rules"] = result.MatchedRules
 		}
+		if len(result.RequestRules) > 0 {
+			other["request_rules"] = result.RequestRules
+		}
 	}
 }

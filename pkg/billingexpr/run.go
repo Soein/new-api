@@ -28,11 +28,11 @@ func RunExpr(exprStr string, params TokenParams) (float64, TraceResult, error) {
 }
 
 func RunExprWithRequest(exprStr string, params TokenParams, request RequestInput) (float64, TraceResult, error) {
-	prog, err := CompileFromCache(exprStr)
+	entry, err := compileEntryFromCacheByHash(exprStr, ExprHashString(exprStr))
 	if err != nil {
 		return 0, TraceResult{}, err
 	}
-	return runProgram(prog, params, request)
+	return runProgram(entry.prog, entry.requestRules, params, request)
 }
 
 // RunExprByHash is like RunExpr but accepts a pre-computed hash for the cache
@@ -43,18 +43,20 @@ func RunExprByHash(exprStr, hash string, params TokenParams) (float64, TraceResu
 }
 
 func RunExprByHashWithRequest(exprStr, hash string, params TokenParams, request RequestInput) (float64, TraceResult, error) {
-	prog, err := CompileFromCacheByHash(exprStr, hash)
+	entry, err := compileEntryFromCacheByHash(exprStr, hash)
 	if err != nil {
 		return 0, TraceResult{}, err
 	}
-	return runProgram(prog, params, request)
+	return runProgram(entry.prog, entry.requestRules, params, request)
 }
 
-func runProgram(prog *vm.Program, params TokenParams, request RequestInput) (float64, TraceResult, error) {
-	trace := TraceResult{}
+func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenParams, request RequestInput) (float64, TraceResult, error) {
+	trace := TraceResult{
+		RequestRules: append([]RequestRuleTrace(nil), requestRules...),
+	}
 	headers := normalizeHeaders(request.Headers)
 	var runtimeErr error
-	ruleIndex := 0
+	matchedRuleIndex := 0
 	if params.ImageCount < 0 || params.ImageCount > dto.MaxImageN || math.IsNaN(params.ImageCount) || math.IsInf(params.ImageCount, 0) || math.Trunc(params.ImageCount) != params.ImageCount {
 		return 0, trace, fmt.Errorf("image_count must be an integer between 0 and %d", dto.MaxImageN)
 	}
@@ -89,8 +91,8 @@ func runProgram(prog *vm.Program, params TokenParams, request RequestInput) (flo
 			return price * params.ImageCount * 1_000_000
 		},
 		"rule": func(name string, matched bool, multiplier float64) float64 {
-			currentRuleIndex := ruleIndex
-			ruleIndex++
+			currentRuleIndex := matchedRuleIndex
+			matchedRuleIndex++
 			if runtimeErr != nil {
 				return 1
 			}
@@ -108,6 +110,24 @@ func runProgram(prog *vm.Program, params TokenParams, request RequestInput) (flo
 			}
 			trace.MatchedRules = append(trace.MatchedRules, MatchedRule{Index: currentRuleIndex, Name: name, Multiplier: multiplier})
 			return multiplier
+		},
+		requestRuleTraceFunction: func(ruleIndex int, matched bool, multiplier float64) float64 {
+			if matched && ruleIndex >= 0 && ruleIndex < len(trace.RequestRules) {
+				trace.RequestRules[ruleIndex].Matched = true
+			}
+			if matched {
+				return multiplier
+			}
+			return 1
+		},
+		requestRuleTraceIntFunction: func(ruleIndex int, matched bool, multiplier int) int {
+			if matched && ruleIndex >= 0 && ruleIndex < len(trace.RequestRules) {
+				trace.RequestRules[ruleIndex].Matched = true
+			}
+			if matched {
+				return multiplier
+			}
+			return 1
 		},
 		"header": func(key string) string {
 			return headers[strings.ToLower(strings.TrimSpace(key))]

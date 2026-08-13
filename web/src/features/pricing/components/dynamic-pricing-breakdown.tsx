@@ -203,20 +203,17 @@ export function DynamicPricingBreakdown({
     const split = splitBillingExprAndRequestRules(expr)
     const parsedTiers = parseTiersFromExpr(split.billingExpr)
     const expressionRules = tryParseRequestRuleExpr(split.requestRuleExpr || '')
-    let parsedRules: RequestRuleGroup[] | null = expressionRules
+    const legacyTraceRules = requestRuleGroupsFromTrace(requestRules || [])
+    const usedLegacyTraceIndexes = new Set<number>()
+    let namedRuleIndex = 0
 
-    if (requestRules != null) {
-      parsedRules = requestRuleGroupsFromTrace(requestRules).map(
-        (group, index) => ({
-          ...group,
-          name: expressionRules?.[index]?.name,
-        })
-      )
-    } else if (expressionRules && matchedRequestRules) {
-      parsedRules = expressionRules.map((group, index) => {
-        const matchedRule = matchedRequestRules.find(
+    const parsedRules = (expressionRules || []).map((group) => {
+      if (group.name) {
+        const currentNamedRuleIndex = namedRuleIndex
+        namedRuleIndex += 1
+        const matchedRule = matchedRequestRules?.find(
           (rule) =>
-            rule.index === index ||
+            rule.index === currentNamedRuleIndex ||
             (rule.index == null && rule.name === group.name)
         )
         if (!matchedRule) return group
@@ -225,12 +222,29 @@ export function DynamicPricingBreakdown({
           matched: true,
           multiplier: String(matchedRule.multiplier),
         }
-      })
-    }
+      }
+
+      if (requestRules == null) return group
+
+      const groupConditionKey = JSON.stringify(group.conditions)
+      const traceIndex = legacyTraceRules.findIndex(
+        (traceGroup, index) =>
+          !usedLegacyTraceIndexes.has(index) &&
+          JSON.stringify(traceGroup.conditions) === groupConditionKey
+      )
+      if (traceIndex < 0) return group
+
+      usedLegacyTraceIndexes.add(traceIndex)
+      return legacyTraceRules[traceIndex]
+    })
+
+    legacyTraceRules.forEach((group, index) => {
+      if (!usedLegacyTraceIndexes.has(index)) parsedRules.push(group)
+    })
 
     return {
       tiers: parsedTiers,
-      ruleGroups: parsedRules || [],
+      ruleGroups: parsedRules,
     }
   }, [expr, matchedRequestRules, requestRules])
 

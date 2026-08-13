@@ -95,4 +95,39 @@ describe('image pricing rule trace', () => {
     assert.match(container.textContent || '', /\$0\.0400/)
     assert.match(container.textContent || '', /\$\/image/)
   })
+
+  test('keeps named and legacy rule traces separate in a mixed expression', () => {
+    act(() => {
+      root.render(
+        <I18nextProvider i18n={i18n}>
+          <DynamicPricingBreakdown
+            compact
+            billingExpr='v2:tier("image", per_image(0.04)) * rule("quality=high", param("quality") == "high", 2) * (param("service_tier") == "fast" ? 1.5 : 1)'
+            matchedRequestRules={[
+              { index: 0, name: 'quality=high', multiplier: 2 },
+            ]}
+            requestRules={[
+              {
+                cond: 'param("service_tier") == "fast"',
+                multiplier: 1.5,
+                matched: false,
+              },
+            ]}
+          />
+        </I18nextProvider>
+      )
+    })
+
+    const rules = [...container.querySelectorAll('li')]
+    assert.equal(rules.length, 2)
+
+    assert.match(rules[0].textContent || '', /quality=high/)
+    assert.match(rules[0].textContent || '', /Body param quality = high/)
+    assert.match(rules[0].textContent || '', /2x · Matched/)
+
+    assert.doesNotMatch(rules[1].textContent || '', /quality=high/)
+    assert.match(rules[1].textContent || '', /Body param service_tier = fast/)
+    assert.match(rules[1].textContent || '', /1.5x/)
+    assert.doesNotMatch(rules[1].textContent || '', /Matched/)
+  })
 })

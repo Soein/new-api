@@ -216,6 +216,19 @@ func TestRechargeEpayCreditsQuotaExactlyOnce(t *testing.T) {
 	assert.Equal(t, 2*500000, getUserQuotaForPaymentGuardTest(t, user.Id))
 }
 
+func TestManualCompleteTopUpAlreadySuccessfulDoesNotRecordTopupLog(t *testing.T) {
+	truncateTables(t)
+
+	user := insertUserForPaymentGuardTest(t, 506, 7)
+	order := createEpayTestOrder(t, user.Id, "MANUALALREADYDONE", PaymentProviderEpay, common.TopUpStatusSuccess)
+
+	require.NoError(t, ManualCompleteTopUp(order.TradeNo, "127.0.0.1"))
+
+	var logCount int64
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("type = ?", LogTypeTopup).Count(&logCount).Error)
+	assert.Zero(t, logCount)
+}
+
 func TestRechargeEpayKeepsRedisAndDatabaseCreditInSync(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)

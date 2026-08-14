@@ -406,27 +406,17 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 	return nil
 }
 
-type postConsumeQuotaResult struct {
-	FundingApplied bool
-	TokenApplied   bool
-}
-
-func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) error {
-	_, err := postConsumeQuotaWithResult(relayInfo, quota, preConsumedQuota, sendEmail)
-	return err
-}
-
-func postConsumeQuotaWithResult(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) (result postConsumeQuotaResult, err error) {
+func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) (err error) {
 
 	// 1) Consume from wallet quota OR subscription item
 	if relayInfo != nil && relayInfo.BillingSource == BillingSourceSubscription {
 		if relayInfo.SubscriptionId == 0 {
-			return result, errors.New("subscription id is missing")
+			return errors.New("subscription id is missing")
 		}
 		delta := int64(quota)
 		if delta != 0 {
 			if err := model.PostConsumeUserSubscriptionDelta(relayInfo.SubscriptionId, delta); err != nil {
-				return result, err
+				return err
 			}
 			relayInfo.SubscriptionPostDelta += delta
 		}
@@ -438,10 +428,9 @@ func postConsumeQuotaWithResult(relayInfo *relaycommon.RelayInfo, quota int, pre
 			err = model.IncreaseUserQuota(relayInfo.UserId, -quota, false)
 		}
 		if err != nil {
-			return result, err
+			return err
 		}
 	}
-	result.FundingApplied = true
 
 	if !relayInfo.IsPlayground {
 		if quota > 0 {
@@ -450,9 +439,8 @@ func postConsumeQuotaWithResult(relayInfo *relaycommon.RelayInfo, quota int, pre
 			err = model.IncreaseTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, -quota)
 		}
 		if err != nil {
-			return result, err
+			return err
 		}
-		result.TokenApplied = true
 	}
 
 	if sendEmail {
@@ -461,7 +449,7 @@ func postConsumeQuotaWithResult(relayInfo *relaycommon.RelayInfo, quota int, pre
 		}
 	}
 
-	return result, nil
+	return nil
 }
 
 func checkAndSendQuotaNotify(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int) {

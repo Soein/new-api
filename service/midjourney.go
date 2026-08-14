@@ -39,6 +39,8 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	task.Quota = 0
 	task.TokenId = 0
 	task.BillingChannelId = 0
+	task.BillingStatus = ""
+	task.BillingQuotaDelta = 0
 	if !shouldBill {
 		return false, nil
 	}
@@ -53,6 +55,10 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	}
 
 	task.Quota = quota
+	task.BillingStatus = model.MidjourneyBillingStatusPrepared
+	if !relayInfo.IsPlayground {
+		task.TokenId = relayInfo.TokenId
+	}
 	task.BillingChannelId = task.ChannelId
 	if relayInfo.ChannelMeta != nil && relayInfo.ChannelId > 0 {
 		task.BillingChannelId = relayInfo.ChannelId
@@ -72,69 +78,128 @@ func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.M
 		return false, errors.New("Midjourney task must be persisted before billing")
 	}
 
-	result, billingErr := postConsumeQuotaWithResult(relayInfo, task.Quota, 0, true)
-	if !result.FundingApplied {
-		task.Quota = 0
-		task.TokenId = 0
-		task.BillingChannelId = 0
-		if updateErr := task.UpdateBillingState(); updateErr != nil {
-			return false, errors.Join(billingErr, fmt.Errorf("clear Midjourney billing state: %w", updateErr))
+	result, billingErr := task.SettleBilling(relayInfo.TokenKey)
+	if billingErr != nil {
+		if errors.Is(billingErr, model.ErrMidjourneyBillingRetryable) {
+			return false, billingErr
+		}
+		if cancelErr := task.CancelPreparedBilling(); cancelErr != nil {
+			billingErr = errors.Join(billingErr, fmt.Errorf("clear prepared Midjourney billing: %w", cancelErr))
 		}
 		return false, billingErr
 	}
+	if result.Applied {
+		checkAndSendQuotaNotify(relayInfo, task.Quota, 0)
+	}
+	return result.Applied, nil
+}
 
-	task.TokenId = 0
-	if result.TokenApplied {
-		task.TokenId = relayInfo.TokenId
+// ReconcileMidjourneyTaskBilling resumes a durable charge or refund left
+// incomplete by a process or cache failure. Terminal failed tasks are never
+// charged solely by recovery; an uncommitted charge is cancelled instead.
+func ReconcileMidjourneyTaskBilling(ctx context.Context, task *model.Midjourney) bool {
+	if task == nil {
+		return true
 	}
-	if updateErr := task.UpdateBillingState(); updateErr != nil {
-		return true, errors.Join(billingErr, fmt.Errorf("update Midjourney billing state: %w", updateErr))
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return true, billingErr
+
+	failed := task.Status == "FAILURE"
+	switch task.BillingStatus {
+	case model.MidjourneyBillingStatusPrepared, model.MidjourneyBillingStatusCharging:
+		if failed {
+			return RefundMidjourneyQuota(ctx, task, "计费恢复时任务已失败")
+		}
+		return reconcileMidjourneyCharge(ctx, task)
+	case model.MidjourneyBillingStatusChargePending:
+		if !reconcileMidjourneyCharge(ctx, task) {
+			return false
+		}
+		if task.Status == "FAILURE" {
+			return RefundMidjourneyQuota(ctx, task, "计费恢复时任务已失败")
+		}
+		return true
+	case model.MidjourneyBillingStatusCharged:
+		if failed && task.Quota > 0 {
+			return RefundMidjourneyQuota(ctx, task, "任务失败退款重试")
+		}
+		return true
+	case model.MidjourneyBillingStatusRefunding, model.MidjourneyBillingStatusRefundPending:
+		return RefundMidjourneyQuota(ctx, task, "退款状态恢复")
+	case "":
+		if failed && task.Quota > 0 {
+			return RefundMidjourneyQuota(ctx, task, "历史任务失败退款重试")
+		}
+		return true
+	default:
+		logger.LogWarn(ctx, fmt.Sprintf("未知的 Midjourney 计费状态 task %s: %s", task.MjId, task.BillingStatus))
+		return false
+	}
+}
+
+func reconcileMidjourneyCharge(ctx context.Context, task *model.Midjourney) bool {
+	tokenKey := ""
+	if task.TokenId > 0 {
+		tokenKey = resolveTokenKey(ctx, task.TokenId, task.MjId)
+	}
+	result, err := task.SettleBilling(tokenKey)
+	if err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("恢复 Midjourney 扣费失败 task %s: %s", task.MjId, err.Error()))
+		return false
+	}
+	if !result.Applied {
+		return true
+	}
+
+	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+		UserId:    task.UserId,
+		LogType:   model.LogTypeConsume,
+		Content:   "Midjourney 计费状态恢复",
+		ChannelId: task.GetBillingChannelId(),
+		ModelName: CovertMjpActionToModelName(task.Action),
+		Quota:     task.Quota,
+		TokenId:   task.TokenId,
+		Other: map[string]interface{}{
+			"task_id": task.MjId,
+			"reason":  "billing_recovery",
+		},
+	})
+	return true
 }
 
 // RefundMidjourneyQuota reverses every accounting element recorded for a billed legacy task.
 func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason string) bool {
-	quota := task.Quota
-	if quota == 0 {
+	tokenKey := ""
+	if task.TokenId > 0 {
+		tokenKey = resolveTokenKey(ctx, task.TokenId, task.MjId)
+	}
+	result, err := task.RefundBilling(tokenKey)
+	if err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("退还 Midjourney 额度失败 task %s: %s", task.MjId, err.Error()))
+		return false
+	}
+	if !result.Completed {
+		return false
+	}
+	if !result.Applied {
 		return true
 	}
 
-	if err := model.IncreaseUserQuota(task.UserId, quota, false); err != nil {
-		logger.LogWarn(ctx, fmt.Sprintf("退还 Midjourney 用户额度失败 task %s: %s", task.MjId, err.Error()))
-		return false
-	}
-
-	if task.TokenId > 0 {
-		tokenKey := resolveTokenKey(ctx, task.TokenId, task.MjId)
-		if tokenKey != "" {
-			if err := model.IncreaseTokenQuota(task.TokenId, tokenKey, quota); err != nil {
-				logger.LogWarn(ctx, fmt.Sprintf("退还 Midjourney 令牌额度失败 task %s: %s", task.MjId, err.Error()))
-			}
-		}
-	}
-
-	billingChannelId := task.GetBillingChannelId()
-	model.UpdateUserUsedQuota(task.UserId, -quota)
-	model.UpdateChannelUsedQuota(billingChannelId, -quota)
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
 		UserId:    task.UserId,
 		LogType:   model.LogTypeRefund,
 		Content:   "",
-		ChannelId: billingChannelId,
+		ChannelId: result.BillingChannelId,
 		ModelName: CovertMjpActionToModelName(task.Action),
-		Quota:     quota,
-		TokenId:   task.TokenId,
+		Quota:     result.Quota,
+		TokenId:   result.TokenId,
 		Other: map[string]interface{}{
 			"task_id": task.MjId,
 			"reason":  reason,
 		},
 	})
 
-	task.Quota = 0
-	if err := task.UpdateBillingState(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("Midjourney 退款成功但清除 quota 失败 task %s: %s", task.MjId, err.Error()))
-	}
 	return true
 }
 

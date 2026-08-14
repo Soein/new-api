@@ -14,6 +14,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -381,6 +382,42 @@ func TestSettleMidjourneyTaskBillingRequiresPersistedTask(t *testing.T) {
 	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
 }
 
+func TestRefundMidjourneyQuotaDoesNotCreditPreparedTask(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 55, 55, 55
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-prepared", initialTokenQuota)
+	seedChannel(t, channelID)
+
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:    userID,
+		TokenId:   tokenID,
+		TokenKey:  "sk-midjourney-prepared",
+		UserQuota: initialUserQuota,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	task := &model.Midjourney{UserId: userID, MjId: "mj-prepared", ChannelId: channelID}
+	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, task.Insert())
+
+	assert.True(t, RefundMidjourneyQuota(ctx, task, "poll raced settlement"))
+	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Zero(t, usedQuota)
+	assert.Zero(t, requestCount)
+	assert.Zero(t, getChannelUsedQuota(t, channelID))
+	assert.Zero(t, getMidjourneyTask(t, task.Id).Quota)
+	assert.Zero(t, countLogs(t))
+}
+
 func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
@@ -414,7 +451,7 @@ func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testi
 	require.NoError(t, err)
 	require.True(t, prepared)
 	assert.Equal(t, chargedQuota, task.Quota)
-	assert.Zero(t, task.TokenId)
+	assert.Equal(t, tokenID, task.TokenId)
 	assert.Equal(t, billingChannelID, task.BillingChannelId)
 	require.NoError(t, task.Insert())
 
@@ -427,14 +464,16 @@ func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testi
 	assert.Equal(t, chargedQuota, persisted.Quota)
 	assert.Equal(t, tokenID, persisted.TokenId)
 	assert.Equal(t, billingChannelID, persisted.BillingChannelId)
-
-	seedChargedAccounting(t, userID, billingChannelID, tokenID, chargedQuota, 1)
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Equal(t, chargedQuota, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Equal(t, int64(chargedQuota), getChannelUsedQuota(t, billingChannelID))
 
 	assert.True(t, RefundMidjourneyQuota(ctx, task, "构图失败"))
 	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
 	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
 	assert.Zero(t, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	usedQuota, requestCount = getUserUsageAccounting(t, userID)
 	assert.Zero(t, usedQuota)
 	assert.Equal(t, 1, requestCount)
 	assert.Zero(t, getChannelUsedQuota(t, billingChannelID))
@@ -508,9 +547,8 @@ func TestSettleMidjourneyTaskBillingFundingFailureClearsMarkers(t *testing.T) {
 	assert.Zero(t, countLogs(t))
 }
 
-func TestSettleMidjourneyTaskBillingTokenFailureKeepsFundingRefundable(t *testing.T) {
+func TestSettleMidjourneyTaskBillingTokenFailureRollsBackFunding(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
 
 	const userID, tokenID, channelID = 53, 53, 53
 	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
@@ -548,26 +586,346 @@ func TestSettleMidjourneyTaskBillingTokenFailureKeepsFundingRefundable(t *testin
 	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
 
 	require.Error(t, err)
-	require.True(t, billed)
-	assert.Equal(t, initialUserQuota-chargedQuota, getUserQuota(t, userID))
+	assert.False(t, billed)
+	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
 	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
 	assert.Zero(t, getTokenUsedQuota(t, tokenID))
 	persisted := getMidjourneyTask(t, task.Id)
-	assert.Equal(t, chargedQuota, persisted.Quota)
+	assert.Zero(t, persisted.Quota)
 	assert.Zero(t, persisted.TokenId)
-	assert.Equal(t, channelID, persisted.BillingChannelId)
-
-	seedChargedAccounting(t, userID, channelID, 0, chargedQuota, 1)
-	assert.True(t, RefundMidjourneyQuota(ctx, task, "token settlement failed"))
-	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, persisted.BillingChannelId)
 	usedQuota, requestCount := getUserUsageAccounting(t, userID)
 	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
+	assert.Zero(t, requestCount)
 	assert.Zero(t, getChannelUsedQuota(t, channelID))
+	assert.Zero(t, countLogs(t))
+}
+
+func TestSettleMidjourneyTaskBillingStateFailureRollsBackCharge(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 56, 56, 56
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-state-failure", initialTokenQuota)
+	seedChannel(t, channelID)
+
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:    userID,
+		TokenId:   tokenID,
+		TokenKey:  "sk-midjourney-state-failure",
+		UserQuota: initialUserQuota,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	task := &model.Midjourney{UserId: userID, MjId: "mj-state-failure", ChannelId: channelID}
+	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, task.Insert())
+
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_midjourney_billing_state_update
+		BEFORE UPDATE ON midjourneys
+		BEGIN
+			SELECT RAISE(ABORT, 'forced billing state failure');
+		END;
+	`).Error)
+	t.Cleanup(func() {
+		model.DB.Exec("DROP TRIGGER IF EXISTS fail_midjourney_billing_state_update")
+	})
+
+	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
+
+	require.Error(t, err)
+	assert.False(t, billed)
+	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	assert.Equal(t, chargedQuota, getMidjourneyTask(t, task.Id).Quota)
+	assert.Zero(t, countLogs(t))
+}
+
+func TestRefundMidjourneyQuotaTokenFailureRollsBackRefund(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 57, 57, 57
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-refund-failure", initialTokenQuota)
+	seedChannel(t, channelID)
+
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:    userID,
+		TokenId:   tokenID,
+		TokenKey:  "sk-midjourney-refund-failure",
+		UserQuota: initialUserQuota,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	task := &model.Midjourney{UserId: userID, MjId: "mj-refund-failure", ChannelId: channelID}
+	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, task.Insert())
+	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
+	require.NoError(t, err)
+	require.True(t, billed)
+
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_midjourney_token_refund
+		BEFORE UPDATE ON tokens
+		WHEN OLD.id = 57
+		BEGIN
+			SELECT RAISE(ABORT, 'forced token refund failure');
+		END;
+	`).Error)
+	t.Cleanup(func() {
+		model.DB.Exec("DROP TRIGGER IF EXISTS fail_midjourney_token_refund")
+	})
+
+	assert.False(t, RefundMidjourneyQuota(ctx, task, "forced refund failure"))
+	assert.Equal(t, initialUserQuota-chargedQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota-chargedQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, chargedQuota, getTokenUsedQuota(t, tokenID))
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Equal(t, chargedQuota, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Equal(t, int64(chargedQuota), getChannelUsedQuota(t, channelID))
+	assert.Equal(t, chargedQuota, getMidjourneyTask(t, task.Id).Quota)
+	assert.Zero(t, countLogs(t))
+}
+
+func TestSettleMidjourneyTaskBillingPersistsThroughBatchMode(t *testing.T) {
+	truncate(t)
+	common.BatchUpdateEnabled = true
+	t.Cleanup(func() { common.BatchUpdateEnabled = false })
+
+	const userID, tokenID, channelID = 58, 58, 58
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-batch", initialTokenQuota)
+	seedChannel(t, channelID)
+
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:    userID,
+		TokenId:   tokenID,
+		TokenKey:  "sk-midjourney-batch",
+		UserQuota: initialUserQuota,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	task := &model.Midjourney{UserId: userID, MjId: "mj-batch", ChannelId: channelID}
+	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, task.Insert())
+
+	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
+
+	require.NoError(t, err)
+	assert.True(t, billed)
+	assert.Equal(t, initialUserQuota-chargedQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota-chargedQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, chargedQuota, getTokenUsedQuota(t, tokenID))
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Equal(t, chargedQuota, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Equal(t, int64(chargedQuota), getChannelUsedQuota(t, channelID))
+}
+
+func TestSettleMidjourneyTaskBillingRedisFailureKeepsPreparedMarker(t *testing.T) {
+	truncate(t)
+
+	oldRedisEnabled := common.RedisEnabled
+	oldRDB := common.RDB
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
+	require.NoError(t, client.Close())
+	common.RedisEnabled = true
+	common.RDB = client
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedisEnabled
+		common.RDB = oldRDB
+	})
+
+	const userID, tokenID, channelID = 61, 61, 61
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-redis-failure", initialTokenQuota)
+	seedChannel(t, channelID)
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:    userID,
+		TokenId:   tokenID,
+		TokenKey:  "sk-midjourney-redis-failure",
+		UserQuota: initialUserQuota,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	task := &model.Midjourney{UserId: userID, MjId: "mj-redis-failure", ChannelId: channelID}
+	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, task.Insert())
+
+	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
+
+	require.Error(t, err)
+	assert.False(t, billed)
+	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
+	persisted := getMidjourneyTask(t, task.Id)
+	assert.Equal(t, chargedQuota, persisted.Quota)
+	assert.Equal(t, tokenID, persisted.TokenId)
+	assert.Equal(t, channelID, persisted.BillingChannelId)
+	assert.Equal(t, model.MidjourneyBillingStatusPrepared, persisted.BillingStatus)
+}
+
+func TestReconcileMidjourneyTaskBillingChargesPreparedTask(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 63, 63, 63
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-reconcile-charge", initialTokenQuota)
+	seedChannel(t, channelID)
+	task := &model.Midjourney{
+		UserId:           userID,
+		Action:           "IMAGINE",
+		MjId:             "mj-reconcile-charge",
+		ChannelId:        channelID,
+		Progress:         "0%",
+		Quota:            chargedQuota,
+		TokenId:          tokenID,
+		BillingChannelId: channelID,
+		BillingStatus:    model.MidjourneyBillingStatusPrepared,
+	}
+	require.NoError(t, task.Insert())
+
+	assert.True(t, ReconcileMidjourneyTaskBilling(context.Background(), task))
+	assert.Equal(t, initialUserQuota-chargedQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota-chargedQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, model.MidjourneyBillingStatusCharged, getMidjourneyTask(t, task.Id).BillingStatus)
 	log := getLastLog(t)
 	require.NotNil(t, log)
-	assert.Zero(t, log.TokenId)
+	assert.Equal(t, model.LogTypeConsume, log.Type)
+	assert.Equal(t, chargedQuota, log.Quota)
+	var other map[string]interface{}
+	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	assert.Equal(t, task.MjId, other["task_id"])
+}
+
+func TestReconcileMidjourneyTaskBillingCancelsFailedPreparedTask(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 64, 64, 64
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-reconcile-cancel", initialTokenQuota)
+	seedChannel(t, channelID)
+	task := &model.Midjourney{
+		UserId:           userID,
+		Action:           "IMAGINE",
+		MjId:             "mj-reconcile-cancel",
+		ChannelId:        channelID,
+		Status:           "FAILURE",
+		Progress:         "100%",
+		Quota:            chargedQuota,
+		TokenId:          tokenID,
+		BillingChannelId: channelID,
+		BillingStatus:    model.MidjourneyBillingStatusPrepared,
+	}
+	require.NoError(t, task.Insert())
+
+	assert.True(t, ReconcileMidjourneyTaskBilling(context.Background(), task))
+	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
+	persisted := getMidjourneyTask(t, task.Id)
+	assert.Empty(t, persisted.BillingStatus)
+	assert.Zero(t, persisted.Quota)
+	assert.Zero(t, countLogs(t))
+}
+
+func TestMidjourneyCASUpdatePreservesConcurrentChargedBillingState(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 59, 59, 59
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-cas", initialTokenQuota)
+	seedChannel(t, channelID)
+
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:    userID,
+		TokenId:   tokenID,
+		TokenKey:  "sk-midjourney-cas",
+		UserQuota: initialUserQuota,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	task := &model.Midjourney{UserId: userID, MjId: "mj-cas", ChannelId: channelID, Status: "SUBMITTED"}
+	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, task.Insert())
+	stale := getMidjourneyTask(t, task.Id)
+
+	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
+	require.NoError(t, err)
+	require.True(t, billed)
+	stale.Status = "FAILURE"
+	won, err := stale.UpdateWithStatus("SUBMITTED")
+	require.NoError(t, err)
+	require.True(t, won)
+
+	persisted := getMidjourneyTask(t, task.Id)
+	assert.Equal(t, model.MidjourneyBillingStatusCharged, persisted.BillingStatus)
+	assert.Equal(t, chargedQuota, persisted.Quota)
+	assert.Equal(t, tokenID, persisted.TokenId)
+	assert.Equal(t, channelID, persisted.BillingChannelId)
+}
+
+func TestMidjourneyUpdatePreservesConcurrentChargedBillingState(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 60, 60, 60
+	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	seedUser(t, userID, initialUserQuota)
+	seedToken(t, tokenID, userID, "sk-midjourney-update", initialTokenQuota)
+	seedChannel(t, channelID)
+
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:    userID,
+		TokenId:   tokenID,
+		TokenKey:  "sk-midjourney-update",
+		UserQuota: initialUserQuota,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	task := &model.Midjourney{UserId: userID, MjId: "mj-update", ChannelId: channelID, Status: "SUBMITTED"}
+	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, task.Insert())
+	stale := getMidjourneyTask(t, task.Id)
+
+	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
+	require.NoError(t, err)
+	require.True(t, billed)
+	stale.Status = "SUCCESS"
+	require.NoError(t, stale.Update())
+
+	persisted := getMidjourneyTask(t, task.Id)
+	assert.Equal(t, model.MidjourneyBillingStatusCharged, persisted.BillingStatus)
+	assert.Equal(t, chargedQuota, persisted.Quota)
+	assert.Equal(t, tokenID, persisted.TokenId)
+	assert.Equal(t, channelID, persisted.BillingChannelId)
 }
 
 func TestPrepareMidjourneyTaskBillingRejectsSubscriptionBeforeCharge(t *testing.T) {
@@ -603,6 +961,9 @@ func TestRefundMidjourneyQuotaUsesLegacyChannelFallbackWithoutTokenAdjustment(t 
 		Progress:  "0%",
 	}
 	require.NoError(t, task.Insert())
+	require.NoError(t, model.DB.Model(&model.Midjourney{}).
+		Where("id = ?", task.Id).
+		Update("billing_status", nil).Error)
 
 	assert.True(t, RefundMidjourneyQuota(ctx, task, "legacy failure"))
 

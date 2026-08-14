@@ -115,6 +115,9 @@ func GetUserCache(userId int) (*UserBase, error) {
 			if errors.Is(err, ErrUserAuthCachePending) {
 				return nil, err
 			}
+			if errors.Is(err, ErrQuotaCacheMutationPending) {
+				return user.ToBaseUser(), nil
+			}
 			common.SysLog("failed to synchronously populate user cache: " + err.Error())
 		}
 	}

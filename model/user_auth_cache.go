@@ -46,6 +46,10 @@ func userAuthFenceTTLSeconds() int {
 }
 
 func writeUserCache(user *UserBase, includeQuota bool) error {
+	return writeUserCacheWithQuotaFence(user, includeQuota, "", "", false)
+}
+
+func writeUserCacheWithQuotaFence(user *UserBase, includeQuota bool, quotaFenceOwner string, operationKey string, databaseMutationApplied bool) error {
 	if user == nil || user.Id <= 0 || !common.RedisEnabled {
 		return nil
 	}
@@ -60,6 +64,10 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	ttl := userCacheTTLSeconds()
 	const script = `
 local incoming = tonumber(ARGV[1])
+local quotaFence = redis.call('GET', KEYS[4])
+if ARGV[10] == '1' and quotaFence and quotaFence ~= ARGV[14] then
+  return 2
+end
 local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
 local committed = tonumber(redis.call('GET', KEYS[3]) or '0')
 local current = tonumber(redis.call('HGET', KEYS[1], 'AuthVersion') or '0')
@@ -75,6 +83,7 @@ end
 if ARGV[10] == '0' and redis.call('EXISTS', KEYS[1]) == 0 then
   return 1
 end
+local quotaExisted = redis.call('HEXISTS', KEYS[1], 'Quota')
 redis.call('HSET', KEYS[1],
   'Id', ARGV[2], 'Group', ARGV[3], 'Email', ARGV[4],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
@@ -83,18 +92,39 @@ redis.call('HSET', KEYS[1],
 if ARGV[10] == '1' and redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
   redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
 end
+if ARGV[10] == '1' and ARGV[14] ~= '' and quotaExisted == 0 then
+  if ARGV[15] == '1' then
+    redis.call('SET', KEYS[5], 1)
+  else
+    redis.call('DEL', KEYS[5])
+  end
+end
 redis.call('EXPIRE', KEYS[1], ARGV[12])
 return 1`
+	databaseMutationAppliedArg := "0"
+	if databaseMutationApplied {
+		databaseMutationAppliedArg = "1"
+	}
 	result, err := common.RDB.Eval(context.Background(), script,
-		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},
+		[]string{
+			getUserCacheKey(user.Id),
+			getUserAuthFenceKey(user.Id),
+			getUserAuthVersionKey(user.Id),
+			getUserQuotaMutationFenceKey(user.Id),
+			operationKey,
+		},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
-		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl, user.SessionGeneration,
+		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
+		user.SessionGeneration, quotaFenceOwner, databaseMutationAppliedArg,
 	).Int()
 	if err != nil {
 		return err
 	}
 	if result == 0 {
 		return ErrUserAuthCachePending
+	}
+	if result == 2 {
+		return ErrQuotaCacheMutationPending
 	}
 	return nil
 }

@@ -47,10 +47,17 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 	taskChannelM := make(map[int][]string)
 	taskM := make(map[string]*model.Midjourney)
 	nullTaskIds := make([]int, 0)
+	nullTasks := make([]*model.Midjourney, 0)
 	for _, task := range tasks {
 		if task.MjId == "" {
-			// 统计失败的未完成任务
 			nullTaskIds = append(nullTaskIds, task.Id)
+			task.Status = "FAILURE"
+			task.Progress = "100%"
+			nullTasks = append(nullTasks, task)
+			continue
+		}
+		service.ReconcileMidjourneyTaskBilling(ctx, task)
+		if task.Progress == "100%" {
 			continue
 		}
 		taskM[task.MjId] = task
@@ -66,6 +73,9 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			logger.LogError(ctx, fmt.Sprintf("Fix null mj_id task error: %v", err))
 		} else {
 			logger.LogInfo(ctx, fmt.Sprintf("Fix null mj_id task success: %v", nullTaskIds))
+			for _, task := range nullTasks {
+				service.ReconcileMidjourneyTaskBilling(ctx, task)
+			}
 		}
 	}
 	if len(taskChannelM) == 0 {

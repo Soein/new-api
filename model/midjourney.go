@@ -1,9 +1,11 @@
 package model
 
+import "gorm.io/gorm"
+
 type Midjourney struct {
 	Id          int    `json:"id"`
 	Code        int    `json:"code"`
-	UserId      int    `json:"user_id" gorm:"index"`
+	UserId      int    `json:"user_id" gorm:"index;index:idx_midjourney_user_billing,priority:1"`
 	Action      string `json:"action" gorm:"type:varchar(40);index"`
 	MjId        string `json:"mj_id" gorm:"index"`
 	Prompt      string `json:"prompt"`
@@ -24,8 +26,10 @@ type Midjourney struct {
 	Buttons     string `json:"buttons"`
 	Properties  string `json:"properties"`
 
-	TokenId          int `json:"-" gorm:"default:0"`
-	BillingChannelId int `json:"-" gorm:"default:0"`
+	TokenId           int    `json:"-" gorm:"default:0;index:idx_midjourney_token_billing,priority:1"`
+	BillingChannelId  int    `json:"-" gorm:"default:0"`
+	BillingStatus     string `json:"-" gorm:"type:varchar(16);index:idx_midjourney_user_billing,priority:2;index:idx_midjourney_token_billing,priority:2"`
+	BillingQuotaDelta int    `json:"-" gorm:"default:0"`
 }
 
 // TaskQueryParams 用于包含所有搜索条件的结构体，可以根据需求添加更多字段
@@ -96,25 +100,36 @@ func GetAllTasks(startIdx int, num int, queryParams TaskQueryParams) []*Midjourn
 func GetAllUnFinishTasks() []*Midjourney {
 	var tasks []*Midjourney
 	var err error
-	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Find(&tasks).Error
+	err = unfinishedMidjourneyTasksQuery(DB).Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
 	return tasks
 }
 
-// HasUnfinishedMidjourneyTasks reports whether at least one Midjourney task is
-// still in progress. It is a cheap existence check (LIMIT 1) used to decide
-// whether the midjourney_poll system task needs to run; when no task is pending
-// the scheduler skips creating a row entirely.
+// HasUnfinishedMidjourneyTasks reports whether a Midjourney task still needs
+// upstream polling or durable billing reconciliation. It is a cheap existence
+// check (LIMIT 1) used to decide whether the scheduler should run a polling pass.
 func HasUnfinishedMidjourneyTasks() bool {
 	var id int
-	err := DB.Model(&Midjourney{}).
-		Where("progress != ?", "100%").
+	err := unfinishedMidjourneyTasksQuery(DB.Model(&Midjourney{})).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
+}
+
+func unfinishedMidjourneyTasksQuery(query *gorm.DB) *gorm.DB {
+	pendingBillingStatuses := []string{
+		MidjourneyBillingStatusPrepared,
+		MidjourneyBillingStatusCharging,
+		MidjourneyBillingStatusChargePending,
+		MidjourneyBillingStatusRefunding,
+		MidjourneyBillingStatusRefundPending,
+	}
+	return query.Where(
+		"progress != ? OR billing_status IN ? OR (status = ? AND quota > 0 AND (billing_status = ? OR billing_status = ? OR billing_status IS NULL))",
+		"100%", pendingBillingStatuses, "FAILURE", MidjourneyBillingStatusCharged, "",
+	)
 }
 
 func GetByOnlyMJId(mjId string) *Midjourney {
@@ -168,15 +183,7 @@ func (midjourney *Midjourney) Insert() error {
 }
 
 func (midjourney *Midjourney) Update() error {
-	var err error
-	err = DB.Save(midjourney).Error
-	return err
-}
-
-func (midjourney *Midjourney) UpdateBillingState() error {
-	return DB.Model(midjourney).
-		Select("quota", "token_id", "billing_channel_id").
-		Updates(midjourney).Error
+	return DB.Omit("quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta").Save(midjourney).Error
 }
 
 func (midjourney *Midjourney) GetBillingChannelId() int {
@@ -192,7 +199,11 @@ func (midjourney *Midjourney) GetBillingChannelId() int {
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
 // Uses Model().Select("*").Updates() to avoid GORM Save()'s INSERT fallback.
 func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) {
-	result := DB.Model(midjourney).Where("status = ?", fromStatus).Select("*").Updates(midjourney)
+	result := DB.Model(midjourney).
+		Where("status = ?", fromStatus).
+		Select("*").
+		Omit("quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta").
+		Updates(midjourney)
 	if result.Error != nil {
 		return false, result.Error
 	}

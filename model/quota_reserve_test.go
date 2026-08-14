@@ -103,7 +103,7 @@ func TestTryReserveQuotaWithoutRedis(t *testing.T) {
 	assert.Equal(t, 55, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
-func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
+func TestRedisReserveKeepsDatabaseBalanceDurableInBatchMode(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	useUserCacheMiniRedis(t)
@@ -113,7 +113,7 @@ func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
 	reserved, err := TryReserveUserQuota(user.Id, 8)
 	require.NoError(t, err)
 	assert.True(t, reserved)
-	assert.Equal(t, 10, getUserQuotaFromDB(t, user.Id), "batch delta is not flushed yet")
+	assert.Equal(t, 2, getUserQuotaFromDB(t, user.Id), "spendable balance must be durable before returning")
 
 	reserved, err = TryReserveUserQuota(user.Id, 3)
 	require.NoError(t, err)
@@ -129,13 +129,88 @@ func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 3, false)
 	require.NoError(t, err)
 	assert.False(t, reserved)
-	assert.Equal(t, 9, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Equal(t, 2, getTokenFromDB(t, token.Id).RemainQuota)
 
 	batchUpdate()
 	assert.Equal(t, 2, getUserQuotaFromDB(t, user.Id))
 	reloadedToken := getTokenFromDB(t, token.Id)
 	assert.Equal(t, 2, reloadedToken.RemainQuota)
 	assert.Equal(t, 7, reloadedToken.UsedQuota)
+}
+
+func TestTokenQuotaAdjustmentsStayDurableInBatchMode(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, IncreaseTokenQuota(token.Id, token.Key, 20))
+	require.NoError(t, DecreaseTokenQuota(token.Id, token.Key, 35))
+
+	reloaded := getTokenFromDB(t, token.Id)
+	assert.Equal(t, 85, reloaded.RemainQuota)
+	assert.Equal(t, 15, reloaded.UsedQuota)
+	_, err = cacheGetTokenByKey(token.Key)
+	assert.Error(t, err, "DB-first adjustment must invalidate the old cache snapshot")
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 80, false)
+
+	require.NoError(t, err)
+	assert.True(t, reserved, "a quota adjustment must not fence the token from immediate reuse")
+	reloaded = getTokenFromDB(t, token.Id)
+	assert.Equal(t, 5, reloaded.RemainQuota)
+	assert.Equal(t, 95, reloaded.UsedQuota)
+}
+
+func TestTokenReserveRejectsStaleHighCacheAtDatabaseBoundary(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "RemainQuota", 200).Err())
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 150, false)
+
+	require.NoError(t, err)
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+	_, err = cacheGetTokenByKey(token.Key)
+	assert.Error(t, err, "a cache that disagrees with the durable balance must be invalidated")
+}
+
+func TestReserveFailsClosedDuringBillingCacheMutation(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.Set(t.Context(), getUserQuotaMutationFenceKey(user.Id), "billing-owner", 0).Err())
+
+	reserved, err := TryReserveUserQuota(user.Id, 10)
+
+	assert.False(t, reserved)
+	assert.ErrorIs(t, err, ErrQuotaCacheMutationPending)
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 100, mustGetCachedUserQuota(t, user.Id))
+
+	token := createReserveTestToken(t, 100)
+	_, err = GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.Set(t.Context(), getTokenQuotaMutationFenceKey(token.Key), "billing-owner", 0).Err())
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 10, false)
+
+	assert.False(t, reserved)
+	assert.ErrorIs(t, err, ErrQuotaCacheMutationPending)
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Equal(t, 100, mustGetCachedTokenQuota(t, token.Key))
 }
 
 func TestReserveFallsBackToDatabaseWhenRedisIsUnavailable(t *testing.T) {

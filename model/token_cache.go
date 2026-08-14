@@ -47,6 +47,17 @@ func invalidateTokenCacheForMutation(key string) error {
 	return common.RDB.Del(ctx, getTokenCacheKey(key)).Err()
 }
 
+// invalidateTokenQuotaCacheAfterCommit drops a balance snapshot after its DB
+// update has committed. Unlike the metadata mutation fence, a quota refresh
+// must not block the token for ten seconds; the final conditional DB debit in
+// TryReserveTokenQuota remains the authority if an in-flight stale fill wins.
+func invalidateTokenQuotaCacheAfterCommit(key string) error {
+	if !common.RedisEnabled || key == "" {
+		return nil
+	}
+	return common.RedisDelKey(getTokenCacheKey(key))
+}
+
 // cacheInitToken publishes a database snapshot only when no mutation fence is
 // active and the hash is cold. An existing hash only gets its TTL refreshed:
 // its RemainQuota may already be ahead of this snapshot because atomic
@@ -54,6 +65,10 @@ func invalidateTokenCacheForMutation(key string) error {
 // field of a live hash.
 // 返回值：0=被 fence 拦截，1=完成初始化，2=哈希已存在，仅刷新 TTL。
 func cacheInitToken(token Token) (int, error) {
+	return cacheInitTokenWithQuotaFence(token, "", "", false)
+}
+
+func cacheInitTokenWithQuotaFence(token Token, quotaFenceOwner string, operationKey string, databaseMutationApplied bool) (int, error) {
 	if !common.RedisEnabled {
 		return 0, nil
 	}
@@ -63,6 +78,10 @@ func cacheInitToken(token Token) (int, error) {
 	}
 	const script = `
 if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+local quotaFence = redis.call('GET', KEYS[3])
+if quotaFence and quotaFence ~= ARGV[18] then
   return 0
 end
 if redis.call('EXISTS', KEYS[1]) == 1 then
@@ -75,18 +94,30 @@ redis.call('HSET', KEYS[1],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
   'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16])
+if ARGV[18] ~= '' then
+  if ARGV[19] == '1' then
+    redis.call('SET', KEYS[4], 1)
+  else
+    redis.call('DEL', KEYS[4])
+  end
+end
 redis.call('EXPIRE', KEYS[1], ARGV[17])
 return 1`
+	databaseMutationAppliedArg := "0"
+	if databaseMutationApplied {
+		databaseMutationAppliedArg = "1"
+	}
 
 	return common.RDB.Eval(context.Background(), script, []string{
 		getTokenCacheKey(token.Key), getTokenCacheFenceKey(token.Key),
+		getTokenQuotaMutationFenceKey(token.Key), operationKey,
 	},
 		token.Id, token.UserId, token.Status, token.Name,
 		token.CreatedTime, token.AccessedTime, token.ExpiredTime,
 		strconv.FormatBool(token.UnlimitedQuota), strconv.FormatBool(token.ModelLimitsEnabled),
 		token.ModelLimits, allowIps, token.Group, strconv.FormatBool(token.CrossGroupRetry),
-		token.AutoGroups, token.RemainQuota, token.UsedQuota,
-		tokenCacheTTLSeconds(),
+		token.AutoGroups, token.RemainQuota, token.UsedQuota, tokenCacheTTLSeconds(),
+		quotaFenceOwner, databaseMutationAppliedArg,
 	).Int()
 }
 

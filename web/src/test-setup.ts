@@ -22,6 +22,39 @@ import i18next from 'i18next'
 import { initReactI18next } from 'react-i18next'
 import { afterEach, beforeAll } from 'vitest'
 
+class LocalStorageMock implements Storage {
+  private readonly entries = new Map<string, string>()
+
+  get length(): number {
+    return this.entries.size
+  }
+
+  clear(): void {
+    this.entries.clear()
+  }
+
+  getItem(key: string): string | null {
+    return this.entries.get(key) ?? null
+  }
+
+  key(index: number): string | null {
+    return [...this.entries.keys()][index] ?? null
+  }
+
+  removeItem(key: string): void {
+    this.entries.delete(key)
+  }
+
+  setItem(key: string, value: string): void {
+    this.entries.set(key, value)
+  }
+}
+
+Object.defineProperty(globalThis, 'localStorage', {
+  configurable: true,
+  value: new LocalStorageMock(),
+})
+
 beforeAll(async () => {
   await i18next.use(initReactI18next).init({
     lng: 'en',

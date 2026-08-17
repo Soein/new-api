@@ -9,6 +9,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+var errUserQuotaCreditLimitExceeded = errors.New("user quota credit limit exceeded")
+
 // UserQuotaDebt stores already-incurred usage that exceeds the configured
 // users.quota floor. Keeping it separate prevents an unbounded negative
 // balance without forgiving the upstream cost.
@@ -49,6 +51,12 @@ func creditUserQuota(userID int, amount int) (int, error) {
 // Callers should update the Redis user cache with the returned quota delta only
 // after their surrounding transaction commits.
 func CreditUserQuotaWithTx(tx *gorm.DB, userID int, amount int) (int, error) {
+	return creditUserQuotaWithLimitTx(tx, userID, amount, 0)
+}
+
+// creditUserQuotaWithLimitTx applies the same debt-first credit semantics while
+// atomically enforcing an optional upper bound for the spendable balance.
+func creditUserQuotaWithLimitTx(tx *gorm.DB, userID int, amount int, maxQuota int) (int, error) {
 	if tx == nil {
 		return 0, errors.New("quota credit transaction is nil")
 	}
@@ -94,10 +102,24 @@ func CreditUserQuotaWithTx(tx *gorm.DB, userID int, amount int) (int, error) {
 	if quotaDelta == 0 {
 		return 0, nil
 	}
-	if err := tx.Model(&User{}).
-		Where("id = ?", userID).
-		Update("quota", gorm.Expr("quota + ?", quotaDelta)).Error; err != nil {
-		return 0, err
+
+	query := tx.Model(&User{}).Where("id = ?", userID)
+	if maxQuota > 0 {
+		maxCurrentQuota := maxQuota - quotaDelta
+		if user.Quota > maxCurrentQuota {
+			return 0, errUserQuotaCreditLimitExceeded
+		}
+		query = query.Where("quota <= ?", maxCurrentQuota)
+	}
+	result := query.Update("quota", gorm.Expr("quota + ?", quotaDelta))
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	if result.RowsAffected != 1 {
+		if maxQuota > 0 {
+			return 0, errUserQuotaCreditLimitExceeded
+		}
+		return 0, gorm.ErrRecordNotFound
 	}
 	return quotaDelta, nil
 }

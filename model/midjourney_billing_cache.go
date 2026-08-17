@@ -73,6 +73,11 @@ if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[1])
   return -1
 end
 local delta = tonumber(ARGV[3])
+local remain = tonumber(redis.call('HGET', KEYS[1], 'RemainQuota'))
+local unlimited = redis.call('HGET', KEYS[1], 'UnlimitedQuota')
+if delta < 0 and unlimited ~= 'true' and unlimited ~= '1' and remain + delta < 0 then
+  return 0
+end
 redis.call('HINCRBY', KEYS[1], 'RemainQuota', delta)
 redis.call('HINCRBY', KEYS[1], 'UsedQuota', -delta)
 redis.call('HSET', KEYS[1], 'AccessedTime', ARGV[4])
@@ -236,6 +241,9 @@ func (mutation midjourneyBillingCacheMutation) apply(userDelta int, tokenDelta i
 		},
 		mutation.tokenId, mutation.owner, tokenDelta, common.GetTimestamp(),
 	).Int()
+	if err == nil && tokenResult == 0 {
+		return errors.Join(ErrTokenQuotaInsufficient, mutation.compensateUser(userDelta))
+	}
 	if err != nil || (tokenResult != 1 && tokenResult != 2) {
 		compensateErr := mutation.compensateUser(userDelta)
 		if err == nil {

@@ -101,9 +101,9 @@ func (midjourney *Midjourney) SettleBilling(tokenKey string) (result MidjourneyB
 		}
 
 		if cacheErr := mutation.apply(-stored.Quota, -stored.Quota, true); cacheErr != nil {
-			if errors.Is(cacheErr, ErrUserQuotaInsufficient) {
+			if errors.Is(cacheErr, ErrUserQuotaInsufficient) || errors.Is(cacheErr, ErrTokenQuotaInsufficient) {
 				rollbackErr := rollbackMidjourneyChargePreparation(&stored, mutation)
-				return errors.Join(cacheErr, rollbackErr)
+				return errors.Join(ErrMidjourneyBillingRetryable, cacheErr, rollbackErr)
 			}
 			return cacheErr
 		}
@@ -119,7 +119,7 @@ func (midjourney *Midjourney) SettleBilling(tokenKey string) (result MidjourneyB
 				if rollbackErr != nil {
 					return fmt.Errorf("%w: settle Midjourney charge: %v", ErrMidjourneyBillingRetryable, errors.Join(settleErr, rollbackErr))
 				}
-				return settleErr
+				return errors.Join(ErrMidjourneyBillingRetryable, settleErr)
 			}
 		}
 		if stored.BillingStatus == MidjourneyBillingStatusCharged {
@@ -199,12 +199,30 @@ func settleMidjourneyBillingInDB(task *Midjourney) error {
 			}
 		}
 		if task.TokenId > 0 && task.Quota > 0 {
-			if err := tx.Model(&Token{}).Where("id = ?", task.TokenId).Updates(map[string]interface{}{
-				"remain_quota":  gorm.Expr("remain_quota - ?", task.Quota),
-				"used_quota":    gorm.Expr("used_quota + ?", task.Quota),
-				"accessed_time": common.GetTimestamp(),
-			}).Error; err != nil {
-				return err
+			var token Token
+			tokenErr := lockForUpdate(tx).
+				Select("id", "unlimited_quota").
+				Where("id = ?", task.TokenId).
+				First(&token).Error
+			if tokenErr != nil && !errors.Is(tokenErr, gorm.ErrRecordNotFound) {
+				return tokenErr
+			}
+			if tokenErr == nil {
+				tokenUpdate := tx.Model(&Token{}).Where("id = ?", task.TokenId)
+				if !token.UnlimitedQuota {
+					tokenUpdate = tokenUpdate.Where("remain_quota >= ?", task.Quota)
+				}
+				updated := tokenUpdate.Updates(map[string]interface{}{
+					"remain_quota":  gorm.Expr("remain_quota - ?", task.Quota),
+					"used_quota":    gorm.Expr("used_quota + ?", task.Quota),
+					"accessed_time": common.GetTimestamp(),
+				})
+				if updated.Error != nil {
+					return updated.Error
+				}
+				if updated.RowsAffected == 0 {
+					return ErrTokenQuotaInsufficient
+				}
 			}
 		}
 		if err := tx.Model(&User{}).Where("id = ?", task.UserId).Updates(map[string]interface{}{

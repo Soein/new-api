@@ -1,6 +1,7 @@
 package model
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -59,6 +60,117 @@ func TestMidjourneySettlementHonorsDurableBalanceInBatchMode(t *testing.T) {
 	assert.Equal(t, MidjourneyBillingStatusPrepared, persisted.BillingStatus)
 	assert.Equal(t, 2000, mustGetCachedUserQuota(t, user.Id))
 	assert.Equal(t, 2000, mustGetCachedTokenQuota(t, token.Key))
+}
+
+func TestMidjourneySettlementRejectsInsufficientCachedTokenQuota(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 10000)
+	token := Token{
+		UserId:      user.Id,
+		Key:         "midjourney-token-insufficient-" + common.GetRandomString(8),
+		Name:        "midjourney-token-insufficient",
+		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
+		RemainQuota: 2000,
+	}
+	require.NoError(t, token.Insert(user.SessionGeneration))
+	channel := Channel{Id: 6108, Name: "midjourney-token-insufficient", Key: "sk-test", Status: common.ChannelStatusEnabled}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, populateUserCache(user))
+	_, err := cacheInitToken(token)
+	require.NoError(t, err)
+	task := Midjourney{
+		UserId:           user.Id,
+		MjId:             "mj-token-insufficient",
+		ChannelId:        channel.Id,
+		Quota:            3000,
+		TokenId:          token.Id,
+		BillingChannelId: channel.Id,
+		BillingStatus:    MidjourneyBillingStatusPrepared,
+	}
+	require.NoError(t, task.Insert())
+
+	settled, err := task.SettleBilling(token.Key)
+
+	assert.False(t, settled.Applied)
+	assert.ErrorIs(t, err, ErrTokenQuotaInsufficient)
+	assert.ErrorIs(t, err, ErrMidjourneyBillingRetryable)
+	assert.Equal(t, 10000, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 2000, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Equal(t, 10000, mustGetCachedUserQuota(t, user.Id))
+	assert.Equal(t, 2000, mustGetCachedTokenQuota(t, token.Key))
+	persisted := Midjourney{}
+	require.NoError(t, DB.First(&persisted, task.Id).Error)
+	assert.Equal(t, MidjourneyBillingStatusPrepared, persisted.BillingStatus)
+}
+
+func TestMidjourneyConcurrentSettlementAllowsOnlyOneCachedReservation(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 5000)
+	token := Token{
+		UserId:      user.Id,
+		Key:         "midjourney-concurrent-cache-" + common.GetRandomString(8),
+		Name:        "midjourney-concurrent-cache",
+		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
+		RemainQuota: 10000,
+	}
+	require.NoError(t, token.Insert(user.SessionGeneration))
+	channel := Channel{Id: 6109, Name: "midjourney-concurrent-cache", Key: "sk-test", Status: common.ChannelStatusEnabled}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, populateUserCache(user))
+	_, err := cacheInitToken(token)
+	require.NoError(t, err)
+	tasks := []*Midjourney{
+		{UserId: user.Id, MjId: "mj-concurrent-cache-1", ChannelId: channel.Id, Quota: 3000, TokenId: token.Id, BillingChannelId: channel.Id, BillingStatus: MidjourneyBillingStatusPrepared},
+		{UserId: user.Id, MjId: "mj-concurrent-cache-2", ChannelId: channel.Id, Quota: 3000, TokenId: token.Id, BillingChannelId: channel.Id, BillingStatus: MidjourneyBillingStatusPrepared},
+	}
+	for _, task := range tasks {
+		require.NoError(t, task.Insert())
+	}
+
+	start := make(chan struct{})
+	type settlementResult struct {
+		applied bool
+		err     error
+	}
+	results := make(chan settlementResult, len(tasks))
+	var workers sync.WaitGroup
+	workers.Add(len(tasks))
+	for _, task := range tasks {
+		go func(task *Midjourney) {
+			defer workers.Done()
+			<-start
+			result, settleErr := task.SettleBilling(token.Key)
+			results <- settlementResult{applied: result.Applied, err: settleErr}
+		}(task)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	var successes int
+	for result := range results {
+		if result.err == nil {
+			assert.True(t, result.applied)
+			successes++
+			continue
+		}
+		assert.False(t, result.applied)
+		assert.ErrorIs(t, result.err, ErrUserQuotaInsufficient)
+		assert.ErrorIs(t, result.err, ErrMidjourneyBillingRetryable)
+	}
+	assert.Equal(t, 1, successes)
+	assert.Equal(t, 2000, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 7000, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Equal(t, 2000, mustGetCachedUserQuota(t, user.Id))
+	assert.Equal(t, 7000, mustGetCachedTokenQuota(t, token.Key))
 }
 
 func TestMidjourneySettlementUsesDurableBalanceAfterCacheLoss(t *testing.T) {

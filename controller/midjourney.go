@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
@@ -26,6 +27,8 @@ type midjourneyPollSummary struct {
 	ChannelsScanned int `json:"channels_scanned"`
 	NullTasksFailed int `json:"null_tasks_failed"`
 }
+
+const midjourneySubmissionGrace = 2 * time.Minute
 
 // runMidjourneyTaskUpdateOnce performs one Midjourney polling pass synchronously.
 // It honors ctx cancellation (the system-task runner cancels it when the lease
@@ -50,6 +53,26 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 	nullTasks := make([]*model.Midjourney, 0)
 	for _, task := range tasks {
 		if task.MjId == "" {
+			submissionAge := time.Duration(time.Now().UnixMilli()-task.SubmitTime) * time.Millisecond
+			switch task.Status {
+			case constant.MjStatusReserving:
+				if submissionAge < midjourneySubmissionGrace {
+					continue
+				}
+			case constant.MjStatusSubmitting:
+				if submissionAge < midjourneySubmissionGrace {
+					continue
+				}
+				task.Status = constant.MjStatusSubmitUnknown
+				task.Progress = "100%"
+				task.FailReason = "Midjourney submission outcome is unknown"
+				if err := task.Update(); err != nil {
+					logger.LogError(ctx, fmt.Sprintf("Mark unknown Midjourney submission error: %v", err))
+				}
+				continue
+			case constant.MjStatusSubmitUnknown:
+				continue
+			}
 			nullTaskIds = append(nullTaskIds, task.Id)
 			task.Status = "FAILURE"
 			task.Progress = "100%"

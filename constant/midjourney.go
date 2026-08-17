@@ -6,6 +6,12 @@ const (
 )
 
 const (
+	MjStatusReserving     = "RESERVING"
+	MjStatusSubmitting    = "SUBMITTING"
+	MjStatusSubmitUnknown = "SUBMIT_UNKNOWN"
+)
+
+const (
 	MjActionImagine       = "IMAGINE"
 	MjActionDescribe      = "DESCRIBE"
 	MjActionBlend         = "BLEND"

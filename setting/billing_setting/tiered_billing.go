@@ -2,10 +2,14 @@ package billing_setting
 
 import (
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/samber/lo"
@@ -16,6 +20,7 @@ const (
 	BillingModeTieredExpr = "tiered_expr"
 	BillingModeField      = "billing_mode"
 	BillingExprField      = "billing_expr"
+	maxTaskExprSmokeTests = 64
 )
 
 // BillingSetting is managed by config.GlobalConfig.Register.
@@ -85,11 +90,24 @@ func ValidateBillingExprJSON(jsonStr string) error {
 	if err := common.UnmarshalJsonStr(jsonStr, &expressions); err != nil {
 		return fmt.Errorf("invalid billing expression map: %w", err)
 	}
-	for modelName, exprStr := range expressions {
+	models := make([]string, 0, len(expressions))
+	for modelName := range expressions {
+		models = append(models, modelName)
+	}
+	sort.Strings(models)
+	generation := jsplugin.DefaultRegistry.Generation()
+	for _, modelName := range models {
+		exprStr := expressions[modelName]
 		if strings.TrimSpace(exprStr) == "" {
 			return fmt.Errorf("model %s has an empty billing expression", modelName)
 		}
-		if err := smokeTestExpr(exprStr); err != nil {
+		var err error
+		if plugin, ok := generation.GetByModel(modelName); ok {
+			err = SmokeTestTaskExpr(exprStr, plugin.Meta.UsageSchema)
+		} else {
+			err = smokeTestExpr(exprStr)
+		}
+		if err != nil {
 			return fmt.Errorf("model %s billing expression is invalid: %w", modelName, err)
 		}
 	}
@@ -97,6 +115,19 @@ func ValidateBillingExprJSON(jsonStr string) error {
 }
 
 func smokeTestExpr(exprStr string) error {
+	if _, err := billingexpr.CompileFromCache(exprStr); err != nil {
+		return err
+	}
+	usageKeys := billingexpr.UsedUsageKeys(exprStr)
+	if len(usageKeys) > 0 {
+		sortedKeys := make([]string, 0, len(usageKeys))
+		for key := range usageKeys {
+			sortedKeys = append(sortedKeys, key)
+		}
+		sort.Strings(sortedKeys)
+		return fmt.Errorf("expression references usage keys %v but the model has no task plugin usage schema", sortedKeys)
+	}
+
 	vectors := []billingexpr.TokenParams{
 		{P: 0, C: 0, Len: 0, ImageCount: 1},
 		{P: 1000, C: 1000, Len: 1000, ImageCount: 1},
@@ -104,7 +135,151 @@ func smokeTestExpr(exprStr string) error {
 		{P: 1000000, C: 1000000, Len: 1000000, ImageCount: 1},
 		{P: 1000, C: 1000, Len: 1000, ImageCount: dto.MaxImageN},
 	}
-	requests := []billingexpr.RequestInput{
+
+	for _, v := range vectors {
+		for _, request := range billingExprSmokeRequests() {
+			result, _, err := billingexpr.RunExprWithRequest(exprStr, v, request)
+			if err != nil {
+				return fmt.Errorf("vector {p=%g, c=%g}: run failed: %w", v.P, v.C, err)
+			}
+			if math.IsNaN(result) || math.IsInf(result, 0) || result < 0 {
+				return fmt.Errorf("vector {p=%g, c=%g}: result must be finite and non-negative, got %f", v.P, v.C, result)
+			}
+		}
+	}
+	return nil
+}
+
+// SmokeTestTaskExpr validates a task usage expression against the usage facts
+// declared by its plugin. Literal u() keys must be declared; dynamic calls are
+// still exercised by the generated runtime vectors when possible.
+func SmokeTestTaskExpr(exprStr string, schema map[string]jsplugin.UsageFieldSchema) error {
+	if _, err := billingexpr.CompileFromCache(exprStr); err != nil {
+		return err
+	}
+	for key := range billingexpr.UsedUsageKeys(exprStr) {
+		if _, declared := schema[key]; !declared {
+			return fmt.Errorf("usage key %q is not declared by the task plugin", key)
+		}
+	}
+
+	for _, usage := range taskUsageSmokeVectors(schema) {
+		for _, request := range billingExprSmokeRequests() {
+			request.Usage = usage
+			result, _, err := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, request)
+			if err != nil {
+				if strings.Contains(err.Error(), "expr result must be a finite non-negative number") {
+					return fmt.Errorf("usage vector %v: result must be finite and non-negative: %w", usage, err)
+				}
+				return fmt.Errorf("usage vector %v: run failed: %w", usage, err)
+			}
+			if math.IsNaN(result) || math.IsInf(result, 0) || result < 0 {
+				return fmt.Errorf("usage vector %v: result must be finite and non-negative, got %f", usage, result)
+			}
+		}
+	}
+	return nil
+}
+
+type usageSmokeDimension struct {
+	name   string
+	values []any
+}
+
+func taskUsageSmokeVectors(schema map[string]jsplugin.UsageFieldSchema) []map[string]any {
+	names := make([]string, 0, len(schema))
+	for name := range schema {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	dimensions := make([]usageSmokeDimension, 0, len(names))
+	for _, name := range names {
+		field := schema[name]
+		if len(field.Enum) > 0 {
+			values := make([]any, len(field.Enum))
+			for index, value := range field.Enum {
+				values[index] = value
+			}
+			dimensions = append(dimensions, usageSmokeDimension{name: name, values: values})
+			continue
+		}
+		if field.Type == "boolean" {
+			dimensions = append(dimensions, usageSmokeDimension{name: name, values: []any{false, true}})
+			continue
+		}
+		limit := relaycommon.MaxTaskDurationSeconds
+		if field.Unit == "count" {
+			limit = dto.MaxImageN
+		}
+		if field.Unit == "token" || field.Unit == "credit" {
+			limit = common.MaxQuota
+		}
+		dimensions = append(dimensions, usageSmokeDimension{
+			name:   name,
+			values: []any{float64(0), float64(1), float64(limit)},
+		})
+	}
+
+	if usageSmokeCombinationCount(dimensions, maxTaskExprSmokeTests) > maxTaskExprSmokeTests {
+		for index := range dimensions {
+			field := schema[dimensions[index].name]
+			if len(field.Enum) <= 2 {
+				continue
+			}
+			dimensions[index].values = []any{field.Enum[0], field.Enum[len(field.Enum)-1]}
+		}
+	}
+
+	vectors := make([]map[string]any, 0, maxTaskExprSmokeTests)
+	var appendVectors func(int, map[string]any)
+	appendVectors = func(index int, current map[string]any) {
+		if len(vectors) >= maxTaskExprSmokeTests {
+			return
+		}
+		if index == len(dimensions) {
+			vector := make(map[string]any, len(current))
+			for key, value := range current {
+				vector[key] = value
+			}
+			vectors = append(vectors, vector)
+			return
+		}
+		for _, value := range dimensions[index].values {
+			current[dimensions[index].name] = value
+			appendVectors(index+1, current)
+		}
+		delete(current, dimensions[index].name)
+	}
+	appendVectors(0, make(map[string]any, len(dimensions)))
+
+	combinationCount := usageSmokeCombinationCount(dimensions, maxTaskExprSmokeTests)
+	if combinationCount > maxTaskExprSmokeTests && len(vectors) > 0 {
+		last := make(map[string]any, len(dimensions))
+		for _, dimension := range dimensions {
+			last[dimension.name] = dimension.values[len(dimension.values)-1]
+		}
+		vectors[len(vectors)-1] = last
+	}
+	return vectors
+}
+
+func usageSmokeCombinationCount(dimensions []usageSmokeDimension, stopAfter int) int {
+	count := 1
+	for _, dimension := range dimensions {
+		if len(dimension.values) == 0 {
+			return 0
+		}
+		if count > stopAfter/len(dimension.values) {
+			return stopAfter + 1
+		}
+		count *= len(dimension.values)
+	}
+	return count
+}
+
+func billingExprSmokeRequests() []billingexpr.RequestInput {
+	return []billingexpr.RequestInput{
 		{},
 		{
 			Headers: map[string]string{
@@ -116,17 +291,4 @@ func smokeTestExpr(exprStr string) error {
 			StructuredBody: []byte(`{"size":"1024x1536","quality":"high","background":"transparent","output_format":"webp","n":128}`),
 		},
 	}
-
-	for _, v := range vectors {
-		for _, request := range requests {
-			result, _, err := billingexpr.RunExprWithRequest(exprStr, v, request)
-			if err != nil {
-				return fmt.Errorf("vector {p=%g, c=%g}: run failed: %w", v.P, v.C, err)
-			}
-			if result < 0 {
-				return fmt.Errorf("vector {p=%g, c=%g}: result %f < 0", v.P, v.C, result)
-			}
-		}
-	}
-	return nil
 }

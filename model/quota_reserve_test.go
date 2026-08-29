@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -211,6 +212,43 @@ func TestReserveFailsClosedDuringBillingCacheMutation(t *testing.T) {
 	assert.ErrorIs(t, err, ErrQuotaCacheMutationPending)
 	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 	assert.Equal(t, 100, mustGetCachedTokenQuota(t, token.Key))
+}
+
+func TestBatchUpdateAccumulatesTwoMaximumUsedQuotaDeltas(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	UpdateUserUsedQuota(user.Id, common.MaxQuota)
+	UpdateUserUsedQuota(user.Id, common.MaxQuota)
+
+	var usedQuota int
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Select("used_quota").Scan(&usedQuota).Error)
+	assert.Zero(t, usedQuota, "batch deltas must remain pending before flush")
+
+	batchUpdate()
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Select("used_quota").Scan(&usedQuota).Error)
+	assert.Equal(t, common.MaxQuota*2, usedQuota)
+}
+
+func TestBatchUpdateAccumulatorSaturatesOverflow(t *testing.T) {
+	resetBatchUpdateTestState(t)
+
+	addNewRecord(BatchUpdateTypeUserQuota, 1, math.MaxInt)
+	addNewRecord(BatchUpdateTypeUserQuota, 1, 1)
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Lock()
+	assert.Equal(t, math.MaxInt, batchUpdateStores[BatchUpdateTypeUserQuota][1])
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
+
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Lock()
+	batchUpdateStores[BatchUpdateTypeUserQuota] = make(map[int]int)
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
+	addNewRecord(BatchUpdateTypeUserQuota, 1, math.MinInt)
+	addNewRecord(BatchUpdateTypeUserQuota, 1, -1)
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Lock()
+	assert.Equal(t, math.MinInt, batchUpdateStores[BatchUpdateTypeUserQuota][1])
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
 }
 
 func TestReserveFallsBackToDatabaseWhenRedisIsUnavailable(t *testing.T) {

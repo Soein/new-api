@@ -797,7 +797,7 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 		Update("aff_quota", gorm.Expr("aff_quota - ?", quota)).Error; err != nil {
 		return err
 	}
-	_, err = CreditUserQuotaWithTx(tx, user.Id, quota)
+	_, err = creditUserQuotaWithLimitTx(tx, user.Id, quota, common.MaxWalletQuota)
 	if err != nil {
 		return err
 	}
@@ -1502,8 +1502,19 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if err := common.ValidateWalletQuota(quota); err != nil {
+		return err
+	}
 	return withUserQuotaMutation(id, func() error {
-		quotaDelta, err := creditUserQuota(id, quota)
+		var quotaDelta int
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var creditErr error
+			quotaDelta, creditErr = creditUserQuotaWithLimitTx(tx, id, quota, common.MaxWalletQuota)
+			if errors.Is(creditErr, errUserQuotaCreditLimitExceeded) {
+				return ErrWalletQuotaLimitExceeded
+			}
+			return creditErr
+		})
 		if err != nil {
 			return err
 		}

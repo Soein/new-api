@@ -155,3 +155,25 @@ func TestSetUserQuotaClearsDebtForExplicitAdminOverride(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, debt)
 }
+
+func TestTransferAffQuotaRejectsWalletOverflowAtomically(t *testing.T) {
+	truncateTables(t)
+
+	transferQuota := common.QuotaFromFloat(common.QuotaPerUnit)
+	user := &User{
+		Id:       1006,
+		Username: "affiliate-wallet-limit-user",
+		Quota:    common.MaxWalletQuota,
+		AffQuota: transferQuota,
+		Status:   common.UserStatusEnabled,
+	}
+	require.NoError(t, DB.Create(user).Error)
+
+	err := user.TransferAffQuotaToQuota(transferQuota)
+
+	require.ErrorIs(t, err, errUserQuotaCreditLimitExceeded)
+	var reloaded User
+	require.NoError(t, DB.Select("quota", "aff_quota").First(&reloaded, user.Id).Error)
+	require.Equal(t, common.MaxWalletQuota, reloaded.Quota)
+	require.Equal(t, transferQuota, reloaded.AffQuota)
+}

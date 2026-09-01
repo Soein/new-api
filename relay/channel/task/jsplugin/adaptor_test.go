@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -22,10 +23,125 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func disableSSRFProtectionForRedirectTest(t *testing.T) {
+	t.Helper()
+	setting := system_setting.GetFetchSetting()
+	original := *setting
+	setting.EnableSSRFProtection = false
+	t.Cleanup(func() { *setting = original })
+}
+
+func newRedirectTestAdaptor(t *testing.T) *TaskAdaptor {
+	t.Helper()
+	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	return New(plugin)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestTaskAdaptorRevalidatesSSRFOnRedirect(t *testing.T) {
+	setting := system_setting.GetFetchSetting()
+	original := *setting
+	setting.EnableSSRFProtection = true
+	setting.AllowPrivateIp = false
+	setting.DomainFilterMode = false
+	setting.IpFilterMode = false
+	setting.DomainList = nil
+	setting.IpList = nil
+	setting.AllowedPorts = []string{"80"}
+	setting.ApplyIPFilterForDomain = true
+	t.Cleanup(func() { *setting = original })
+
+	adaptor := newRedirectTestAdaptor(t)
+	transportCalls := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		transportCalls++
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"/next"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/start", nil)
+	require.NoError(t, err)
+
+	resp, err := adaptor.doCredentialedPluginRequest(client, req, "http://127.0.0.1")
+	require.Error(t, err)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	assert.ErrorContains(t, err, "blocked")
+	assert.Equal(t, 1, transportCalls, "blocked redirect must not reach the transport")
+}
+
+func TestTaskAdaptorFollowsSameOriginRedirect(t *testing.T) {
+	disableSSRFProtectionForRedirectTest(t)
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/upstream-1":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			assert.Equal(t, "query", r.Header.Get("X-Plugin"))
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	adaptor := newRedirectTestAdaptor(t)
+	resp, err := adaptor.FetchTask(server.URL, "secret", map[string]any{"task_id": "upstream-1", "action": "query"}, "")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "/final", resp.Request.URL.Path)
+}
+
+func TestTaskAdaptorBlocksCredentialedCrossOriginRedirect(t *testing.T) {
+	disableSSRFProtectionForRedirectTest(t)
+	service.InitHttpClient()
+
+	targetReached := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetReached <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/credential-target", http.StatusFound)
+	}))
+	defer origin.Close()
+
+	adaptor := newRedirectTestAdaptor(t)
+	targetURL, err := url.Parse(target.URL)
+	require.NoError(t, err)
+	// Even an administrator-approved host must not receive credentials through
+	// an HTTP redirect; allowedHosts is for direct plugin requests only.
+	adaptor.plugin.Meta.AllowedHosts = []string{targetURL.Host}
+
+	resp, err := adaptor.FetchTask(origin.URL, "secret", map[string]any{"task_id": "upstream-1", "action": "query"}, "")
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.ErrorContains(t, err, "cross-origin")
+	select {
+	case <-targetReached:
+		t.Fatal("cross-origin redirect reached the credential target")
+	default:
+	}
+}
 
 const mockPlugin = `
 export const meta = {

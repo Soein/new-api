@@ -158,6 +158,27 @@ func TestCompileIgnoresSourceMapDirectives(t *testing.T) {
 	assert.Equal(t, int64(1), value)
 }
 
+func TestEngineDynamicCodeIgnoresSourceMapDirectives(t *testing.T) {
+	t.Parallel()
+	engine, err := Compile(`
+export function evalCode() {
+  return eval("41 + 1\n//# sourceMappingURL=/nonexistent/eval-leak-probe.map");
+}
+export function functionCode() {
+  return Function("return 42;\n//# sourceMappingURL=/nonexistent/function-leak-probe.map")();
+}
+`, Options{Key: "dynamic-sourcemap"})
+	require.NoError(t, err)
+
+	for _, hook := range []string{"evalCode", "functionCode"} {
+		t.Run(hook, func(t *testing.T) {
+			value, callErr := engine.Call(context.Background(), hook)
+			require.NoError(t, callErr)
+			assert.Equal(t, int64(42), value)
+		})
+	}
+}
+
 func TestEngineInterruptsLongRunningHook(t *testing.T) {
 	t.Parallel()
 	engine, err := Compile(`export function run() { while (true) {} }`, Options{
@@ -356,6 +377,7 @@ func TestValidateRequestURL(t *testing.T) {
 		{name: "approved host", requestURL: "https://upload.example.com/task", baseURL: "https://api.example.com", allowedHosts: []string{"upload.example.com"}},
 		{name: "subdomain is not implicit", requestURL: "https://evil.api.example.com/task", baseURL: "https://api.example.com", wantError: "not allowed"},
 		{name: "userinfo trick", requestURL: "https://api.example.com@evil.example/task", baseURL: "https://api.example.com", wantError: "not allowed"},
+		{name: "https downgrade", requestURL: "http://api.example.com/task", baseURL: "https://api.example.com", wantError: "HTTPS to HTTP"},
 		{name: "relative URL", requestURL: "/v1/task", baseURL: "https://api.example.com", wantError: "absolute"},
 	}
 	for _, test := range tests {
@@ -367,6 +389,57 @@ func TestValidateRequestURL(t *testing.T) {
 			}
 			require.Error(t, err)
 			assert.True(t, strings.Contains(err.Error(), test.wantError), err.Error())
+		})
+	}
+}
+
+func TestValidateCredentialedRedirectURL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		requestURL string
+		initialURL string
+		baseURL    string
+		allowed    []string
+		wantError  string
+	}{
+		{
+			name:       "same origin path redirect",
+			requestURL: "https://api.example.com/v2/task",
+			initialURL: "https://api.example.com/v1/task",
+			baseURL:    "https://api.example.com",
+		},
+		{
+			name:       "default HTTPS port is same origin",
+			requestURL: "https://api.example.com:443/v2/task",
+			initialURL: "https://api.example.com/v1/task",
+			baseURL:    "https://api.example.com",
+		},
+		{
+			name:       "approved host is still cross origin",
+			requestURL: "https://upload.example.com/task",
+			initialURL: "https://api.example.com/task",
+			baseURL:    "https://api.example.com",
+			allowed:    []string{"upload.example.com"},
+			wantError:  "cross-origin",
+		},
+		{
+			name:       "HTTPS downgrade",
+			requestURL: "http://api.example.com/task",
+			initialURL: "https://api.example.com/task",
+			baseURL:    "https://api.example.com",
+			wantError:  "HTTPS to HTTP",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateCredentialedRedirectURL(test.requestURL, test.initialURL, test.baseURL, test.allowed)
+			if test.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.ErrorContains(t, err, test.wantError)
 		})
 	}
 }

@@ -38,6 +38,12 @@ func TestFormatUserLogsStripsQuotaSaturation(t *testing.T) {
 func TestTaskPluginLogVisibilityIsRoleSeparated(t *testing.T) {
 	other := common.MapToJsonStr(map[string]interface{}{
 		"model_price": 1.25,
+		"billing_usage_schema": map[string]interface{}{
+			"seconds": map[string]interface{}{
+				"type": "number",
+				"unit": "second",
+			},
+		},
 		"admin_info": map[string]interface{}{
 			"task_plugin": map[string]interface{}{
 				"key":     "document-parser",
@@ -62,6 +68,7 @@ func TestTaskPluginLogVisibilityIsRoleSeparated(t *testing.T) {
 		assert.NotContains(t, parsed, "admin_info")
 		assert.NotContains(t, parsed, "root_info")
 		assert.Equal(t, 1.25, parsed["model_price"])
+		assert.Contains(t, parsed, "billing_usage_schema")
 	})
 
 	t.Run("admin", func(t *testing.T) {
@@ -72,6 +79,7 @@ func TestTaskPluginLogVisibilityIsRoleSeparated(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, parsed, "admin_info")
 		assert.NotContains(t, parsed, "root_info")
+		assert.Contains(t, parsed, "billing_usage_schema")
 	})
 
 	t.Run("root", func(t *testing.T) {
@@ -79,5 +87,6 @@ func TestTaskPluginLogVisibilityIsRoleSeparated(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, parsed, "admin_info")
 		assert.Contains(t, parsed, "root_info")
+		assert.Contains(t, parsed, "billing_usage_schema")
 	})
 }

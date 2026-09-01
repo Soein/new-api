@@ -80,6 +80,8 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 		&model.UserQuotaDebt{},
 		&model.Channel{},
 		&model.Task{},
+		&model.TaskPluginState{},
+		&model.TaskPlugin{},
 		&model.Log{},
 	))
 	model.DB = database
@@ -204,12 +206,26 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	assert.Equal(t, constant.TaskPlatform("kling"), persisted.Platform)
 	assert.Equal(t, "kling-private-1", persisted.PrivateData.UpstreamTaskID)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusNotStart), persisted.Status)
+	require.NotNil(t, persisted.PrivateData.Execution)
+	require.NotNil(t, persisted.PrivateData.Execution.TaskPlugin)
+	assert.Equal(t, submitBinding.Plugin.Meta.Version, persisted.PrivateData.Execution.TaskPlugin.Version)
+	assert.Equal(t, submitBinding.Plugin.Layer, persisted.PrivateData.Execution.TaskPlugin.Layer)
+	assert.Equal(t, submitBinding.Plugin.SourceHash, persisted.PrivateData.Execution.TaskPlugin.SourceHash)
+	require.NotNil(t, persisted.PrivateData.BillingContext)
+	assert.Equal(t, submitBinding.Plugin.Meta.UsageSchema, persisted.PrivateData.BillingContext.UsageSchema)
 
 	previousAdaptorFactory := service.GetTaskAdaptorFunc
+	previousTaskAdaptorFactory := service.GetTaskAdaptorForTaskFunc
 	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
 		return relay.GetTaskAdaptor(platform)
 	}
-	t.Cleanup(func() { service.GetTaskAdaptorFunc = previousAdaptorFactory })
+	service.GetTaskAdaptorForTaskFunc = func(task *model.Task) service.TaskPollingAdaptor {
+		return relay.GetTaskAdaptorForTask(task)
+	}
+	t.Cleanup(func() {
+		service.GetTaskAdaptorFunc = previousAdaptorFactory
+		service.GetTaskAdaptorForTaskFunc = previousTaskAdaptorFactory
+	})
 	service.DispatchPlatformUpdate(
 		context.Background(),
 		persisted.Platform,

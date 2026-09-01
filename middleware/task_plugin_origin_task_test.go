@@ -213,6 +213,26 @@ func TestApplyOriginTaskIntent(t *testing.T) {
 	}
 }
 
+func TestApplyOriginTaskIntentRejectsSnapshotFromPluginThatPreviouslyOwnedNumericPlatform(t *testing.T) {
+	setupOriginTaskDB(t)
+	channel := insertOriginTaskChannel(t, common.ChannelStatusEnabled)
+	task := insertOriginOwnedTask(t, "task-reassigned-platform", 7, channel.Id, constant.TaskPlatform("651"))
+	task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: "former-plugin", Version: "1.0.0", Layer: jsplugin.PluginLayerFactory, SourceHash: "former-source",
+	}}
+	require.NoError(t, model.DB.Save(task).Error)
+	c := originTaskTestContext(7)
+
+	intentErr := applyOriginTaskIntent(c, map[string]any{
+		"originTaskIds": []any{"task-reassigned-platform"},
+	}, jsplugin.Meta{Key: "current-plugin", ChannelTypes: []int{651}})
+
+	require.NotNil(t, intentErr)
+	assert.Equal(t, "origin_task_platform_mismatch", intentErr.Code)
+	_, found, _ := service.GetChannelConstraints(c).ResolvedPin()
+	assert.False(t, found)
+}
+
 func TestApplyOriginTaskIntentAbsentAndEmptyAreNoop(t *testing.T) {
 	setupOriginTaskDB(t)
 	c := originTaskTestContext(7)
@@ -321,7 +341,7 @@ func TestPrepareTaskPluginEndpointPinsOriginTaskChannel(t *testing.T) {
 	channel := insertOriginTaskChannel(t, common.ChannelStatusEnabled)
 	insertOriginOwnedTask(t, "task-endpoint", 7, channel.Id, "origin-endpoint")
 	const key = "origin-endpoint"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,
@@ -354,7 +374,7 @@ func TestPrepareTaskPluginEndpointPinsOriginTaskChannel(t *testing.T) {
 func TestPrepareTaskPluginEndpointRejectsUnknownOriginTask(t *testing.T) {
 	setupOriginTaskDB(t)
 	const key = "origin-endpoint-missing"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,

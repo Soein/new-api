@@ -510,9 +510,11 @@ export function DetailsDialog(props: DetailsDialogProps) {
     other?.billing_mode === 'tiered_expr' &&
     !!other?.expr_b64
   const pricingData = usePricingData(props.open && isTieredBilling)
-  const billingUsageSchema = pricingData.models.find(
-    (model) => model.model_name === props.log.model_name
-  )?.billing_usage_schema
+  const billingUsageSchema =
+    other?.billing_usage_schema ??
+    pricingData.models.find(
+      (model) => model.model_name === props.log.model_name
+    )?.billing_usage_schema
   const hasAudioTokens = other?.ws || other?.audio
   const showTiming = isTimingLogType(props.log.type)
   const showAdminIp =

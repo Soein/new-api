@@ -41,7 +41,7 @@ type pluginProtocolBridgeDeps struct {
 	heartbeatInterval  time.Duration
 	admissionTimeout   time.Duration
 	getByTaskId        func(int, string) (*model.Task, bool, error)
-	resolvePlugin      func(constant.TaskPlatform) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool)
+	resolvePlugin      func(*model.Task) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool)
 }
 
 func defaultPluginProtocolBridgeDeps() pluginProtocolBridgeDeps {
@@ -131,10 +131,8 @@ func (d pluginProtocolBridgeDeps) withDefaults() pluginProtocolBridgeDeps {
 	return d
 }
 
-func resolveTaskPluginForProtocolRetrieve(platform constant.TaskPlatform) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool) {
-	generation := pluginruntime.DefaultRegistry.Generation()
-	plugin, ok := relay.ResolveTaskPluginForPlatform(generation, platform)
-	return plugin, generation, ok
+func resolveTaskPluginForProtocolRetrieve(task *model.Task) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool) {
+	return relay.ResolveTaskPluginForTask(task)
 }
 
 func serveTaskPluginProtocol(
@@ -171,13 +169,13 @@ func serveTaskPluginProtocol(
 		respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")
 		return
 	}
-	if definition, known := pluginruntime.HostProtocol(pinned.Protocol); known && len(definition.DefinedModes()) > 0 && pinned.Plugin != nil {
-		background := false
-		if body, ok := protocolRequest.Body.(map[string]any); ok && body["kind"] == string(pluginruntime.BodyJSON) {
-			if requestBody, ok := body["value"].(map[string]any); ok {
-				background, _ = requestBody["background"].(bool)
-			}
+	background := false
+	if body, ok := protocolRequest.Body.(map[string]any); ok && body["kind"] == string(pluginruntime.BodyJSON) {
+		if requestBody, ok := body["value"].(map[string]any); ok {
+			background, _ = requestBody["background"].(bool)
 		}
+	}
+	if definition, known := pluginruntime.HostProtocol(pinned.Protocol); known && len(definition.DefinedModes()) > 0 && pinned.Plugin != nil {
 		missing := false
 		if protocolRequest.Stream && !pinned.Plugin.Meta.ProtocolSupports(pinned.Protocol, "stream") {
 			missing = true
@@ -248,6 +246,7 @@ func serveTaskPluginProtocol(
 		relayInfo.RelayMode = relayconstant.RelayModeVideoSubmit
 		relayInfo.IsStream = false
 		relayInfo.OriginModelName = c.GetString("resolved_task_model")
+		relayInfo.ResponsesBackground = background
 		if action := c.GetString("task_action"); action != "" {
 			relayInfo.Action = action
 		}
@@ -332,19 +331,7 @@ func serveTaskPluginProtocol(
 		createdAt,
 		deps.protocolLimits,
 	)
-	background := false
-	if body, ok := protocolRequest.Body.(map[string]any); ok && body["kind"] == string(pluginruntime.BodyJSON) {
-		if requestBody, ok := body["value"].(map[string]any); ok {
-			background, _ = requestBody["background"].(bool)
-		}
-	}
 	if background {
-		outcome.Task.PrivateData.ResponsesBackground = true
-		if outcome.Task.ID != 0 {
-			if err := model.DB.Model(outcome.Task).Update("private_data", outcome.Task.PrivateData).Error; err != nil {
-				logger.LogError(c, "persist task background flag failed: "+err.Error())
-			}
-		}
 		machine.SetBackground(true)
 		if !protocolRequest.Stream {
 			logger.LogDebug(
@@ -949,7 +936,7 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 		return
 	}
 
-	plugin, generation, ok := deps.resolvePlugin(task.Platform)
+	plugin, generation, ok := deps.resolvePlugin(task)
 	if !ok || plugin == nil {
 		writeTaskPluginResponseNotFound(c, responseID, "no_plugin")
 		return

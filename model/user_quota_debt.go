@@ -48,10 +48,11 @@ func creditUserQuota(userID int, amount int) (int, error) {
 
 // CreditUserQuotaWithTx is the transaction-aware form used by payment,
 // redemption, and check-in flows that already own a database transaction.
+// Spendable quota is atomically capped at common.MaxWalletQuota.
 // Callers should update the Redis user cache with the returned quota delta only
 // after their surrounding transaction commits.
 func CreditUserQuotaWithTx(tx *gorm.DB, userID int, amount int) (int, error) {
-	return creditUserQuotaWithLimitTx(tx, userID, amount, 0)
+	return creditUserQuotaWithLimitTx(tx, userID, amount, common.MaxWalletQuota)
 }
 
 // creditUserQuotaWithLimitTx applies the same debt-first credit semantics while

@@ -466,7 +466,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 
 	// OpenAI Video API 格式: 走各 adaptor 的 ConvertToOpenAIVideo
 	if isOpenAIVideoAPI {
-		adaptor := GetTaskAdaptor(originTask.Platform)
+		adaptor := GetTaskAdaptorForTask(originTask)
 		if adaptor == nil {
 			taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("invalid channel id: %d", originTask.ChannelId), "invalid_channel_id", http.StatusBadRequest)
 			return
@@ -512,7 +512,7 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		baseURL = channelModel.GetBaseURL()
 	}
 	proxy := channelModel.GetSetting().Proxy
-	adaptor := GetTaskAdaptor(constant.TaskPlatform(strconv.Itoa(channelModel.Type)))
+	adaptor := GetTaskAdaptorForTask(task)
 	if adaptor == nil {
 		return nil
 	}

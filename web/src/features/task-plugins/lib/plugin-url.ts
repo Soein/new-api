@@ -87,6 +87,77 @@ export class PluginSourceFetchError extends Error {
   }
 }
 
+async function safelyCancelReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<void> {
+  try {
+    await reader.cancel()
+  } catch {
+    // Intentional best-effort stream cleanup; ignore stream abort/cancel errors
+  }
+}
+
+async function safelyCancelStream(
+  stream: ReadableStream<Uint8Array>
+): Promise<void> {
+  try {
+    await stream.cancel()
+  } catch {
+    // Intentional best-effort stream cleanup; ignore stream abort/cancel errors
+  }
+}
+
+/**
+ * Reads a Response body as text up to maxBytes.
+ * Cancels the body stream immediately if the byte budget is exceeded during chunked streaming,
+ * or rejects before reading if Content-Length declares an oversized payload.
+ */
+export async function readBoundedResponseText(
+  response: Response,
+  maxBytes: number
+): Promise<string> {
+  const declaredLength = Number(response.headers?.get?.('content-length'))
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    if (response.body) {
+      await safelyCancelStream(response.body)
+    }
+    throw new PluginSourceFetchError('too_large')
+  }
+
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let totalBytes = 0
+    let text = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          totalBytes += value.byteLength
+          if (totalBytes > maxBytes) {
+            await safelyCancelReader(reader)
+            throw new PluginSourceFetchError('too_large')
+          }
+          text += decoder.decode(value, { stream: true })
+        }
+      }
+      text += decoder.decode()
+      return text
+    } catch (err) {
+      if (err instanceof PluginSourceFetchError) throw err
+      await safelyCancelReader(reader)
+      throw err
+    }
+  }
+
+  const text = await response.text()
+  if (pluginSourceByteLength(text) > maxBytes) {
+    throw new PluginSourceFetchError('too_large')
+  }
+  return text
+}
+
 /**
  * Fetches plugin source in the browser. Every marketplace and URL-import fetch
  * goes through here: the gateway never makes the outbound request, so there is
@@ -105,18 +176,7 @@ export async function fetchPluginSourceText(
   if (!response.ok) {
     throw new PluginSourceFetchError('not_found', response.status)
   }
-  const declaredLength = Number(response.headers.get('content-length'))
-  if (
-    Number.isFinite(declaredLength) &&
-    declaredLength > MAX_PLUGIN_SOURCE_BYTES
-  ) {
-    throw new PluginSourceFetchError('too_large')
-  }
-  const text = await response.text()
-  if (pluginSourceByteLength(text) > MAX_PLUGIN_SOURCE_BYTES) {
-    throw new PluginSourceFetchError('too_large')
-  }
-  return text
+  return readBoundedResponseText(response, MAX_PLUGIN_SOURCE_BYTES)
 }
 
 /**

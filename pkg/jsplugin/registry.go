@@ -2,6 +2,7 @@ package jsplugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
@@ -27,9 +28,22 @@ import (
 const APIVersion1 = 1
 
 const (
+	PluginLayerFactory  = "factory"
+	PluginLayerOverride = "override"
+)
+
+const (
 	maxLocalizedTextLocales       = 16
 	maxMetaDescriptionRunes       = 512
 	maxUsageFieldDescriptionRunes = 256
+)
+
+// Usage-schema bounds cap metadata size and every enum Cartesian expansion
+// consumed by the pricing editor and public pricing display.
+const (
+	MaxUsageSchemaFields     = 16
+	MaxUsageEnumValues       = 16
+	MaxUsageEnumCombinations = 256
 )
 
 var pluginKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
@@ -129,9 +143,30 @@ type UsageFieldSchema struct {
 	Description LocalizedText `json:"description,omitempty"`
 }
 
+// CloneUsageSchema returns a deep copy suitable for immutable pricing and log
+// snapshots while preserving nil versus explicitly empty metadata.
+func CloneUsageSchema(schema map[string]UsageFieldSchema) map[string]UsageFieldSchema {
+	if schema == nil {
+		return nil
+	}
+	cloned := make(map[string]UsageFieldSchema, len(schema))
+	for key, field := range schema {
+		if field.Enum != nil {
+			field.Enum = append([]string{}, field.Enum...)
+		}
+		if field.Description != nil {
+			field.Description = maps.Clone(field.Description)
+		}
+		cloned[key] = field
+	}
+	return cloned
+}
+
 type LoadedPlugin struct {
-	Meta   Meta
-	Engine *Engine
+	Meta       Meta
+	Engine     *Engine
+	Layer      string
+	SourceHash string
 }
 
 // RegistrySnapshot is a read-only copy of the metadata currently stored in
@@ -217,8 +252,10 @@ func (r *Registry) register(source string, options Options, factory bool) (*Load
 	factoryPlugins := clonePluginMap(r.factory)
 	overridePlugins := clonePluginMap(r.override)
 	if factory {
+		plugin.Layer = PluginLayerFactory
 		factoryPlugins[plugin.Meta.Key] = plugin
 	} else {
+		plugin.Layer = PluginLayerOverride
 		overridePlugins[plugin.Meta.Key] = plugin
 	}
 	enabled := r.overrideEnabled.Load()
@@ -435,7 +472,11 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 			return nil, fmt.Errorf("plugin %s export %q is no longer supported", meta.Key, removed)
 		}
 	}
-	return &LoadedPlugin{Meta: meta, Engine: engine}, nil
+	return &LoadedPlugin{
+		Meta:       meta,
+		Engine:     engine,
+		SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source))),
+	}, nil
 }
 
 func (r *Registry) Get(platform string) (*LoadedPlugin, bool) {
@@ -450,6 +491,36 @@ func (r *Registry) GetByChannelType(channelType int) (*LoadedPlugin, bool) {
 // routing generation contains no plugins regardless of the other layers.
 func (r *Registry) Enabled() bool {
 	return r.masterEnabled.Load()
+}
+
+// OverrideEnabled reports whether database overrides may execute. Historical
+// task restoration must honor the same kill switch as the current generation.
+func (r *Registry) OverrideEnabled() bool {
+	return r.masterEnabled.Load() && r.overrideEnabled.Load()
+}
+
+// FactoryPlugin returns the registered factory-layer plugin even when an
+// override currently masks it. Callers must separately check FactoryEnabled
+// before executing it.
+func (r *Registry) FactoryPlugin(key string) (*LoadedPlugin, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	plugin, ok := r.factory[key]
+	return plugin, ok
+}
+
+// FactoryEnabled reports whether the factory layer for key may execute.
+func (r *Registry) FactoryEnabled(key string) bool {
+	if !r.masterEnabled.Load() {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, disabled := r.disabledFactory[key]; disabled {
+		return false
+	}
+	_, ok := r.factory[key]
+	return ok
 }
 
 func (r *Registry) SetEnabled(enabled bool) {
@@ -565,6 +636,7 @@ func (r *Registry) ReplaceOverrides(plugins []*LoadedPlugin) error {
 		if _, exists := overridePlugins[plugin.Meta.Key]; exists {
 			return fmt.Errorf("duplicate override plugin key %q", plugin.Meta.Key)
 		}
+		plugin.Layer = PluginLayerOverride
 		overridePlugins[plugin.Meta.Key] = plugin
 	}
 
@@ -845,17 +917,7 @@ func cloneMeta(meta Meta) Meta {
 		meta.Description = maps.Clone(meta.Description)
 	}
 	if meta.UsageSchema != nil {
-		usageSchema := make(map[string]UsageFieldSchema, len(meta.UsageSchema))
-		for key, field := range meta.UsageSchema {
-			if field.Enum != nil {
-				field.Enum = append([]string{}, field.Enum...)
-			}
-			if field.Description != nil {
-				field.Description = maps.Clone(field.Description)
-			}
-			usageSchema[key] = field
-		}
-		meta.UsageSchema = usageSchema
+		meta.UsageSchema = CloneUsageSchema(meta.UsageSchema)
 	}
 	meta.UsageExamples = cloneUsageExamples(meta.UsageExamples)
 	return meta
@@ -1239,13 +1301,8 @@ func normalizeV1Meta(meta *Meta) error {
 			}
 		}
 	}
-	for name, field := range meta.UsageSchema {
-		if strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name {
-			return fmt.Errorf("plugin meta usageSchema keys must be non-empty canonical names")
-		}
-		if err := validateUsageFieldSchema(name, field); err != nil {
-			return err
-		}
+	if err := validateUsageSchema(meta.UsageSchema); err != nil {
+		return err
 	}
 	if err := validateUsageExamples(meta.UsageSchema, meta.UsageExamples); err != nil {
 		return err
@@ -1260,6 +1317,9 @@ func decodeUsageSchema(value any) (map[string]UsageFieldSchema, error) {
 	object, ok := value.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("plugin meta usageSchema must be an object")
+	}
+	if len(object) > MaxUsageSchemaFields {
+		return nil, fmt.Errorf("plugin meta usageSchema must not exceed %d fields", MaxUsageSchemaFields)
 	}
 	schema := make(map[string]UsageFieldSchema, len(object))
 	for name, rawField := range object {
@@ -1290,12 +1350,44 @@ func decodeUsageSchema(value any) (map[string]UsageFieldSchema, error) {
 				return nil, err
 			}
 		}
-		if err = validateUsageFieldSchema(name, field); err != nil {
-			return nil, err
-		}
 		schema[name] = field
 	}
+	if err := validateUsageSchema(schema); err != nil {
+		return nil, err
+	}
 	return schema, nil
+}
+
+func validateUsageSchema(schema map[string]UsageFieldSchema) error {
+	if len(schema) > MaxUsageSchemaFields {
+		return fmt.Errorf("plugin meta usageSchema must not exceed %d fields", MaxUsageSchemaFields)
+	}
+	names := make([]string, 0, len(schema))
+	for name := range schema {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	enumCombinations := 1
+	for _, name := range names {
+		field := schema[name]
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name {
+			return fmt.Errorf("plugin meta usageSchema keys must be non-empty canonical names")
+		}
+		if err := validateUsageFieldSchema(name, field); err != nil {
+			return err
+		}
+		if field.Enum == nil {
+			continue
+		}
+		if len(field.Enum) > MaxUsageEnumValues {
+			return fmt.Errorf("plugin meta usageSchema field %q enum must not exceed %d values", name, MaxUsageEnumValues)
+		}
+		if enumCombinations > MaxUsageEnumCombinations/len(field.Enum) {
+			return fmt.Errorf("plugin meta usageSchema enum combinations must not exceed %d", MaxUsageEnumCombinations)
+		}
+		enumCombinations *= len(field.Enum)
+	}
+	return nil
 }
 
 func validateUsageFieldSchema(name string, field UsageFieldSchema) error {
@@ -1308,6 +1400,9 @@ func validateUsageFieldSchema(name string, field UsageFieldSchema) error {
 		}
 		if len(field.Enum) == 0 {
 			return fmt.Errorf("plugin meta usageSchema field %q enum must contain at least one value", name)
+		}
+		if len(field.Enum) > MaxUsageEnumValues {
+			return fmt.Errorf("plugin meta usageSchema field %q enum must not exceed %d values", name, MaxUsageEnumValues)
 		}
 		values := make(map[string]struct{}, len(field.Enum))
 		for _, value := range field.Enum {

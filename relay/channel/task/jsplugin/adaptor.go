@@ -22,12 +22,12 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
-	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -584,7 +584,7 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http
 		return nil, err
 	}
 	started := time.Now()
-	resp, err := client.Do(req)
+	resp, err := a.doCredentialedPluginRequest(client, req, baseURL)
 	if err != nil {
 		logger.LogDebug(
 			context.Background(),
@@ -604,6 +604,26 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http
 		time.Since(started).Milliseconds(),
 	)
 	return resp, nil
+}
+
+func (a *TaskAdaptor) doCredentialedPluginRequest(client *http.Client, req *http.Request, baseURL string) (*http.Response, error) {
+	pluginClient := *client
+	pluginClient.CheckRedirect = func(redirect *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return fmt.Errorf("plugin redirect is missing its initial request")
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if err := pluginruntime.ValidateCredentialedRedirectURL(redirect.URL.String(), via[0].URL.String(), baseURL, a.plugin.Meta.AllowedHosts); err != nil {
+			return fmt.Errorf("redirect to %s blocked: %w", redirect.URL, err)
+		}
+		if err := service.ValidateSSRFProtectedFetchURL(redirect.URL.String()); err != nil {
+			return fmt.Errorf("redirect to %s blocked: %w", redirect.URL, err)
+		}
+		return nil
+	}
+	return pluginClient.Do(req)
 }
 
 func (a *TaskAdaptor) ParseBatchResult(body []byte) (map[string]*service.BatchTaskResult, error) {

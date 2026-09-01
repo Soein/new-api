@@ -475,6 +475,9 @@ func (e *Engine) getRuntime(ctx context.Context) (*runtimeInstance, error) {
 
 func (e *Engine) newRuntime(ctx context.Context) (instance *runtimeInstance, err error) {
 	runtime := sobek.New()
+	// ParseModule only covers the uploaded module. eval() and Function() parse
+	// again at runtime, so they need the same source-map file-read protection.
+	runtime.SetParserOptions(parser.WithDisableSourceMaps)
 	logContext := &runtimeLogContext{context: ctx}
 	logOutput := e.log
 	if logOutput == nil {

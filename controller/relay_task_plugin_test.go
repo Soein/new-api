@@ -193,6 +193,13 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 				Name: "Community Author",
 				URL:  "https://plugins.example/author",
 			},
+			UsageSchema: map[string]pluginruntime.UsageFieldSchema{
+				"seconds": {
+					Type:        "number",
+					Unit:        "second",
+					Description: pluginruntime.LocalizedText{"en": "Settled duration."},
+				},
+			},
 		}},
 	})
 	billing := &taskSubmissionTestBilling{events: &events}
@@ -216,6 +223,10 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 	require.NotNil(t, outcome.Task.PrivateData.Execution.TaskPlugin.Author)
 	assert.Equal(t, "Community Author", outcome.Task.PrivateData.Execution.TaskPlugin.Author.Name)
 	assert.Equal(t, "https://plugins.example/author", outcome.Task.PrivateData.Execution.TaskPlugin.Author.URL)
+	encodedBillingContext, err := common.Marshal(outcome.Task.PrivateData.BillingContext)
+	require.NoError(t, err)
+	assert.Contains(t, string(encodedBillingContext), `"usage_schema"`)
+	assert.Contains(t, string(encodedBillingContext), `"Settled duration."`)
 
 	var stored model.Task
 	require.NoError(t, database.Where("task_id = ?", "task_public").First(&stored).Error)
@@ -225,6 +236,10 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 	require.NotNil(t, stored.PrivateData.Execution.TaskPlugin.Author)
 	assert.Equal(t, "Community Author", stored.PrivateData.Execution.TaskPlugin.Author.Name)
 	assert.Equal(t, "upstream-private", stored.PrivateData.UpstreamTaskID)
+	encodedStoredBillingContext, err := common.Marshal(stored.PrivateData.BillingContext)
+	require.NoError(t, err)
+	assert.Contains(t, string(encodedStoredBillingContext), `"usage_schema"`)
+	assert.Contains(t, string(encodedStoredBillingContext), `"Settled duration."`)
 }
 
 func TestExecuteTaskSubmissionRefundsCancellationBeforeDurableBarrier(t *testing.T) {

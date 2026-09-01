@@ -21,12 +21,13 @@ import type {
   BillingUsageFieldSchema,
   BillingUsageSchema,
 } from '../types'
-
-export const TASK_TOKEN_PRICE_SCALE = 1_000_000
 import {
   parseTaskTiersFromExpr,
   splitBillingExprAndRequestRules,
 } from './billing-expr'
+
+export const TASK_TOKEN_PRICE_SCALE = 1_000_000
+export const MAX_TASK_ENUM_COMBINATIONS = 256
 
 export type TaskVisualCondition = {
   field: string
@@ -84,14 +85,46 @@ export function getTaskEnumFields(
     .sort(([left], [right]) => left.localeCompare(right))
 }
 
-export function getTaskEnumCombinations(
+export function getTaskEnumCombinationCount(
   schema: BillingUsageSchema | null | undefined
+): number {
+  const fields = getTaskEnumFields(schema)
+  if (fields.length === 0) return 1
+  let total = 1
+  for (const [, definition] of fields) {
+    const enumLen = definition.enum?.length ?? 0
+    if (enumLen === 0) continue
+    if (total > Number.MAX_SAFE_INTEGER / enumLen) {
+      return Number.POSITIVE_INFINITY
+    }
+    total *= enumLen
+  }
+  return total
+}
+
+export function getTaskEnumCombinations(
+  schema: BillingUsageSchema | null | undefined,
+  maxCombinations = MAX_TASK_ENUM_COMBINATIONS
 ): Record<string, string>[] {
+  const fields = getTaskEnumFields(schema)
+  if (fields.length === 0) return [{}]
+
+  let total = 1
+  for (const [, definition] of fields) {
+    const enumLen = definition.enum?.length ?? 0
+    if (enumLen === 0) continue
+    if (total > maxCombinations / enumLen) {
+      return []
+    }
+    total *= enumLen
+  }
+
   let combinations: Record<string, string>[] = [{}]
-  for (const [field, definition] of getTaskEnumFields(schema)) {
+  for (const [field, definition] of fields) {
     const nextCombinations: Record<string, string>[] = []
+    const values = definition.enum ?? []
     for (const combination of combinations) {
-      for (const value of definition.enum ?? []) {
+      for (const value of values) {
         nextCombinations.push({ ...combination, [field]: value })
       }
     }
@@ -205,6 +238,7 @@ export function tryParseTaskMatrixConfig(
   const enumFields = getTaskEnumFields(schema)
   const numberFields = getTaskNumberFields(schema)
   const combinations = getTaskEnumCombinations(schema)
+  if (combinations.length === 0) return null
 
   if (tiers.length === 1 && tiers[0].conditions.length === 0) {
     return {

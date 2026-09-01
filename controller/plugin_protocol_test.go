@@ -147,7 +147,7 @@ func TestServeTaskPluginProtocolDisconnectDuringSubmissionFinishesDurableWithout
 	}
 }
 
-func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettlesWithoutRefund(t *testing.T) {
+func TestServeTaskPluginProtocolBackgroundDisconnectBeforeDurableBarrierPersistsFlagAndSettlesWithoutRefund(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, true, &events)
 	previousLogConsumeEnabled := common.LogConsumeEnabled
@@ -161,6 +161,7 @@ func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettles
 		}};
 	`)
 	c, recorder := newPluginProtocolTestContext(true, true)
+	setProtocolRequestBackground(c, true)
 	requestContext, cancel := context.WithCancel(c.Request.Context())
 	c.Request = c.Request.WithContext(requestContext)
 	billing := &taskSubmissionTestBilling{events: &events}
@@ -221,6 +222,7 @@ func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettles
 	assert.Equal(t, model.TaskStatus(model.TaskStatusNotStart), persisted.Status)
 	assert.Equal(t, 7, persisted.Quota)
 	assert.Equal(t, "upstream_disconnect_persisted", persisted.PrivateData.UpstreamTaskID)
+	assert.True(t, persisted.PrivateData.ResponsesBackground)
 	assert.Empty(t, recorder.Header().Get("Content-Type"))
 	assert.Empty(t, recorder.Body.String())
 	assert.False(t, recorder.Flushed)
@@ -229,6 +231,61 @@ func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettles
 		require.FailNow(t, "protocol observation started after client disconnect")
 	default:
 	}
+}
+
+func TestServeTaskPluginProtocolBackgroundPersistenceFailureDoesNotClaimBackground(t *testing.T) {
+	events := make([]string, 0, 3)
+	database := setupTaskSubmissionDatabase(t, true, &events)
+	require.NoError(t, database.Callback().Create().Before("gorm:create").Register("test:reject-background-task", func(tx *gorm.DB) {
+		task, ok := tx.Statement.Dest.(*model.Task)
+		if ok && task.PrivateData.ResponsesBackground {
+			tx.AddError(errors.New("background persistence unavailable"))
+		}
+	}))
+	previousLogConsumeEnabled := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = previousLogConsumeEnabled })
+
+	pinned := compilePluginProtocolTestEndpoint(t, "background-persistence-failure", `
+		export const protocols = {openai_responses: {
+			renderEvents: function() { return {events: [], done: false}; },
+			renderFinal: function() { return {}; }
+		}};
+	`)
+	c, recorder := newPluginProtocolTestContext(false, false)
+	setProtocolRequestBackground(c, true)
+	billing := &taskSubmissionTestBilling{events: &events}
+	deps := pluginProtocolTestDeps()
+	deps.submit = func(c *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
+		info.Billing = billing
+		info.TaskRelayInfo.PublicTaskID = "task_background_persistence_failure"
+		info.TaskRelayInfo.LockedChannel = &model.Channel{
+			Id:   1,
+			Type: constant.ChannelTypeTaskPlugin,
+			Name: "background-persistence-failure",
+		}
+		info.ChannelMeta = &relaycommon.ChannelMeta{
+			ChannelId:   1,
+			ChannelType: constant.ChannelTypeTaskPlugin,
+		}
+		return executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+			return &relay.TaskSubmitResult{
+				UpstreamTaskID: "upstream_background_persistence_failure",
+				Platform:       constant.TaskPlatform(pinned.Plugin.Meta.Key),
+				Quota:          7,
+			}, nil
+		})
+	}
+
+	serveTaskPluginProtocol(c, pinned, deps)
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), `"background":true`)
+	assert.Equal(t, []string{"reserve", "insert", "refund"}, events)
+	assert.Equal(t, 1, billing.refunds)
+	var count int64
+	require.NoError(t, database.Model(&model.Task{}).Where("task_id = ?", "task_background_persistence_failure").Count(&count).Error)
+	assert.Zero(t, count)
 }
 
 func TestServeTaskPluginProtocolDisconnectDuringTerminalSettlementStopsOnlyObservation(t *testing.T) {
@@ -1164,6 +1221,71 @@ func TestRetrieveTaskPluginResponseSuccessRendersFinal(t *testing.T) {
 	assert.Equal(t, "retrieved-final", response.Output[0].Content[0].Text)
 }
 
+func TestRetrieveTaskPluginResponseUsesPinnedHistoricalRenderer(t *testing.T) {
+	originalDB := model.DB
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.TaskPluginState{}, &model.TaskPlugin{}))
+	model.DB = database
+	t.Cleanup(func() { model.DB = originalDB })
+
+	const key = "retrieve-historical"
+	t.Cleanup(func() { _ = pluginruntime.DefaultRegistry.Unregister(key) })
+	source := func(version, text string) string {
+		return `
+export const meta = {apiVersion: 1, key: "` + key + `", name: "Historical Retrieve", version: "` + version + `", author: {name: "Test"}, models: ["video-model"], fetchMode: "per_task", protocols: [{name: "openai_responses", supports: ["sync", "background"]}]};
+export const protocols = {openai_responses: {decodeRequest: function(ctx) { return ctx; }, renderFinal: function() { return {output: [{type: "message", status: "completed", role: "assistant", content: [{type: "output_text", text: "` + text + `", annotations: [], logprobs: []}]}]}; }}};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {taskId: "upstream"}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+export function listArtifacts() { return []; }
+export function buildContentRequest() { return {}; }
+`
+	}
+	v1Source := source("1.0.0", "historical-v1")
+	v2Source := source("2.0.0", "current-v2")
+	v1, err := pluginruntime.CompilePlugin(v1Source, pluginruntime.Options{})
+	require.NoError(t, err)
+	v2, err := pluginruntime.CompilePlugin(v2Source, pluginruntime.Options{})
+	require.NoError(t, err)
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "1.0.0", Source: v1Source, SourceHash: v1.SourceHash, Enabled: true,
+	}))
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "2.0.0", Source: v2Source, SourceHash: v2.SourceHash, Enabled: true,
+	}))
+	require.NoError(t, model.ActivateTaskPlugin(key, "2.0.0"))
+	_, err = pluginruntime.DefaultRegistry.Register(v2Source, pluginruntime.Options{})
+	require.NoError(t, err)
+	_, err = model.DeleteTaskPluginVersion(key, "1.0.0")
+	require.NoError(t, err)
+
+	task := &model.Task{
+		TaskID: "task_retrieve_historical", Platform: constant.TaskPlatform(key), UserId: 71,
+		Status: model.TaskStatusSuccess, CreatedAt: 1_710_000_000,
+		Properties: model.Properties{OriginModelName: "video-model"},
+	}
+	task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: key, Version: "1.0.0", APIVersion: 1,
+		Layer: pluginruntime.PluginLayerOverride, SourceHash: v1.SourceHash, Generation: 40,
+	}}
+	c, recorder := newPluginProtocolRetrieveContext("resp_retrieve_historical")
+	deps := pluginProtocolTestDeps()
+	deps.getByTaskId = func(userID int, taskID string) (*model.Task, bool, error) {
+		return task, userID == task.UserId && taskID == task.TaskID, nil
+	}
+
+	retrieveTaskPluginResponse(c, deps)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	var response dto.PluginResponsesResponse
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Len(t, response.Output, 1)
+	require.Len(t, response.Output[0].Content, 1)
+	assert.Equal(t, "historical-v1", response.Output[0].Content[0].Text)
+}
+
 func TestRetrieveTaskPluginResponseStreamOnlySuccessSynthesizesFromEvents(t *testing.T) {
 	logs := make([]string, 0, 1)
 	pinned := compilePluginProtocolRetrieveEndpoint(t, "retrieve-stream-only", `
@@ -1352,7 +1474,7 @@ func TestRetrieveTaskPluginResponseNotFound(t *testing.T) {
 			common.SetContextKey(c, constant.ContextKeyUserId, testCase.userID)
 			deps := pluginProtocolRetrieveDeps(pinned, testCase.task, testCase.exists, nil)
 			if testCase.plugin == nil {
-				deps.resolvePlugin = func(constant.TaskPlatform) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool) {
+				deps.resolvePlugin = func(*model.Task) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool) {
 					return nil, nil, false
 				}
 			}
@@ -1571,7 +1693,7 @@ func pluginProtocolRetrieveDeps(pinned pluginruntime.PinnedEndpoint, task *model
 		}
 		return task, task != nil, err
 	}
-	deps.resolvePlugin = func(constant.TaskPlatform) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool) {
+	deps.resolvePlugin = func(*model.Task) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool) {
 		if pinned.Plugin == nil {
 			return nil, nil, false
 		}

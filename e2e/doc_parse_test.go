@@ -11,12 +11,12 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
-	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
@@ -41,7 +41,7 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 	originalDB := model.DB
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.TaskPlugin{}, &model.Channel{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.TaskPluginState{}, &model.TaskPlugin{}, &model.Channel{}, &model.Task{}))
 	model.DB = database
 	t.Cleanup(func() { model.DB = originalDB; jsplugin.DefaultRegistry.Unregister("doc-parse") })
 
@@ -113,8 +113,13 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 	require.NoError(t, database.Create(&task).Error)
 
 	originalFactory := service.GetTaskAdaptorFunc
+	originalTaskFactory := service.GetTaskAdaptorForTaskFunc
 	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
-	t.Cleanup(func() { service.GetTaskAdaptorFunc = originalFactory })
+	service.GetTaskAdaptorForTaskFunc = func(task *model.Task) service.TaskPollingAdaptor { return relay.GetTaskAdaptorForTask(task) }
+	t.Cleanup(func() {
+		service.GetTaskAdaptorFunc = originalFactory
+		service.GetTaskAdaptorForTaskFunc = originalTaskFactory
+	})
 	service.DispatchPlatformUpdate(context.Background(), "doc-parse", map[int][]string{channel.Id: {parsed.UpstreamTaskID}}, map[string]*model.Task{parsed.UpstreamTaskID: &task})
 	require.NoError(t, database.First(&task, task.ID).Error)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)

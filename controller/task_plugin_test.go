@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"net/http"
@@ -26,7 +27,7 @@ func setupTaskPluginControllerTest(t *testing.T) {
 	originalDB := model.DB
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.TaskPlugin{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Option{}))
+	require.NoError(t, database.AutoMigrate(&model.TaskPluginState{}, &model.TaskPlugin{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Option{}))
 	model.DB = database
 	t.Cleanup(func() { model.DB = originalDB })
 }
@@ -90,6 +91,55 @@ func TestDeleteThirdPartyPluginReportsAssociatedChannelsAndInFlightTasks(t *test
 
 	assert.Contains(t, recorder.Body.String(), `"name":"linked"`)
 	assert.Contains(t, recorder.Body.String(), `"in_flight_count":1`)
+}
+
+func TestDeleteInactiveTaskPluginVersionRequiresForceWhileSnapshotTaskIsUnfinished(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	key := "delete-snapshot-version"
+	cleanupTaskPluginControllerRuntime(t, key)
+	for _, version := range []string{"1.0.0", "2.0.0"} {
+		source := taskPluginControllerTestSource(key, version)
+		require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+			Key: key, APIVersion: 1, Version: version, Source: source,
+			SourceHash: "delete-snapshot-" + version, Enabled: true,
+		}))
+	}
+	require.NoError(t, model.ActivateTaskPlugin(key, "2.0.0"))
+	require.NoError(t, model.DB.Create(&model.Task{
+		TaskID: "unfinished-version-task", Platform: constant.TaskPlatform(key), Status: model.TaskStatusInProgress,
+		PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+			Key: key, Version: "1.0.0", APIVersion: 1, Layer: jsplugin.PluginLayerOverride,
+			SourceHash: "delete-snapshot-1.0.0",
+		}}},
+	}).Error)
+
+	requestDelete := func(query string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginContext, _ := gin.CreateTestContext(recorder)
+		ginContext.Params = gin.Params{{Key: "key", Value: key}, {Key: "version", Value: "1.0.0"}}
+		ginContext.Request = httptest.NewRequest(http.MethodDelete, "/api/plugin/task/"+key+"/versions/1.0.0"+query, nil)
+		DeleteTaskPluginVersion(ginContext)
+		return recorder
+	}
+
+	recorder := requestDelete("")
+	assert.Contains(t, recorder.Body.String(), `"success":false`)
+	assert.Contains(t, recorder.Body.String(), `"in_flight_count":1`)
+	_, err := model.GetTaskPluginVersion(key, "1.0.0")
+	require.NoError(t, err)
+
+	recorder = requestDelete("?force=true")
+	assert.Contains(t, recorder.Body.String(), `"success":true`)
+	_, err = model.GetTaskPluginVersion(key, "1.0.0")
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	historical, err := model.GetTaskPluginVersionForExecution(key, "1.0.0")
+	require.NoError(t, err)
+	assert.False(t, historical.Enabled)
+
+	// A previously graceful tombstone can be force-deleted later if the exact
+	// historical source is subsequently found unsafe.
+	recorder = requestDelete("?force=true")
+	assert.Contains(t, recorder.Body.String(), `"success":true`)
 }
 
 func TestDisableThirdPartyPluginSupportsCascadeAndForce(t *testing.T) {
@@ -529,6 +579,127 @@ func TestActivateTaskPluginRefreshesRuntimeSyncState(t *testing.T) {
 	taskPluginSyncState.Unlock()
 	assert.Equal(t, "hash-v2", syncedHash)
 	assert.False(t, hasSyncError)
+}
+
+func TestActivateTaskPluginRejectsRoutingConflictWithoutChangingActiveVersion(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	key := "activate-conflict-candidate"
+	ownerKey := "activate-conflict-owner"
+	cleanupTaskPluginControllerRuntime(t, key)
+	cleanupTaskPluginControllerRuntime(t, ownerKey)
+	v1Source := taskPluginControllerChannelSource(key, "1.0.0", 9101)
+	v2Source := taskPluginControllerChannelSource(key, "2.0.0", 9102)
+	ownerSource := taskPluginControllerChannelSource(ownerKey, "1.0.0", 9102)
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "1.0.0", Source: v1Source, SourceHash: "conflict-v1", Enabled: true,
+	}))
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "2.0.0", Source: v2Source, SourceHash: "conflict-v2", Enabled: true,
+	}))
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: ownerKey, APIVersion: 1, Version: "1.0.0", Source: ownerSource, SourceHash: "conflict-owner", Enabled: true,
+	}))
+	require.NoError(t, syncTaskPluginsOnce())
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "key", Value: key}}
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/plugin/task/"+key+"/activate", strings.NewReader(`{"version":"2.0.0"}`))
+	context.Request.Header.Set("Content-Type", "application/json")
+	ActivateTaskPlugin(context)
+
+	assert.Contains(t, recorder.Body.String(), `"success":false`)
+	assert.Contains(t, recorder.Body.String(), "channelType 9102 conflicts")
+	active, err := model.GetTaskPluginVersion(key, "")
+	require.NoError(t, err)
+	assert.Equal(t, "1.0.0", active.Version)
+	runtimePlugin, ok := jsplugin.DefaultRegistry.Get(key)
+	require.True(t, ok)
+	assert.Equal(t, "1.0.0", runtimePlugin.Meta.Version)
+}
+
+func TestActivateTaskPluginRollsBackDatabaseWhenRuntimePublishFails(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	key := "activate-publish-failure"
+	cleanupTaskPluginControllerRuntime(t, key)
+	v1Source := taskPluginControllerTestSource(key, "1.0.0")
+	v2Source := taskPluginControllerTestSource(key, "2.0.0")
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "1.0.0", Source: v1Source, SourceHash: "publish-v1", Enabled: true,
+	}))
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "2.0.0", Source: v2Source, SourceHash: "publish-v2", Enabled: true,
+	}))
+	require.NoError(t, syncTaskPluginsOnce())
+	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(func(candidate, _ *jsplugin.RoutingGeneration) (jsplugin.PreparedRoutingGeneration, error) {
+		if plugin, ok := candidate.Get(key); ok && plugin.Meta.Version == "2.0.0" {
+			return jsplugin.PreparedRoutingGeneration{}, fmt.Errorf("simulated publish failure")
+		}
+		return jsplugin.PreparedRoutingGeneration{Generation: candidate}, nil
+	}))
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(nil)) })
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "key", Value: key}}
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/plugin/task/"+key+"/activate", strings.NewReader(`{"version":"2.0.0"}`))
+	context.Request.Header.Set("Content-Type", "application/json")
+	ActivateTaskPlugin(context)
+
+	assert.Contains(t, recorder.Body.String(), `"success":false`)
+	assert.Contains(t, recorder.Body.String(), "simulated publish failure")
+	active, err := model.GetTaskPluginVersion(key, "")
+	require.NoError(t, err)
+	assert.Equal(t, "1.0.0", active.Version)
+	runtimePlugin, ok := jsplugin.DefaultRegistry.Get(key)
+	require.True(t, ok)
+	assert.Equal(t, "1.0.0", runtimePlugin.Meta.Version)
+}
+
+func TestActivateTaskPluginRollbackDoesNotOverwriteNewerNodeActivation(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	key := "activate-cas-failure"
+	cleanupTaskPluginControllerRuntime(t, key)
+	for _, version := range []string{"1.0.0", "2.0.0", "3.0.0"} {
+		source := taskPluginControllerTestSource(key, version)
+		require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+			Key: key, APIVersion: 1, Version: version, Source: source,
+			SourceHash: "activate-cas-" + version, Enabled: true,
+		}))
+	}
+	require.NoError(t, syncTaskPluginsOnce())
+
+	var newerActivationErr error
+	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(func(candidate, _ *jsplugin.RoutingGeneration) (jsplugin.PreparedRoutingGeneration, error) {
+		plugin, ok := candidate.Get(key)
+		if ok && plugin.Meta.Version == "2.0.0" {
+			newerActivationErr = model.ActivateTaskPlugin(key, "3.0.0")
+			return jsplugin.PreparedRoutingGeneration{}, fmt.Errorf("simulated node-a publish failure")
+		}
+		return jsplugin.PreparedRoutingGeneration{Generation: candidate}, nil
+	}))
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(nil)) })
+
+	recorder := httptest.NewRecorder()
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/api/plugin/task/"+key+"/activate", strings.NewReader(`{"version":"2.0.0"}`)).WithContext(requestContext)
+	request.Header.Set("Content-Type", "application/json")
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Params = gin.Params{{Key: "key", Value: key}}
+	ginContext.Request = request
+
+	ActivateTaskPlugin(ginContext)
+
+	require.NoError(t, newerActivationErr)
+	assert.Contains(t, recorder.Body.String(), `"success":false`)
+	assert.Contains(t, recorder.Body.String(), "simulated node-a publish failure")
+	active, err := model.GetTaskPluginVersion(key, "")
+	require.NoError(t, err)
+	assert.Equal(t, "3.0.0", active.Version)
+	runtimePlugin, ok := jsplugin.DefaultRegistry.Get(key)
+	require.True(t, ok)
+	assert.Equal(t, "3.0.0", runtimePlugin.Meta.Version)
 }
 
 func TestSyncTaskPluginsPublishesOneGenerationForWholeBatch(t *testing.T) {

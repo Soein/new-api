@@ -24,6 +24,7 @@ import (
 )
 
 const maxTaskPluginSourceBytes = 1024 * 1024
+const taskPluginActivationSyncTimeout = 15 * time.Second
 
 type taskPluginUploadRequest struct {
 	Source       string `json:"source" binding:"required"`
@@ -358,7 +359,11 @@ func DryRunTaskPlugin(c *gin.Context) {
 func DeleteTaskPluginVersion(c *gin.Context) {
 	key := c.Param("key")
 	version := c.Param("version")
+	force := c.Query("force") == "true"
 	plugin, lookupErr := model.GetTaskPluginVersion(key, version)
+	if errors.Is(lookupErr, gorm.ErrRecordNotFound) && force {
+		plugin, lookupErr = model.GetTaskPluginVersionForExecution(key, version)
+	}
 	if lookupErr != nil {
 		if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
 			common.ApiErrorMsg(c, "override plugin version not found; factory plugins cannot be deleted")
@@ -367,18 +372,33 @@ func DeleteTaskPluginVersion(c *gin.Context) {
 		common.ApiError(c, lookupErr)
 		return
 	}
+	if !force {
+		versionInFlight, usageErr := model.CountUnfinishedTasksUsingTaskPluginVersion(plugin)
+		if usageErr != nil {
+			common.ApiError(c, usageErr)
+			return
+		}
+		if versionInFlight > 0 {
+			c.JSON(200, gin.H{
+				"success": false,
+				"message": "task plugin version is still used by unfinished tasks",
+				"data":    gin.H{"in_flight_count": versionInFlight},
+			})
+			return
+		}
+	}
 	if plugin.Active && !taskPluginHasFactory(key) {
 		channels, inFlight, usageErr := model.GetTaskPluginUsage(key)
 		if usageErr != nil {
 			common.ApiError(c, usageErr)
 			return
 		}
-		if (len(channels) > 0 || inFlight > 0) && c.Query("force") != "true" {
+		if (len(channels) > 0 || inFlight > 0) && !force {
 			c.JSON(200, gin.H{"success": false, "message": "task plugin is still in use", "data": gin.H{"channels": channels, "in_flight_count": inFlight}})
 			return
 		}
 	}
-	_, err := model.DeleteTaskPluginVersion(key, version)
+	_, err := model.DeleteTaskPluginVersion(key, version, force)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			common.ApiErrorMsg(c, "override plugin version not found; factory plugins cannot be deleted")
@@ -398,12 +418,16 @@ type taskPluginActivateRequest struct {
 	Version string `json:"version" binding:"required"`
 }
 
+var taskPluginActivationMu sync.Mutex
+
 func ActivateTaskPlugin(c *gin.Context) {
 	var request taskPluginActivateRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
+	taskPluginActivationMu.Lock()
+	defer taskPluginActivationMu.Unlock()
 	versions, err := model.ListTaskPluginVersions(c.Param("key"))
 	if err != nil {
 		common.ApiError(c, err)
@@ -420,19 +444,58 @@ func ActivateTaskPlugin(c *gin.Context) {
 		common.ApiErrorMsg(c, "plugin version not found")
 		return
 	}
-	if _, err = jsplugin.NewRegistry().Register(target.Source, jsplugin.Options{Key: target.Key, Version: target.Version}); err != nil {
+	compiled, err := jsplugin.CompilePlugin(target.Source, jsplugin.Options{Key: target.Key, Version: target.Version})
+	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
-	if err = model.ActivateTaskPlugin(target.Key, target.Version); err != nil {
+	if err = jsplugin.PreflightRoutingConflict(jsplugin.DefaultRegistry.Generation(), compiled); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	activation, err := model.ActivateTaskPluginWithState(target.Key, target.Version)
+	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	if err = syncTaskPluginsOnceContext(c.Request.Context()); err != nil {
-		common.ApiError(c, err)
+	if err = syncTaskPluginsAfterActivation(c.Request.Context()); err != nil {
+		common.ApiError(c, rollbackTaskPluginActivation(c.Request.Context(), activation, err))
+		return
+	}
+	runtimePlugin, published := jsplugin.DefaultRegistry.Get(target.Key)
+	routingError := jsplugin.DefaultRegistry.RoutingErrors()[target.Key]
+	if !published || runtimePlugin.Meta.Version != target.Version || routingError != "" {
+		publishErr := fmt.Errorf("task plugin %s@%s was not published", target.Key, target.Version)
+		if routingError != "" {
+			publishErr = fmt.Errorf("%w: %s", publishErr, routingError)
+		}
+		common.ApiError(c, rollbackTaskPluginActivation(c.Request.Context(), activation, publishErr))
 		return
 	}
 	common.ApiSuccess(c, nil)
+}
+
+func rollbackTaskPluginActivation(ctx context.Context, activation model.TaskPluginActivation, activationErr error) error {
+	restored, err := model.RestoreTaskPluginActivation(activation)
+	if err != nil {
+		return fmt.Errorf("%w; restore database activation: %v", activationErr, err)
+	}
+	if err = syncTaskPluginsAfterActivation(ctx); err != nil {
+		if restored {
+			return fmt.Errorf("%w; republish restored activation: %v", activationErr, err)
+		}
+		return fmt.Errorf("%w; publish current database activation: %v", activationErr, err)
+	}
+	return activationErr
+}
+
+func syncTaskPluginsAfterActivation(parent context.Context) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), taskPluginActivationSyncTimeout)
+	defer cancel()
+	return syncTaskPluginsOnceContext(ctx)
 }
 
 type taskPluginStatusRequest struct {

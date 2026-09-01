@@ -707,7 +707,14 @@ func executeTaskSubmissionWith(
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
+	var usageSchema map[string]pluginruntime.UsageFieldSchema
+	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedPlugin); exists {
+		if pinned, ok := pinnedValue.(pluginruntime.PinnedPlugin); ok && pinned.Plugin != nil {
+			usageSchema = pluginruntime.CloneUsageSchema(pinned.Plugin.Meta.UsageSchema)
+		}
+	}
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+	task.PrivateData.ResponsesBackground = relayInfo.ResponsesBackground
 	task.PrivateData.BillingSource = relayInfo.BillingSource
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 	task.PrivateData.TokenId = relayInfo.TokenId
@@ -720,6 +727,7 @@ func executeTaskSubmissionWith(
 		OriginModelName: relayInfo.OriginModelName,
 		PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
 		TieredSnapshot:  relayInfo.TieredBillingSnapshot,
+		UsageSchema:     usageSchema,
 	}
 	task.Quota = result.Quota
 	task.Data = result.TaskData

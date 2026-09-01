@@ -292,6 +292,51 @@ func TestTaskBillingOtherOmitsEmptyUsageFacts(t *testing.T) {
 	assert.NotContains(t, other, "usage_facts")
 }
 
+func TestTaskBillingOtherIncludesFrozenUsageSchemaSnapshot(t *testing.T) {
+	task := makeTask(1, 1, 100, 0, BillingSourceWallet, 0)
+	var billingContext model.TaskBillingContext
+	require.NoError(t, common.Unmarshal([]byte(`{
+		"usage_schema": {
+			"seconds": {"type": "number", "unit": "second", "description": {"en": "Settled duration."}},
+			"mode": {"enum": ["standard", "pro"], "description": {"en": "Settled quality tier."}}
+		}
+	}`), &billingContext))
+	task.PrivateData.BillingContext = &billingContext
+
+	other := taskBillingOther(task)
+
+	encoded, err := common.Marshal(other["billing_usage_schema"])
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"seconds": {"type": "number", "unit": "second", "description": {"en": "Settled duration."}},
+		"mode": {"enum": ["standard", "pro"], "description": {"en": "Settled quality tier."}}
+	}`, string(encoded))
+
+	// The log payload is a settlement-time snapshot, not an alias of mutable
+	// task state that can change before persistence.
+	seconds := billingContext.UsageSchema["seconds"]
+	seconds.Unit = "count"
+	seconds.Description["en"] = "Changed after settlement."
+	billingContext.UsageSchema["seconds"] = seconds
+	mode := billingContext.UsageSchema["mode"]
+	mode.Enum[0] = "mutated"
+	billingContext.UsageSchema["mode"] = mode
+	encoded, err = common.Marshal(other["billing_usage_schema"])
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"unit":"second"`)
+	assert.Contains(t, string(encoded), `"standard"`)
+	assert.NotContains(t, string(encoded), "Changed after settlement.")
+	assert.NotContains(t, string(encoded), "mutated")
+}
+
+func TestTaskBillingOtherKeepsHistoricalTasksWithoutUsageSchemaCompatible(t *testing.T) {
+	task := makeTask(1, 1, 100, 0, BillingSourceWallet, 0)
+
+	other := taskBillingOther(task)
+
+	assert.NotContains(t, other, "billing_usage_schema")
+}
+
 func callLogTaskConsumption(t *testing.T, info *relaycommon.RelayInfo, task *model.Task) *model.Log {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -387,6 +432,42 @@ func TestLogTaskConsumptionWithoutSnapshotKeepsRatioMode(t *testing.T) {
 	assert.NotContains(t, other, "usage_facts")
 	assert.Contains(t, log.Content, "计算参数：")
 	assert.Contains(t, log.Content, "size: 2.00")
+}
+
+func TestLogTaskConsumptionIncludesFrozenUsageSchemaForZeroDeltaSettlement(t *testing.T) {
+	truncate(t)
+	const userID, channelID = 42, 42
+	seedUser(t, userID, 10_000)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, 100, 0, BillingSourceWallet, 0)
+	require.NoError(t, common.Unmarshal([]byte(`{
+		"usage_schema": {
+			"seconds": {"type": "number", "unit": "second", "description": {"en": "Settled duration."}}
+		}
+	}`), task.PrivateData.BillingContext))
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		OriginModelName: "test-model",
+		UsingGroup:      "default",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{Action: "GENERATE"},
+		PriceData: types.PriceData{
+			ModelPrice:     0.02,
+			Quota:          100,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+
+	log := callLogTaskConsumption(t, info, task)
+
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	schema, ok := other["billing_usage_schema"].(map[string]any)
+	require.True(t, ok)
+	seconds, ok := schema["seconds"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "second", seconds["unit"])
 }
 
 func TestTaskBillingOtherSeparatesPluginAndRootDiagnostics(t *testing.T) {

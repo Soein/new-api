@@ -6,6 +6,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestDecreaseUserQuotaDoesNotOverdraw(t *testing.T) {
@@ -176,4 +177,30 @@ func TestTransferAffQuotaRejectsWalletOverflowAtomically(t *testing.T) {
 	require.NoError(t, DB.Select("quota", "aff_quota").First(&reloaded, user.Id).Error)
 	require.Equal(t, common.MaxWalletQuota, reloaded.Quota)
 	require.Equal(t, transferQuota, reloaded.AffQuota)
+}
+
+func TestCreditUserQuotaWithTxRejectsWalletOverflowAtomically(t *testing.T) {
+	truncateTables(t)
+
+	user := &User{
+		Id:       1007,
+		Username: "default-wallet-limit-user",
+		Quota:    common.MaxWalletQuota,
+		Status:   common.UserStatusEnabled,
+	}
+	require.NoError(t, DB.Create(user).Error)
+	require.NoError(t, DB.Create(&UserQuotaDebt{UserId: user.Id, Amount: 1}).Error)
+
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		_, err := CreditUserQuotaWithTx(tx, user.Id, 2)
+		return err
+	})
+
+	require.ErrorIs(t, err, errUserQuotaCreditLimitExceeded)
+	var reloaded User
+	require.NoError(t, DB.Select("quota").First(&reloaded, user.Id).Error)
+	require.Equal(t, common.MaxWalletQuota, reloaded.Quota)
+	debt, debtErr := GetUserQuotaDebt(user.Id)
+	require.NoError(t, debtErr)
+	require.EqualValues(t, 1, debt)
 }

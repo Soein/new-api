@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -65,6 +66,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 			other["usage_facts"] = snap.UsageFacts
 		}
 	}
+	appendTaskBillingUsageSchema(task, other)
 	appendTaskLogInfo(task, other)
 	attachQuotaSaturation(c, info, other)
 	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
@@ -156,6 +158,7 @@ func taskBillingOther(task *model.Task) map[string]interface{} {
 				other["usage_facts"] = snap.UsageFacts
 			}
 		}
+		appendTaskBillingUsageSchema(task, other)
 	}
 	props := task.Properties
 	if props.UpstreamModelName != "" && props.UpstreamModelName != props.OriginModelName {
@@ -164,6 +167,17 @@ func taskBillingOther(task *model.Task) map[string]interface{} {
 	}
 	appendTaskLogInfo(task, other)
 	return other
+}
+
+func appendTaskBillingUsageSchema(task *model.Task, other map[string]interface{}) {
+	if task == nil || other == nil || task.PrivateData.BillingContext == nil {
+		return
+	}
+	schema := jsplugin.CloneUsageSchema(task.PrivateData.BillingContext.UsageSchema)
+	if len(schema) == 0 {
+		return
+	}
+	other["billing_usage_schema"] = schema
 }
 
 func appendTaskLogInfo(task *model.Task, other map[string]interface{}) {

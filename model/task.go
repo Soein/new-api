@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
@@ -143,6 +144,8 @@ type TaskPluginSnapshot struct {
 	Author     *TaskPluginAuthorSnapshot `json:"author,omitempty"`
 	APIVersion int                       `json:"api_version"`
 	Generation uint64                    `json:"generation"`
+	Layer      string                    `json:"layer,omitempty"`
+	SourceHash string                    `json:"source_hash,omitempty"`
 }
 
 type TaskPluginAuthorSnapshot struct {
@@ -152,13 +155,14 @@ type TaskPluginAuthorSnapshot struct {
 
 // TaskBillingContext 记录任务提交时的计费参数，以便轮询阶段可以重新计算额度。
 type TaskBillingContext struct {
-	ModelPrice      float64                      `json:"model_price,omitempty"`       // 模型单价
-	GroupRatio      float64                      `json:"group_ratio,omitempty"`       // 分组倍率
-	ModelRatio      float64                      `json:"model_ratio,omitempty"`       // 模型倍率
-	OtherRatios     map[string]float64           `json:"other_ratios,omitempty"`      // 附加倍率（时长、分辨率等）
-	OriginModelName string                       `json:"origin_model_name,omitempty"` // 模型名称，必须为OriginModelName
-	PerCallBilling  bool                         `json:"per_call_billing,omitempty"`  // 按次计费：跳过轮询阶段的差额结算
-	TieredSnapshot  *billingexpr.BillingSnapshot `json:"tiered_snapshot,omitempty"`
+	ModelPrice      float64                              `json:"model_price,omitempty"`       // 模型单价
+	GroupRatio      float64                              `json:"group_ratio,omitempty"`       // 分组倍率
+	ModelRatio      float64                              `json:"model_ratio,omitempty"`       // 模型倍率
+	OtherRatios     map[string]float64                   `json:"other_ratios,omitempty"`      // 附加倍率（时长、分辨率等）
+	OriginModelName string                               `json:"origin_model_name,omitempty"` // 模型名称，必须为OriginModelName
+	PerCallBilling  bool                                 `json:"per_call_billing,omitempty"`  // 按次计费：跳过轮询阶段的差额结算
+	TieredSnapshot  *billingexpr.BillingSnapshot         `json:"tiered_snapshot,omitempty"`
+	UsageSchema     map[string]jsplugin.UsageFieldSchema `json:"usage_schema,omitempty"`
 }
 
 // GetUpstreamTaskID 获取上游真实 task ID（用于与 provider 通信）
@@ -432,6 +436,20 @@ func GetByTaskIdsForPlatforms(userID int, platforms []constant.TaskPlatform, tas
 	var tasks []*Task
 	err := DB.
 		Where("user_id = ? AND platform IN ? AND task_id IN ?", userID, platforms, taskIDs).
+		Find(&tasks).Error
+	if err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func GetByTaskIdsForUser(userID int, taskIDs []string) ([]*Task, error) {
+	if len(taskIDs) == 0 {
+		return nil, nil
+	}
+	var tasks []*Task
+	err := DB.
+		Where("user_id = ? AND task_id IN ?", userID, taskIDs).
 		Find(&tasks).Error
 	if err != nil {
 		return nil, err

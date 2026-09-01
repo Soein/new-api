@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -31,7 +34,7 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 	common.RedisEnabled = false
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.Channel{}, &model.User{}))
+	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.Channel{}, &model.User{}, &model.TaskPluginState{}, &model.TaskPlugin{}))
 	model.DB = database
 	t.Cleanup(func() {
 		model.DB = originalDB
@@ -110,6 +113,46 @@ func TestGetTaskArtifactsReturnsEmptyForLegacyTask(t *testing.T) {
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	assert.Equal(t, task.TaskID, response.TaskID)
 	assert.Empty(t, response.Artifacts)
+}
+
+func TestProjectTaskArtifactsUsesSubmittedPluginVersion(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	const key = "versioned-artifacts"
+	t.Cleanup(func() { _ = pluginruntime.DefaultRegistry.Unregister(key) })
+	pluginSource := func(version, artifactKey string) string {
+		return `
+export const meta = {apiVersion: 1, key: "` + key + `", name: "Artifacts", version: "` + version + `", author: {name: "Test"}, models: ["doc"], fetchMode: "per_task"};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+export function listArtifacts() { return [{key: "` + artifactKey + `", type: "file"}]; }
+export function buildContentRequest(ctx) { return {url: ctx.baseUrl + "/content", method: "GET"}; }
+`
+	}
+	v1Source := pluginSource("1.0.0", "v1-result")
+	v2Source := pluginSource("2.0.0", "v2-result")
+	v1Hash := fmt.Sprintf("%x", sha256.Sum256([]byte(v1Source)))
+	v2Hash := fmt.Sprintf("%x", sha256.Sum256([]byte(v2Source)))
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "1.0.0", Source: v1Source, SourceHash: v1Hash, Enabled: true,
+	}))
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: key, APIVersion: 1, Version: "2.0.0", Source: v2Source, SourceHash: v2Hash, Enabled: true,
+	}))
+	require.NoError(t, model.ActivateTaskPlugin(key, "2.0.0"))
+	_, err := pluginruntime.DefaultRegistry.Register(v2Source, pluginruntime.Options{Key: key, Version: "2.0.0"})
+	require.NoError(t, err)
+	task.Platform = constant.TaskPlatform(key)
+	task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: key, Version: "1.0.0", APIVersion: 1,
+		Layer: pluginruntime.PluginLayerOverride, SourceHash: v1Hash,
+	}}
+
+	artifacts, err := projectTaskArtifacts(task)
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, "v1-result", artifacts[0].Key)
 }
 
 func TestTaskArtifactAuthorizationKeepsForeignTasksHidden(t *testing.T) {

@@ -50,7 +50,7 @@ export function parseTaskResult(){return {status:"SUCCESS"};}
 
 func pinMappingOrderPlugin(t *testing.T, c *gin.Context, source string) {
 	t.Helper()
-	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	plugin, err := pluginruntime.NewRegistry().RegisterFactory(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
 }
@@ -111,7 +111,7 @@ func TestRelayTaskSubmitDoesNotApplyMappingTwice(t *testing.T) {
 }
 
 func TestRelayTaskSubmitEmptyOriginKeepsLateMapping(t *testing.T) {
-	plugin, err := pluginruntime.NewRegistry().Register(mappingOrderSubmitPlugin, pluginruntime.Options{})
+	plugin, err := pluginruntime.NewRegistry().RegisterFactory(mappingOrderSubmitPlugin, pluginruntime.Options{})
 	require.NoError(t, err)
 	synthesized := service.CoverTaskActionToModelName(constant.TaskPlatform(plugin.Meta.Key), "text_to_video")
 	c, info := newTaskSubmitContext(t, "pre-validate-upstream",

@@ -39,6 +39,28 @@ type batchPollingAdaptor struct {
 	results    map[string]*BatchTaskResult
 }
 
+type terminalPollingAdaptor struct {
+	taskPollingFetchAdaptor
+	adjustments int
+}
+
+func (a *terminalPollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
+	taskID, _ := body["task_id"].(string)
+	a.mu.Lock()
+	a.taskIDs = append(a.taskIDs, taskID)
+	a.mu.Unlock()
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"provider":"ok"}`))}, nil
+}
+
+func (a *terminalPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, nil
+}
+
+func (a *terminalPollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	a.adjustments++
+	return 0
+}
+
 func (a *batchPollingAdaptor) FetchMode() string { return "batch" }
 func (a *batchPollingAdaptor) FetchBatchTasks(_ string, _ string, taskIDs []string, _ string) (*http.Response, error) {
 	a.batchCalls++
@@ -245,6 +267,107 @@ func TestDispatchPlatformUpdateUsesFetchMode(t *testing.T) {
 	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return nil }
 	assert.NotPanics(t, func() { DispatchPlatformUpdate(context.Background(), "missing-plugin", taskChannels, tasks) })
 	GetTaskAdaptorFunc = previousFactory
+}
+
+func TestDispatchPlatformUpdateUsesEachTasksPinnedPluginVersion(t *testing.T) {
+	truncate(t)
+	const channelID = 110
+	seedTaskPollingChannel(t, channelID, true)
+	v1Task := seedPollingTask(t, channelID, "task_v1", "upstream_v1")
+	v1Task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: "versioned-poll", Version: "1.0.0", APIVersion: 1,
+	}}
+	v2Task := seedPollingTask(t, channelID, "task_v2", "upstream_v2")
+	v2Task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: "versioned-poll", Version: "2.0.0", APIVersion: 1,
+	}}
+
+	v1Adaptor := &taskPollingFetchAdaptor{}
+	v2Adaptor := &taskPollingFetchAdaptor{}
+	previousTaskFactory := GetTaskAdaptorForTaskFunc
+	GetTaskAdaptorForTaskFunc = func(task *model.Task) TaskPollingAdaptor {
+		if task.PrivateData.Execution.TaskPlugin.Version == "1.0.0" {
+			return v1Adaptor
+		}
+		return v2Adaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorForTaskFunc = previousTaskFactory })
+
+	DispatchPlatformUpdate(context.Background(), "versioned-poll", map[int][]string{
+		channelID: {v1Task.GetUpstreamTaskID(), v2Task.GetUpstreamTaskID()},
+	}, map[string]*model.Task{
+		v1Task.GetUpstreamTaskID(): v1Task,
+		v2Task.GetUpstreamTaskID(): v2Task,
+	})
+
+	assert.Equal(t, []string{v1Task.GetUpstreamTaskID()}, v1Adaptor.fetchedTaskIDs())
+	assert.Equal(t, []string{v2Task.GetUpstreamTaskID()}, v2Adaptor.fetchedTaskIDs())
+}
+
+func TestDispatchPlatformUpdateSeparatesSameVersionPluginSources(t *testing.T) {
+	truncate(t)
+	const channelID = 112
+	seedTaskPollingChannel(t, channelID, true)
+	factoryTask := seedPollingTask(t, channelID, "task_factory", "upstream_factory")
+	factoryTask.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: "same-version-poll", Version: "1.0.0", APIVersion: 1,
+		Layer: "factory", SourceHash: "factory-hash",
+	}}
+	overrideTask := seedPollingTask(t, channelID, "task_override", "upstream_override")
+	overrideTask.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: "same-version-poll", Version: "1.0.0", APIVersion: 1,
+		Layer: "override", SourceHash: "override-hash",
+	}}
+
+	factoryAdaptor := &taskPollingFetchAdaptor{}
+	overrideAdaptor := &taskPollingFetchAdaptor{}
+	previousTaskFactory := GetTaskAdaptorForTaskFunc
+	GetTaskAdaptorForTaskFunc = func(task *model.Task) TaskPollingAdaptor {
+		if task.PrivateData.Execution.TaskPlugin.Layer == "factory" {
+			return factoryAdaptor
+		}
+		return overrideAdaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorForTaskFunc = previousTaskFactory })
+
+	DispatchPlatformUpdate(context.Background(), "same-version-poll", map[int][]string{
+		channelID: {factoryTask.GetUpstreamTaskID(), overrideTask.GetUpstreamTaskID()},
+	}, map[string]*model.Task{
+		factoryTask.GetUpstreamTaskID():  factoryTask,
+		overrideTask.GetUpstreamTaskID(): overrideTask,
+	})
+
+	assert.Equal(t, []string{factoryTask.GetUpstreamTaskID()}, factoryAdaptor.fetchedTaskIDs())
+	assert.Equal(t, []string{overrideTask.GetUpstreamTaskID()}, overrideAdaptor.fetchedTaskIDs())
+}
+
+func TestDispatchPlatformUpdateSettlesWithSubmittedPluginVersion(t *testing.T) {
+	truncate(t)
+	const channelID = 111
+	seedTaskPollingChannel(t, channelID, true)
+	task := seedPollingTask(t, channelID, "task_settle_v1", "upstream_settle_v1")
+	task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+		Key: "versioned-settlement", Version: "1.0.0", APIVersion: 1,
+	}}
+
+	v1Adaptor := &terminalPollingAdaptor{}
+	v2Adaptor := &terminalPollingAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	previousTaskFactory := GetTaskAdaptorForTaskFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return v2Adaptor }
+	GetTaskAdaptorForTaskFunc = func(*model.Task) TaskPollingAdaptor { return v1Adaptor }
+	t.Cleanup(func() {
+		GetTaskAdaptorFunc = previousFactory
+		GetTaskAdaptorForTaskFunc = previousTaskFactory
+	})
+
+	DispatchPlatformUpdate(context.Background(), task.Platform, map[int][]string{
+		channelID: {task.GetUpstreamTaskID()},
+	}, map[string]*model.Task{task.GetUpstreamTaskID(): task})
+
+	assert.Equal(t, []string{task.GetUpstreamTaskID()}, v1Adaptor.fetchedTaskIDs())
+	assert.Equal(t, 1, v1Adaptor.adjustments)
+	assert.Zero(t, v2Adaptor.adjustments)
 }
 
 func TestUpdateBatchTasksSettlesTieredUsageForTerminalStates(t *testing.T) {

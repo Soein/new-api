@@ -20,6 +20,7 @@ For commercial licensing, please contact support@quantumnous.com
  * Type definitions for usage logs
  */
 import type { RequestRuleTrace } from '@/features/pricing/lib/billing-expr'
+import type { BillingUsageSchema } from '@/features/pricing/types'
 
 import type { UsageLog } from './data/schema'
 // ============================================================================
@@ -200,6 +201,7 @@ export interface LogOtherData {
   // settlement run.
   billing_mode?: string
   expr_b64?: string
+  billing_usage_schema?: BillingUsageSchema
   matched_tier?: string
   image_count?: number
   matched_request_rules?: Array<{

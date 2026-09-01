@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
+
 import { describe, test } from 'vitest'
 
 import {
@@ -25,6 +26,7 @@ import {
   normalizePluginSourceUrl,
   PluginSourceFetchError,
   pluginSourceByteLength,
+  readBoundedResponseText,
 } from '../lib/plugin-url'
 
 describe('plugin source URL normalization', () => {
@@ -219,5 +221,88 @@ describe('browser plugin source fetch', () => {
         stubResponse({ ok: true, body: 'x'.repeat(MAX_PLUGIN_SOURCE_BYTES) })
     )
     assert.equal(pluginSourceByteLength(text), MAX_PLUGIN_SOURCE_BYTES)
+  })
+
+  test('aborts and cancels chunked stream as soon as byte limit is exceeded', async () => {
+    let canceled = false
+    let chunksSent = 0
+    const chunk1 = new Uint8Array(500 * 1024).fill(120) // 500 KB
+    const chunk2 = new Uint8Array(600 * 1024).fill(120) // 600 KB (total > 1 MB)
+    const chunk3 = new Uint8Array(500 * 1024).fill(120) // should never be pulled
+
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (chunksSent === 0) {
+            chunksSent++
+            controller.enqueue(chunk1)
+          } else if (chunksSent === 1) {
+            chunksSent++
+            controller.enqueue(chunk2)
+          } else {
+            chunksSent++
+            controller.enqueue(chunk3)
+          }
+        },
+        cancel() {
+          canceled = true
+        },
+      },
+      new CountQueuingStrategy({ highWaterMark: 0 })
+    )
+
+    const response = new Response(stream, {
+      status: 200,
+      headers: { 'Transfer-Encoding': 'chunked' },
+    })
+
+    await assert.rejects(
+      fetchPluginSourceText(
+        'https://example.com/chunked.js',
+        async () => response
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof PluginSourceFetchError)
+        assert.equal(error.reason, 'too_large')
+        return true
+      }
+    )
+
+    assert.equal(canceled, true)
+    assert.equal(
+      chunksSent,
+      2,
+      'should not pull further chunks once limit exceeded'
+    )
+  })
+
+  test('accepts chunked stream that fits exactly within limit', async () => {
+    const half = MAX_PLUGIN_SOURCE_BYTES / 2
+    const chunk1 = new Uint8Array(half).fill(97) // 'a'
+    const chunk2 = new Uint8Array(half).fill(98) // 'b'
+    let chunksSent = 0
+
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunksSent === 0) {
+          chunksSent++
+          controller.enqueue(chunk1)
+        } else if (chunksSent === 1) {
+          chunksSent++
+          controller.enqueue(chunk2)
+        } else {
+          controller.close()
+        }
+      },
+    })
+
+    const response = new Response(stream, { status: 200 })
+    const text = await readBoundedResponseText(
+      response,
+      MAX_PLUGIN_SOURCE_BYTES
+    )
+    assert.equal(pluginSourceByteLength(text), MAX_PLUGIN_SOURCE_BYTES)
+    assert.equal(text.startsWith('a'), true)
+    assert.equal(text.endsWith('b'), true)
   })
 })

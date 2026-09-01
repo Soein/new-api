@@ -743,6 +743,7 @@ func TestProductionPluginNativeQueryTraversesInnerRouter(t *testing.T) {
 
 	kling, found := jsplugin.DefaultRegistry.Get("kling")
 	require.True(t, found)
+	klingFixture := *kling
 	authenticatedProductionHandlers := func(
 		generation *jsplugin.RoutingGeneration,
 		binding jsplugin.RouteBinding,
@@ -763,7 +764,8 @@ func TestProductionPluginNativeQueryTraversesInnerRouter(t *testing.T) {
 			production[6],
 		}
 	}
-	outer, registry := newPluginRouterTest(t, []*jsplugin.LoadedPlugin{kling}, authenticatedProductionHandlers)
+	outer, registry := newPluginRouterTest(t, []*jsplugin.LoadedPlugin{&klingFixture}, authenticatedProductionHandlers)
+	klingFixture.Layer = jsplugin.PluginLayerFactory
 	outer.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch)
 
 	request := httptest.NewRequest(http.MethodGet, "/kling/v1/videos/text2video/task_native_router", nil)

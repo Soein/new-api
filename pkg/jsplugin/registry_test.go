@@ -342,6 +342,76 @@ func TestRegistryDecodesAndValidatesUsageSchema(t *testing.T) {
 	})
 }
 
+func TestRegistryRejectsUsageSchemaThatWouldExpandWithoutBound(t *testing.T) {
+	t.Run("field count", func(t *testing.T) {
+		fields := make([]string, 17)
+		for index := range fields {
+			fields[index] = fmt.Sprintf("field_%d: {type: \"number\", unit: \"count\"}", index)
+		}
+		source := routingTestPluginSource(
+			"schema-fields-limit",
+			0,
+			`["model"]`,
+			`usageSchema: {`+strings.Join(fields, ",")+`},`,
+			"",
+		)
+
+		_, err := CompilePlugin(source, Options{})
+
+		require.ErrorContains(t, err, "usageSchema must not exceed 16 fields")
+	})
+
+	t.Run("enum value count", func(t *testing.T) {
+		values := make([]string, 17)
+		for index := range values {
+			values[index] = fmt.Sprintf("%q", fmt.Sprintf("value-%d", index))
+		}
+		source := routingTestPluginSource(
+			"schema-enum-limit",
+			0,
+			`["model"]`,
+			`usageSchema: {mode: {enum: [`+strings.Join(values, ",")+`]}},`,
+			"",
+		)
+
+		_, err := CompilePlugin(source, Options{})
+
+		require.ErrorContains(t, err, `usageSchema field "mode" enum must not exceed 16 values`)
+	})
+
+	t.Run("enum Cartesian product", func(t *testing.T) {
+		leftValues := make([]string, 16)
+		for index := range leftValues {
+			leftValues[index] = fmt.Sprintf("%q", fmt.Sprintf("left-%d", index))
+		}
+		rightValues := make([]string, 16)
+		for index := range rightValues {
+			rightValues[index] = fmt.Sprintf("%q", fmt.Sprintf("right-%d", index))
+		}
+		boundarySource := routingTestPluginSource(
+			"schema-combo-boundary",
+			0,
+			`["model"]`,
+			`usageSchema: {left: {enum: [`+strings.Join(leftValues, ",")+`]}, right: {enum: [`+strings.Join(rightValues, ",")+`]}},`,
+			"",
+		)
+		_, err := CompilePlugin(boundarySource, Options{})
+		require.NoError(t, err)
+
+		source := routingTestPluginSource(
+			"schema-combo-limit",
+			0,
+			`["model"]`,
+			`usageSchema: {left: {enum: [`+strings.Join(leftValues, ",")+`]}, right: {enum: [`+strings.Join(rightValues, ",")+`]}, variant: {enum: ["a", "b"]}},`,
+			"",
+		)
+
+		_, err = CompilePlugin(source, Options{})
+
+		require.ErrorContains(t, err, "usageSchema enum combinations must not exceed 256")
+	})
+}
+
 func TestRegistryValidatesUsageExamples(t *testing.T) {
 	tokenSchema := `usageSchema: {tokens: {type: "number", unit: "token"}, mode: {enum: ["std", "pro"]}},`
 	validExample := `{label: "std · 1 token", facts: {tokens: 1, mode: "std"}}`

@@ -35,7 +35,7 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 `
 
 func TestPrepareTaskPluginSubmitRejectsMissingModel(t *testing.T) {
-	_, err := jsplugin.DefaultRegistry.Register(genericTaskPluginSource, jsplugin.Options{})
+	_, err := registerUnpersistedTaskPlugin(genericTaskPluginSource, jsplugin.Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("generic-entry-test") })
 	recorder := httptest.NewRecorder()
@@ -94,6 +94,49 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 
 	assert.True(t, reachedSubmit)
 	assert.Equal(t, http.StatusNoContent, recorder.Code)
+}
+
+func TestPrepareTaskPluginRouteRejectsTombstonedOverrideBeforeDecode(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	source := `
+export const meta = {
+  apiVersion: 1, key: "route-stale-override", name: "Stale", version: "1.0.0",
+  author: {name: "Test"}, models: ["stale-model"], fetchMode: "per_task",
+  routes: [{method: "POST", path: "/vendor/stale", type: "submit", decode: "decode", render: "created"}],
+};
+export const native = {
+  decode: function() { throw new Error("stale decoder executed"); },
+  created: function(ctx, task) { return task; },
+};
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`
+	plugin := compileTaskRoutePlugin(t, source)
+	plugin.Layer = jsplugin.PluginLayerOverride
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: plugin.Meta.Key, APIVersion: plugin.Meta.APIVersion, Version: plugin.Meta.Version,
+		Source: source, SourceHash: plugin.SourceHash, Enabled: true,
+	}))
+	_, err := model.DeleteTaskPluginVersion(plugin.Meta.Key, plugin.Meta.Version)
+	require.NoError(t, err)
+
+	reached := false
+	router := gin.New()
+	router.POST("/vendor/stale", pinTaskPluginRoute(plugin, 0), PrepareTaskPluginRoute(), func(c *gin.Context) {
+		reached = true
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/vendor/stale", strings.NewReader(`{"model":"stale-model"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	assert.False(t, reached)
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), "stale decoder executed")
 }
 
 func TestPrepareTaskPluginNativeRouteRejectsMultipartBeforeDecoder(t *testing.T) {
@@ -455,7 +498,7 @@ func TestPrepareTaskPluginEndpointPinsGenerationBeforeParseAndDistribution(t *te
 		 ctx.requestBody.prompt = "plugin-local-mutation";
 		 return {model: ctx.model, action: "first-action", requestBody: {prompt: "normalized"}};`,
 	)
-	first, err := jsplugin.DefaultRegistry.Register(firstSource, jsplugin.Options{})
+	first, err := registerUnpersistedTaskPlugin(firstSource, jsplugin.Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
 
@@ -465,7 +508,7 @@ func TestPrepareTaskPluginEndpointPinsGenerationBeforeParseAndDistribution(t *te
 		"/v1/responses",
 		PinTaskPluginEndpoint(),
 		func(c *gin.Context) {
-			_, updateErr := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+			_, updateErr := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 				key,
 				"2.0.0",
 				`["claimed-model"]`,
@@ -512,9 +555,46 @@ func TestPrepareTaskPluginEndpointPinsGenerationBeforeParseAndDistribution(t *te
 	assert.Equal(t, http.StatusNoContent, recorder.Code)
 }
 
+func TestPrepareTaskPluginEndpointRejectsTombstonedOverrideBeforeDecode(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	const key = "endpoint-stale-override"
+	source := taskProtocolPluginSource(
+		key,
+		"1.0.0",
+		`["stale-model"]`,
+		"/v1/responses",
+		`throw new Error("stale protocol decoder executed");`,
+	)
+	plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
+	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+		Key: plugin.Meta.Key, APIVersion: plugin.Meta.APIVersion, Version: plugin.Meta.Version,
+		Source: source, SourceHash: plugin.SourceHash, Enabled: true,
+	}))
+	_, err = model.DeleteTaskPluginVersion(plugin.Meta.Key, plugin.Meta.Version)
+	require.NoError(t, err)
+
+	reached := false
+	router := gin.New()
+	router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+		reached = true
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"stale-model"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	assert.False(t, reached)
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), "stale protocol decoder executed")
+}
+
 func TestPrepareTaskPluginEndpointClientDisconnectDoesNotCancelParseHook(t *testing.T) {
 	const key = "endpoint-detached-parse-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,
@@ -558,7 +638,7 @@ func TestPrepareTaskPluginEndpointClientDisconnectDoesNotCancelParseHook(t *test
 
 func TestPrepareTaskPluginEndpointUsesStrictOriginalStreamFlag(t *testing.T) {
 	const key = "endpoint-stream-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,
@@ -612,7 +692,7 @@ func TestPrepareTaskPluginEndpointUsesStrictOriginalStreamFlag(t *testing.T) {
 
 func TestTaskPluginEndpointMissPreservesOrdinaryRequestBody(t *testing.T) {
 	const key = "endpoint-miss-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,
@@ -654,7 +734,7 @@ func TestTaskPluginEndpointMissPreservesOrdinaryRequestBody(t *testing.T) {
 func TestTaskPluginEndpointUsesOneCanonicalModelForDuplicateJSONKeys(t *testing.T) {
 	require.NoError(t, appI18n.Init())
 	const key = "endpoint-duplicate-model-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,
@@ -771,7 +851,7 @@ func TestTaskPluginEndpointOnlyPreservesConditionalMiddlewareSemantics(t *testin
 
 func TestPrepareTaskPluginEndpointRejectsModelDriftBeforeDistribution(t *testing.T) {
 	const key = "endpoint-drift-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,
@@ -813,7 +893,7 @@ func TestPrepareTaskPluginEndpointRejectsModelDriftBeforeDistribution(t *testing
 
 func TestPrepareTaskPluginEndpointAcceptsRegisteredVideoMultipartBody(t *testing.T) {
 	const key = "endpoint-multipart-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["video-model"]`,
@@ -858,7 +938,7 @@ func TestPrepareTaskPluginEndpointAcceptsRegisteredVideoMultipartBody(t *testing
 
 func TestVideoGenerationsIsNotClaimedByOpenAIVideoProtocol(t *testing.T) {
 	const key = "endpoint-video-gen-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["generation-model"]`,
@@ -995,6 +1075,181 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	assert.NotContains(t, keys, "quota")
 	assert.NotContains(t, keys, "private_data")
 	assert.NotContains(t, recorder.Body.String(), "secret")
+}
+
+func TestPrepareTaskPluginQueryRendersWithExactHistoricalOverride(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	const key = "route-historical-renderer"
+	source := func(version, marker string) string {
+		return fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: %q,
+  author: {name: "Test"}, models: ["history-model"], fetchMode: "per_task",
+  routes: [{method: "GET", path: "/vendor/history/:id", type: "query", taskIdParam: "id", render: "status"}],
+};
+export const native = {status: function() { return {renderer: %q}; }};
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`, key, key, version, marker)
+	}
+	v1Source := source("1.0.0", "v1")
+	v2Source := source("2.0.0", "v2")
+	v1 := compileTaskRoutePlugin(t, v1Source)
+	v2 := compileTaskRoutePlugin(t, v2Source)
+	v1.Layer = jsplugin.PluginLayerOverride
+	v2.Layer = jsplugin.PluginLayerOverride
+	for _, item := range []struct {
+		plugin *jsplugin.LoadedPlugin
+		source string
+	}{{v1, v1Source}, {v2, v2Source}} {
+		require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+			Key: item.plugin.Meta.Key, APIVersion: item.plugin.Meta.APIVersion, Version: item.plugin.Meta.Version,
+			Source: item.source, SourceHash: item.plugin.SourceHash, Enabled: true,
+		}))
+	}
+	require.NoError(t, model.ActivateTaskPlugin(key, v2.Meta.Version))
+	_, err := model.DeleteTaskPluginVersion(key, v1.Meta.Version)
+	require.NoError(t, err)
+	insertTaskPluginRouteTask(t, &model.Task{
+		TaskID: "historical-task", UserId: 7, Platform: constant.TaskPlatform(key), Status: model.TaskStatusSuccess,
+		PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+			Key: key, Version: v1.Meta.Version, APIVersion: v1.Meta.APIVersion,
+			Layer: jsplugin.PluginLayerOverride, SourceHash: v1.SourceHash,
+		}}},
+	})
+
+	router := gin.New()
+	router.GET("/vendor/history/:id", pinTaskPluginRoute(v2, 0), func(c *gin.Context) {
+		c.Set("id", 7)
+		c.Next()
+	}, PrepareTaskPluginRoute())
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/vendor/history/historical-task", nil))
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.JSONEq(t, `{"renderer":"v1"}`, recorder.Body.String())
+}
+
+func TestPrepareTaskPluginQueryRestoresSnapshotAfterLegacyPlatformRemoval(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	const key = "route-removed-legacy-platform"
+	source := func(version, marker, channelTypes string) string {
+		return fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: %q,
+  author: {name: "Test"}, %s models: ["history-model"], fetchMode: "per_task",
+  routes: [{method: "GET", path: "/vendor/legacy-history/:id", type: "query", taskIdParam: "id", render: "status"}],
+};
+export const native = {status: function() { return {renderer: %q}; }};
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`, key, key, version, channelTypes, marker)
+	}
+	v1Source := source("1.0.0", "v1", "channelTypes: [651],")
+	v2Source := source("2.0.0", "v2", "")
+	v1 := compileTaskRoutePlugin(t, v1Source)
+	v2 := compileTaskRoutePlugin(t, v2Source)
+	v1.Layer = jsplugin.PluginLayerOverride
+	v2.Layer = jsplugin.PluginLayerOverride
+	for _, item := range []struct {
+		plugin *jsplugin.LoadedPlugin
+		source string
+	}{{v1, v1Source}, {v2, v2Source}} {
+		require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+			Key: item.plugin.Meta.Key, APIVersion: item.plugin.Meta.APIVersion, Version: item.plugin.Meta.Version,
+			Source: item.source, SourceHash: item.plugin.SourceHash, Enabled: true,
+		}))
+	}
+	require.NoError(t, model.ActivateTaskPlugin(key, v2.Meta.Version))
+	_, err := model.DeleteTaskPluginVersion(key, v1.Meta.Version)
+	require.NoError(t, err)
+	insertTaskPluginRouteTask(t, &model.Task{
+		TaskID: "legacy-platform-task", UserId: 7, Platform: constant.TaskPlatform("651"), Status: model.TaskStatusSuccess,
+		PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+			Key: key, Version: v1.Meta.Version, APIVersion: v1.Meta.APIVersion,
+			Layer: jsplugin.PluginLayerOverride, SourceHash: v1.SourceHash,
+		}}},
+	})
+
+	router := gin.New()
+	router.GET("/vendor/legacy-history/:id", pinTaskPluginRoute(v2, 0), func(c *gin.Context) {
+		c.Set("id", 7)
+		c.Next()
+	}, PrepareTaskPluginRoute())
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/vendor/legacy-history/legacy-platform-task", nil))
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.JSONEq(t, `{"renderer":"v1"}`, recorder.Body.String())
+}
+
+func TestPrepareTaskPluginQueryRejectsMixedHistoricalSources(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	const key = "route-mixed-history"
+	source := func(version string) string {
+		return fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: %q,
+  author: {name: "Test"}, models: ["history-model"], fetchMode: "per_task",
+  routes: [{method: "POST", path: "/vendor/history", type: "dynamic", decode: "decode", render: "show"}],
+};
+export const native = {
+  decode: function() { return {kind: "query", taskIds: ["history-v1", "history-v2"]}; },
+  show: function() { return {renderer: %q}; },
+};
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`, key, key, version, version)
+	}
+	v1Source := source("1.0.0")
+	v2Source := source("2.0.0")
+	v1 := compileTaskRoutePlugin(t, v1Source)
+	v2 := compileTaskRoutePlugin(t, v2Source)
+	v1.Layer = jsplugin.PluginLayerOverride
+	v2.Layer = jsplugin.PluginLayerOverride
+	for _, item := range []struct {
+		plugin *jsplugin.LoadedPlugin
+		source string
+	}{{v1, v1Source}, {v2, v2Source}} {
+		require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+			Key: item.plugin.Meta.Key, APIVersion: item.plugin.Meta.APIVersion, Version: item.plugin.Meta.Version,
+			Source: item.source, SourceHash: item.plugin.SourceHash, Enabled: true,
+		}))
+	}
+	require.NoError(t, model.ActivateTaskPlugin(key, v2.Meta.Version))
+	for _, item := range []struct {
+		taskID string
+		plugin *jsplugin.LoadedPlugin
+	}{{"history-v1", v1}, {"history-v2", v2}} {
+		insertTaskPluginRouteTask(t, &model.Task{
+			TaskID: item.taskID, UserId: 7, Platform: constant.TaskPlatform(key), Status: model.TaskStatusSuccess,
+			PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+				Key: key, Version: item.plugin.Meta.Version, APIVersion: item.plugin.Meta.APIVersion,
+				Layer: jsplugin.PluginLayerOverride, SourceHash: item.plugin.SourceHash,
+			}}},
+		})
+	}
+
+	router := gin.New()
+	router.POST("/vendor/history", pinTaskPluginRoute(v2, 0), func(c *gin.Context) {
+		c.Set("id", 7)
+		c.Next()
+	}, PrepareTaskPluginRoute())
+	request := httptest.NewRequest(http.MethodPost, "/vendor/history", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 }
 
 func TestPrepareTaskPluginDynamicDecoderRejectsRendererField(t *testing.T) {
@@ -1388,7 +1643,7 @@ func TestTaskPluginErrorFallbackMessageIncludesRequestID(t *testing.T) {
 
 func TestPrepareTaskPluginEndpointSurfacesDecodeHookMessage(t *testing.T) {
 	const key = "endpoint-decode-detail-test"
-	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskProtocolPluginSource(
 		key,
 		"1.0.0",
 		`["claimed-model"]`,
@@ -1458,7 +1713,7 @@ func TestPinTaskPluginEndpointRejectsUnsupportedRequestForms(t *testing.T) {
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			_, err := jsplugin.DefaultRegistry.Register(taskResponsesPluginSource(
+			_, err := registerUnpersistedTaskPlugin(taskResponsesPluginSource(
 				testCase.key, 0, `["form-gate-model"]`, testCase.supports, testCase.hooks, `return {model: ctx.model};`,
 			), jsplugin.Options{})
 			require.NoError(t, err)
@@ -1496,7 +1751,7 @@ func TestPinTaskPluginEndpointRejectsUnsupportedRequestForms(t *testing.T) {
 
 func TestPinTaskPluginEndpointMalformedStreamStillFailsInPrepare(t *testing.T) {
 	const key = "form-gate-malformed-stream"
-	_, err := jsplugin.DefaultRegistry.Register(taskResponsesPluginSource(
+	_, err := registerUnpersistedTaskPlugin(taskResponsesPluginSource(
 		key, 0, `["form-gate-bool-model"]`, `["sync", "background"]`,
 		`renderFinal: function() { return {}; }`,
 		`return {model: ctx.model};`,
@@ -1521,14 +1776,14 @@ func TestPinTaskPluginEndpointMalformedStreamStillFailsInPrepare(t *testing.T) {
 }
 
 func TestPinTaskPluginEndpointMovesParserToSurvivingSharedCandidate(t *testing.T) {
-	streamOnly, err := jsplugin.DefaultRegistry.Register(taskResponsesPluginSource(
+	streamOnly, err := registerUnpersistedTaskPlugin(taskResponsesPluginSource(
 		"alpha-stream", constant.ChannelTypeReplicate, `["shared-form-model"]`, `["stream"]`,
 		`renderEvents: function() { return {events: [], done: false}; }`,
 		`return {model: ctx.model, action: "stream-parser"};`,
 	), jsplugin.Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister("alpha-stream")) })
-	full, err := jsplugin.DefaultRegistry.Register(taskResponsesPluginSource(
+	full, err := registerUnpersistedTaskPlugin(taskResponsesPluginSource(
 		"bravo-full", constant.ChannelTypeCodex, `["shared-form-model"]`, `["stream", "sync", "background"]`,
 		`renderEvents: function() { return {events: [], done: false}; }, renderFinal: function() { return {}; }`,
 		`return {model: ctx.model, action: "full-parser"};`,
@@ -1589,6 +1844,16 @@ func compileTaskRoutePlugin(t *testing.T, source string) *jsplugin.LoadedPlugin 
 	plugin, err := jsplugin.CompilePlugin(source, jsplugin.Options{})
 	require.NoError(t, err)
 	return plugin
+}
+
+func registerUnpersistedTaskPlugin(source string, options jsplugin.Options) (*jsplugin.LoadedPlugin, error) {
+	plugin, err := jsplugin.DefaultRegistry.Register(source, options)
+	if err == nil {
+		// Most middleware tests exercise request normalization and routing in
+		// isolation. Persisted override admission has dedicated DB-backed tests.
+		plugin.Layer = jsplugin.PluginLayerFactory
+	}
+	return plugin, err
 }
 
 func taskResponsesPluginSource(key string, channelType int, models, supports, hooks, parseRequestBody string) string {
@@ -1685,7 +1950,7 @@ func setupTaskPluginRouteDB(t *testing.T) {
 	previousType := common.MainDatabaseType()
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.TaskPluginState{}, &model.TaskPlugin{}, &model.Task{}))
 	model.DB = database
 	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 	t.Cleanup(func() {

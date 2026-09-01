@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	_ "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -44,6 +45,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/xunfei"
 	"github.com/QuantumNous/new-api/relay/channel/zhipu"
 	"github.com/QuantumNous/new-api/relay/channel/zhipu_4v"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -187,6 +189,41 @@ func TaskPlatformUnavailableError(platform constant.TaskPlatform) (string, strin
 
 func GetTaskAdaptor(platform constant.TaskPlatform) channel.TaskAdaptor {
 	plugin, ok := ResolveTaskPluginForPlatform(pluginruntime.DefaultRegistry.Generation(), platform)
+	if !ok || !taskPluginAdmittedForNewRequest(plugin) {
+		return nil
+	}
+	return jspluginadaptor.New(plugin)
+}
+
+// taskPluginAdmittedForNewRequest closes the cross-node registry sync window
+// for database overrides. The registry chooses code, but the authoritative DB
+// must still name that exact enabled source as active immediately before the
+// upstream attempt. Once admitted, durable tombstones protect an in-flight
+// request if an administrator deletes the version concurrently.
+func taskPluginAdmittedForNewRequest(plugin *pluginruntime.LoadedPlugin) bool {
+	return service.TaskPluginAdmittedForNewRequest(plugin)
+}
+
+// ResolveTaskPluginForTask restores the exact plugin source identity captured
+// when the task was submitted. The returned generation carries the persisted
+// generation number for diagnostics; historical execution uses the returned
+// immutable plugin object directly.
+func ResolveTaskPluginForTask(task *model.Task) (*pluginruntime.LoadedPlugin, *pluginruntime.RoutingGeneration, bool) {
+	if task == nil || task.PrivateData.Execution == nil || task.PrivateData.Execution.TaskPlugin == nil {
+		if task == nil {
+			return nil, nil, false
+		}
+		generation := pluginruntime.DefaultRegistry.Generation()
+		plugin, ok := ResolveTaskPluginForPlatform(generation, task.Platform)
+		return plugin, generation, ok && taskPluginAdmittedForNewRequest(plugin)
+	}
+	return service.ResolveExactTaskPluginForTask(task)
+}
+
+// GetTaskAdaptorForTask exposes the exact historical resolver through the
+// polling adaptor interface used by task settlement and artifact paths.
+func GetTaskAdaptorForTask(task *model.Task) channel.TaskAdaptor {
+	plugin, _, ok := ResolveTaskPluginForTask(task)
 	if !ok {
 		return nil
 	}
@@ -200,6 +237,9 @@ func getTaskAdaptorForRequest(c *gin.Context, platform constant.TaskPlatform) (c
 	if c != nil {
 		if value, exists := c.Get(pluginruntime.ContextKeyPinnedPlugin); exists {
 			if pinned, ok := value.(pluginruntime.PinnedPlugin); ok && pinned.Plugin != nil {
+				if !taskPluginAdmittedForNewRequest(pinned.Plugin) {
+					return platform, nil
+				}
 				platform = constant.TaskPlatform(pinned.Plugin.Meta.Key)
 				return platform, jspluginadaptor.New(pinned.Plugin)
 			}
@@ -207,6 +247,13 @@ func getTaskAdaptorForRequest(c *gin.Context, platform constant.TaskPlatform) (c
 		}
 		if value, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
 			if pinned, ok := value.(pluginruntime.PinnedEndpoint); ok && pinned.Plugin != nil {
+				if !taskPluginAdmittedForNewRequest(pinned.Plugin) {
+					return platform, nil
+				}
+				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{
+					Generation: pinned.Generation,
+					Plugin:     pinned.Plugin,
+				})
 				platform = constant.TaskPlatform(pinned.Plugin.Meta.Key)
 				return platform, jspluginadaptor.New(pinned.Plugin)
 			}
@@ -214,6 +261,13 @@ func getTaskAdaptorForRequest(c *gin.Context, platform constant.TaskPlatform) (c
 		}
 		if value, exists := c.Get(pluginruntime.ContextKeyPinnedRoute); exists {
 			if pinned, ok := value.(pluginruntime.PinnedRoute); ok && pinned.Plugin != nil {
+				if !taskPluginAdmittedForNewRequest(pinned.Plugin) {
+					return platform, nil
+				}
+				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{
+					Generation: pinned.Generation,
+					Plugin:     pinned.Plugin,
+				})
 				platform = constant.TaskPlatform(pinned.Plugin.Meta.Key)
 				return platform, jspluginadaptor.New(pinned.Plugin)
 			}
@@ -222,7 +276,7 @@ func getTaskAdaptorForRequest(c *gin.Context, platform constant.TaskPlatform) (c
 	}
 	generation := pluginruntime.DefaultRegistry.Generation()
 	plugin, ok := ResolveTaskPluginForPlatform(generation, platform)
-	if !ok {
+	if !ok || !taskPluginAdmittedForNewRequest(plugin) {
 		return platform, nil
 	}
 	if c != nil {

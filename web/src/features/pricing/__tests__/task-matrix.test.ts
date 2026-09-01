@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
+
 import { describe, test } from 'vitest'
 
 import { parseTaskTiersFromExpr } from '../lib/billing-expr'
@@ -25,7 +26,9 @@ import {
   createDefaultTaskVisualConfig,
   evaluateTaskVisualConfig,
   generateTaskExprFromConfig,
+  getTaskEnumCombinationCount,
   getTaskEnumCombinations,
+  MAX_TASK_ENUM_COMBINATIONS,
   taskMatrixRowLabel,
   taskMatrixToTiers,
   tryParseTaskMatrixConfig,
@@ -87,6 +90,44 @@ describe('task matrix enum combinations', () => {
 
   test('returns one empty combination for a number-only schema', () => {
     assert.deepEqual(getTaskEnumCombinations(numberOnlySchema), [{}])
+  })
+
+  test('computes exact limit correctly (256 combinations for 8 binary enums)', () => {
+    const exactSchema: BillingUsageSchema = {}
+    for (let i = 0; i < 8; i++) {
+      exactSchema[`f${i}`] = { enum: ['a', 'b'] }
+    }
+    assert.equal(
+      getTaskEnumCombinationCount(exactSchema),
+      MAX_TASK_ENUM_COMBINATIONS
+    )
+    const combinations = getTaskEnumCombinations(exactSchema)
+    assert.equal(combinations.length, MAX_TASK_ENUM_COMBINATIONS)
+  })
+
+  test('safely rejects over-limit combinations without materializing', () => {
+    const overLimitSchema: BillingUsageSchema = {}
+    for (let i = 0; i < 9; i++) {
+      overLimitSchema[`f${i}`] = { enum: ['a', 'b'] }
+    }
+    assert.equal(getTaskEnumCombinationCount(overLimitSchema), 512)
+    assert.deepEqual(getTaskEnumCombinations(overLimitSchema), [])
+    assert.equal(tryParseTaskMatrixConfig('1', overLimitSchema), null)
+  })
+
+  test('safely handles overflow-like dimensions with huge numbers of enums', () => {
+    const overflowSchema: BillingUsageSchema = {}
+    for (let i = 0; i < 20; i++) {
+      overflowSchema[`f${i}`] = {
+        enum: Array.from({ length: 50 }, (_, j) => `val_${j}`),
+      }
+    }
+    assert.equal(
+      getTaskEnumCombinationCount(overflowSchema),
+      Number.POSITIVE_INFINITY
+    )
+    assert.deepEqual(getTaskEnumCombinations(overflowSchema), [])
+    assert.equal(tryParseTaskMatrixConfig('1', overflowSchema), null)
   })
 })
 

@@ -30,9 +30,11 @@ func TaskExecutionSnapshotFromContext(ctx *gin.Context) *model.TaskExecutionSnap
 			}
 			meta := pinned.Plugin.Meta
 			snapshot.TaskPlugin = &model.TaskPluginSnapshot{
-				Key:     meta.Key,
-				Name:    meta.Name,
-				Version: meta.Version,
+				Key:        meta.Key,
+				Name:       meta.Name,
+				Version:    meta.Version,
+				Layer:      pinned.Plugin.Layer,
+				SourceHash: pinned.Plugin.SourceHash,
 				Author: &model.TaskPluginAuthorSnapshot{
 					Name: meta.Author.Name,
 					URL:  meta.Author.URL,
@@ -84,6 +86,8 @@ func AppendTaskPluginAuditInfo(other map[string]interface{}, snapshot *model.Tas
 		"version":     snapshot.Version,
 		"api_version": snapshot.APIVersion,
 		"generation":  snapshot.Generation,
+		"layer":       snapshot.Layer,
+		"source_hash": snapshot.SourceHash,
 	}
 }
 

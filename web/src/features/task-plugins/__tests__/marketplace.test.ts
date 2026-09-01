@@ -22,12 +22,25 @@ import { describe, test } from 'vitest'
 
 import {
   deriveInstallState,
+  fetchMarketplaceIndex,
   findMarketplaceVersion,
+  formatMarketplaceError,
   GITHUB_MARKETPLACE_INDEX_URL,
   indexHasIntegrityHashes,
   isDefaultMarketplaceSource,
   isStaleFactoryOverride,
   marketplaceBuiltInVersion,
+  MarketplaceIndexFetchError,
+  MAX_INDEX_PLUGINS,
+  MAX_MARKETPLACE_INDEX_BYTES,
+  MAX_PLUGIN_ALLOWED_HOSTS,
+  MAX_PLUGIN_AUTH_LENGTH,
+  MAX_PLUGIN_HOST_LENGTH,
+  MAX_PLUGIN_KEY_LENGTH,
+  MAX_PLUGIN_PATH_LENGTH,
+  MAX_PLUGIN_SHA256_LENGTH,
+  MAX_PLUGIN_VERSION_LENGTH,
+  MAX_PLUGIN_VERSIONS,
   parseMarketplaceIndex,
   resolveMarketplaceActionPolicy,
   resolvePluginSourceUrl,
@@ -582,6 +595,242 @@ describe('source integrity and trust labels', () => {
     assert.equal(
       isDefaultMarketplaceSource('https://mirror.example/index.json'),
       false
+    )
+  })
+})
+
+describe('marketplace index boundaries, security, and error contracts', () => {
+  test('rejects oversized plugin catalogs instead of silently slicing them', () => {
+    const rawPlugins = Array.from(
+      { length: MAX_INDEX_PLUGINS + 1 },
+      (_, i) => ({
+        key: `plugin-${i}`,
+        name: `Plugin ${i}`,
+        versions: [{ version: '1.0.0', path: `plugin-${i}.js` }],
+      })
+    )
+    assert.throws(
+      () =>
+        parseMarketplaceIndex({
+          indexVersion: 1,
+          name: 'Huge catalog',
+          plugins: rawPlugins,
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof MarketplaceIndexFetchError)
+        assert.equal(err.reason, 'oversized_catalog')
+        return true
+      }
+    )
+  })
+
+  test('skips plugins with oversized versions list instead of silently slicing', () => {
+    const rawVersions = Array.from(
+      { length: MAX_PLUGIN_VERSIONS + 1 },
+      (_, i) => ({
+        version: `1.${i}.0`,
+        path: `plugin-1.${i}.0.js`,
+      })
+    )
+    const index = parseMarketplaceIndex({
+      indexVersion: 1,
+      plugins: [
+        {
+          key: 'many-versions',
+          versions: rawVersions,
+        },
+        {
+          key: 'valid-plugin',
+          versions: [{ version: '1.0.0', path: 'valid.js' }],
+        },
+      ],
+    })
+    // 'many-versions' is skipped because its versions list exceeds MAX_PLUGIN_VERSIONS
+    assert.equal(index.plugins.length, 1)
+    assert.equal(index.plugins[0].key, 'valid-plugin')
+  })
+
+  test('rejects oversized key without truncation to prevent identity collisions', () => {
+    const prefix = 'k'.repeat(MAX_PLUGIN_KEY_LENGTH)
+    const key1 = `${prefix}-1`
+    const key2 = `${prefix}-2`
+    const index = parseMarketplaceIndex({
+      indexVersion: 1,
+      plugins: [
+        {
+          key: key1,
+          name: 'Plugin 1',
+          versions: [{ version: '1.0.0', path: 'p1.js' }],
+        },
+        {
+          key: key2,
+          name: 'Plugin 2',
+          versions: [{ version: '1.0.0', path: 'p2.js' }],
+        },
+        {
+          key: 'valid-key',
+          name: 'Plugin Valid',
+          versions: [{ version: '1.0.0', path: 'pv.js' }],
+        },
+      ],
+    })
+    // Both oversized keys are dropped; no collision occurs
+    assert.equal(index.plugins.length, 1)
+    assert.equal(index.plugins[0].key, 'valid-key')
+  })
+
+  test('skips versions with oversized security/identity fields while preserving valid versions', () => {
+    const hugeVersion = 'v'.repeat(MAX_PLUGIN_VERSION_LENGTH + 1)
+    const hugePath = 'p'.repeat(MAX_PLUGIN_PATH_LENGTH + 1)
+    const hugeSha = 's'.repeat(MAX_PLUGIN_SHA256_LENGTH + 1)
+    const hugeAuth = 'a'.repeat(MAX_PLUGIN_AUTH_LENGTH + 1)
+    const hugeHost = 'h'.repeat(MAX_PLUGIN_HOST_LENGTH + 1)
+
+    const index = parseMarketplaceIndex({
+      indexVersion: 1,
+      plugins: [
+        {
+          key: 'my-plugin',
+          name: 'n'.repeat(500), // Display name is safely bounded
+          description: 'd'.repeat(10000), // Display description is safely bounded
+          versions: [
+            { version: hugeVersion, path: 'p1.js' },
+            { version: '1.0.0', path: hugePath },
+            { version: '1.0.1', path: 'p3.js', sha256: hugeSha },
+            { version: '1.0.2', path: 'p4.js', auth: hugeAuth },
+            { version: '1.0.3', path: 'p5.js', allowedHosts: [hugeHost] },
+            {
+              version: '1.0.4',
+              path: 'p6.js',
+              allowedHosts: Array.from(
+                { length: MAX_PLUGIN_ALLOWED_HOSTS + 1 },
+                (_, i) => `host-${i}.com`
+              ),
+            },
+            { version: '1.0.5', path: 'valid/path.js', sha256: 'abc123' },
+          ],
+        },
+      ],
+    })
+    assert.equal(index.plugins.length, 1)
+    const plugin = index.plugins[0]
+    assert.equal(plugin.versions.length, 1)
+    assert.equal(plugin.versions[0].version, '1.0.5')
+    assert.equal(plugin.versions[0].path, 'valid/path.js')
+    assert.equal(plugin.versions[0].sha256, 'abc123')
+    assert.ok(plugin.name.length <= 256)
+    assert.ok((plugin.description as string).length <= 4096)
+  })
+
+  test('deduplicates duplicate plugin keys and duplicate version entries', () => {
+    const index = parseMarketplaceIndex({
+      indexVersion: 1,
+      plugins: [
+        {
+          key: 'doubao',
+          name: 'Doubao First',
+          versions: [
+            { version: '1.0.0', path: 'p1.js' },
+            { version: '1.0.0', path: 'p1-dup.js' },
+          ],
+        },
+        {
+          key: 'doubao',
+          name: 'Doubao Duplicate',
+          versions: [{ version: '2.0.0', path: 'p2.js' }],
+        },
+      ],
+    })
+    assert.equal(index.plugins.length, 1)
+    assert.equal(index.plugins[0].name, 'Doubao First')
+    assert.equal(index.plugins[0].versions.length, 1)
+    assert.equal(index.plugins[0].versions[0].path, 'p1.js')
+  })
+
+  test('fetchMarketplaceIndex rejects oversized chunked index bodies', async () => {
+    const chunk1 = new Uint8Array(MAX_MARKETPLACE_INDEX_BYTES).fill(120)
+    const chunk2 = new Uint8Array(1024).fill(120) // total > MAX_MARKETPLACE_INDEX_BYTES
+    let canceled = false
+
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(chunk1)
+        controller.enqueue(chunk2)
+      },
+      cancel() {
+        canceled = true
+      },
+    })
+
+    const response = new Response(stream, { status: 200 })
+    await assert.rejects(
+      fetchMarketplaceIndex(
+        'https://example.com/index.json',
+        async () => response
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof MarketplaceIndexFetchError)
+        assert.equal(err.reason, 'too_large')
+        return true
+      }
+    )
+    assert.equal(canceled, true)
+  })
+
+  test('formatMarketplaceError produces localized error messages for all failure reasons', () => {
+    const fakeT = (key: string, opts?: Record<string, unknown>) => {
+      if (opts?.status) return `HTTP_${opts.status}`
+      return `TRANSLATED_${key}`
+    }
+
+    assert.equal(
+      formatMarketplaceError(
+        new MarketplaceIndexFetchError('unreachable'),
+        fakeT
+      ),
+      'TRANSLATED_Network error or host unreachable'
+    )
+    assert.equal(
+      formatMarketplaceError(
+        new MarketplaceIndexFetchError('not_found', 404),
+        fakeT
+      ),
+      'HTTP_404'
+    )
+    assert.equal(
+      formatMarketplaceError(
+        new MarketplaceIndexFetchError('too_large'),
+        fakeT
+      ),
+      'TRANSLATED_Index payload exceeds size limit (2 MiB)'
+    )
+    assert.equal(
+      formatMarketplaceError(
+        new MarketplaceIndexFetchError('invalid_json'),
+        fakeT
+      ),
+      'TRANSLATED_Invalid JSON in index response'
+    )
+    assert.equal(
+      formatMarketplaceError(
+        new MarketplaceIndexFetchError('invalid_structure'),
+        fakeT
+      ),
+      'TRANSLATED_Index payload structure is invalid'
+    )
+    assert.equal(
+      formatMarketplaceError(
+        new MarketplaceIndexFetchError('unsupported_version'),
+        fakeT
+      ),
+      'TRANSLATED_Unsupported index version'
+    )
+    assert.equal(
+      formatMarketplaceError(
+        new MarketplaceIndexFetchError('oversized_catalog'),
+        fakeT
+      ),
+      'TRANSLATED_Index contains too many plugins (exceeds 500)'
     )
   })
 })

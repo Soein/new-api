@@ -63,6 +63,16 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		if pinned.Generation != nil {
 			generation = pinned.Generation.Number
 		}
+		if !service.TaskPluginAdmittedForNewRequest(pinned.Plugin) {
+			logger.LogWarn(
+				c,
+				"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=admission reason=inactive_source",
+				generation,
+				pinned.Plugin.Meta.Key,
+			)
+			abortTaskPluginRouteHostError(c, http.StatusServiceUnavailable, "")
+			return
+		}
 		logger.LogDebug(
 			c,
 			"task_plugin subsystem=route event=prepare_start generation=%d plugin=%q method=%q declared_type=%q",
@@ -513,6 +523,16 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 		}
 		if !ok || pinned.Generation == nil || pinned.Plugin == nil {
 			abortWithOpenAiMessage(c, http.StatusInternalServerError, "Task protocol request failed")
+			return
+		}
+		if !service.TaskPluginAdmittedForNewRequest(pinned.Plugin) {
+			logger.LogWarn(
+				c,
+				"task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=admission reason=inactive_source",
+				pinned.Generation.Number,
+				pinned.Plugin.Meta.Key,
+			)
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task protocol request failed")
 			return
 		}
 		logger.LogDebug(
@@ -1077,8 +1097,22 @@ func applyOriginTaskIntent(c *gin.Context, intent map[string]any, meta pluginrun
 		if !exist || task == nil {
 			return &originTaskIntentError{Code: "origin_task_not_found", Message: "origin task not found or not owned by you", StatusCode: http.StatusBadRequest}
 		}
-		if _, allowed := allowedPlatform[task.Platform]; !allowed {
-			return &originTaskIntentError{Code: "origin_task_platform_mismatch", Message: "origin task does not belong to this plugin", StatusCode: http.StatusBadRequest}
+		snapshot := (*model.TaskPluginSnapshot)(nil)
+		if task.PrivateData.Execution != nil {
+			snapshot = task.PrivateData.Execution.TaskPlugin
+		}
+		if snapshot == nil {
+			if _, allowed := allowedPlatform[task.Platform]; !allowed {
+				return &originTaskIntentError{Code: "origin_task_platform_mismatch", Message: "origin task does not belong to this plugin", StatusCode: http.StatusBadRequest}
+			}
+		} else {
+			if snapshot.Key != meta.Key {
+				return &originTaskIntentError{Code: "origin_task_platform_mismatch", Message: "origin task does not belong to this plugin", StatusCode: http.StatusBadRequest}
+			}
+			exactPlugin, _, resolved := service.ResolveExactTaskPluginForTask(task)
+			if !resolved || exactPlugin.Meta.Key != meta.Key {
+				return &originTaskIntentError{Code: "origin_task_platform_mismatch", Message: "origin task does not belong to this plugin", StatusCode: http.StatusBadRequest}
+			}
 		}
 		if channelID == 0 {
 			channelID = task.ChannelId
@@ -1141,7 +1175,11 @@ func renderTaskPluginQuery(
 	)
 	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
 	platforms := taskPluginLegacyPlatforms(pinned.Plugin.Meta)
-	tasks, err := model.GetByTaskIdsForPlatforms(userID, platforms, taskIDs)
+	legacyPlatforms := make(map[constant.TaskPlatform]struct{}, len(platforms))
+	for _, platform := range platforms {
+		legacyPlatforms[platform] = struct{}{}
+	}
+	tasks, err := model.GetByTaskIdsForUser(userID, taskIDs)
 	if err != nil {
 		logger.LogDebug(
 			c,
@@ -1166,6 +1204,12 @@ func renderTaskPluginQuery(
 		tasksByID[task.TaskID] = task
 	}
 	views := make([]map[string]any, 0, len(taskIDs))
+	rendererPlugin := (*pluginruntime.LoadedPlugin)(nil)
+	resolvedRenderer := ""
+	if len(taskIDs) == 0 {
+		rendererPlugin = pinned.Plugin
+		resolvedRenderer = renderer
+	}
 	for _, taskID := range taskIDs {
 		task := tasksByID[taskID]
 		if task == nil {
@@ -1178,6 +1222,71 @@ func renderTaskPluginQuery(
 				len(tasks),
 			)
 			abortTaskPluginRouteError(c, http.StatusNotFound)
+			return
+		}
+		snapshot := (*model.TaskPluginSnapshot)(nil)
+		if task.PrivateData.Execution != nil {
+			snapshot = task.PrivateData.Execution.TaskPlugin
+		}
+		if snapshot == nil {
+			if _, allowed := legacyPlatforms[task.Platform]; !allowed {
+				abortTaskPluginRouteError(c, http.StatusNotFound)
+				return
+			}
+		} else if snapshot.Key != pinned.Plugin.Meta.Key {
+			abortTaskPluginRouteError(c, http.StatusNotFound)
+			return
+		}
+		taskPlugin := pinned.Plugin
+		taskRenderer := renderer
+		if snapshot != nil {
+			exactPlugin, _, resolved := service.ResolveExactTaskPluginForTask(task)
+			if !resolved || exactPlugin.Meta.Key != pinned.Plugin.Meta.Key {
+				logger.LogWarn(
+					c,
+					"task_plugin subsystem=query event=render_rejected generation=%d plugin=%q reason=exact_source_unavailable task_id=%q",
+					generation,
+					pinned.Plugin.Meta.Key,
+					task.TaskID,
+				)
+				abortTaskPluginRouteHostError(c, http.StatusServiceUnavailable, "")
+				return
+			}
+			taskPlugin = exactPlugin
+			taskRenderer = ""
+			for _, historicalRoute := range exactPlugin.Meta.Routes {
+				if historicalRoute.Method == pinned.Route.Method && historicalRoute.Path == pinned.Route.Path && historicalRoute.Type == pinned.Route.Type {
+					taskRenderer = historicalRoute.Render
+					break
+				}
+			}
+			if taskRenderer == "" {
+				logger.LogWarn(
+					c,
+					"task_plugin subsystem=query event=render_rejected generation=%d plugin=%q reason=historical_route_unavailable task_id=%q",
+					generation,
+					pinned.Plugin.Meta.Key,
+					task.TaskID,
+				)
+				abortTaskPluginRouteHostError(c, http.StatusServiceUnavailable, "")
+				return
+			}
+		}
+		if rendererPlugin == nil {
+			rendererPlugin = taskPlugin
+			resolvedRenderer = taskRenderer
+		} else if rendererPlugin.Meta.Key != taskPlugin.Meta.Key ||
+			rendererPlugin.Meta.Version != taskPlugin.Meta.Version ||
+			rendererPlugin.Layer != taskPlugin.Layer ||
+			rendererPlugin.SourceHash != taskPlugin.SourceHash ||
+			resolvedRenderer != taskRenderer {
+			logger.LogWarn(
+				c,
+				"task_plugin subsystem=query event=render_rejected generation=%d plugin=%q reason=mixed_source_identity",
+				generation,
+				pinned.Plugin.Meta.Key,
+			)
+			abortTaskPluginRouteHostError(c, http.StatusServiceUnavailable, "")
 			return
 		}
 		view, viewErr := service.BuildTaskPluginView(task)
@@ -1202,15 +1311,19 @@ func renderTaskPluginQuery(
 	if !multiple {
 		rendererInput = views[0]
 	}
+	if rendererPlugin == nil || resolvedRenderer == "" {
+		abortTaskPluginRouteHostError(c, http.StatusServiceUnavailable, "")
+		return
+	}
 	renderStarted := time.Now()
-	result, err := pinned.Plugin.Engine.CallPath(c.Request.Context(), "native", []string{renderer}, requestContext.JSValue(), rendererInput)
+	result, err := rendererPlugin.Engine.CallPath(c.Request.Context(), "native", []string{resolvedRenderer}, requestContext.JSValue(), rendererInput)
 	if err != nil {
 		logger.LogDebug(
 			c,
 			"task_plugin subsystem=query event=render_failed generation=%d plugin=%q renderer=%q reason=hook_failed elapsed_ms=%d",
 			generation,
 			pinned.Plugin.Meta.Key,
-			renderer,
+			resolvedRenderer,
 			time.Since(renderStarted).Milliseconds(),
 		)
 		abortTaskPluginRouteError(c, http.StatusInternalServerError)
@@ -1221,7 +1334,7 @@ func renderTaskPluginQuery(
 		"task_plugin subsystem=query event=render_complete generation=%d plugin=%q renderer=%q task_count=%d elapsed_ms=%d",
 		generation,
 		pinned.Plugin.Meta.Key,
-		renderer,
+		resolvedRenderer,
 		len(views),
 		time.Since(renderStarted).Milliseconds(),
 	)
@@ -1293,6 +1406,20 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 
 func abortTaskPluginRouteError(c *gin.Context, status int) {
 	abortTaskPluginRouteErrorDetail(c, status, "")
+}
+
+func abortTaskPluginRouteHostError(c *gin.Context, status int, detail string) {
+	taskErr := sanitizedTaskPluginError(status, detail)
+	c.Abort()
+	message := taskErr.Message
+	if requestID := c.GetString(common.RequestIdKey); requestID != "" {
+		message = common.MessageWithRequestId(taskErr.Message, requestID)
+	}
+	c.JSON(taskErr.HTTPStatus, &dto.TaskError{
+		Code:       taskErr.Code,
+		Message:    message,
+		StatusCode: taskErr.HTTPStatus,
+	})
 }
 
 func abortTaskPluginRouteErrorDetail(c *gin.Context, status int, detail string) {

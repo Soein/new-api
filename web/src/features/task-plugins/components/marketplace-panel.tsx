@@ -36,9 +36,10 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { listMarketplaceSources, listTaskPlugins } from '../api'
 import {
   deriveInstallState,
+  fetchMarketplaceIndex,
+  formatMarketplaceError,
   indexHasIntegrityHashes,
   isDefaultMarketplaceSource,
-  parseMarketplaceIndex,
 } from '../lib/marketplace'
 import type { MarketplaceIndex, MarketplaceSource } from '../types'
 import {
@@ -75,16 +76,10 @@ export function MarketplacePanel() {
     enabled: Boolean(selectedSource),
     retry: false,
     queryFn: async (): Promise<MarketplaceIndex> => {
-      if (!selectedSource) throw new Error('marketplace source is not selected')
-      const response = await fetch(selectedSource.index_url)
-      if (!response.ok) {
-        throw new Error(
-          t('Index request failed with HTTP {{status}}', {
-            status: response.status,
-          })
-        )
+      if (!selectedSource) {
+        throw new Error(t('Marketplace source is not selected'))
       }
-      return parseMarketplaceIndex(await response.json())
+      return fetchMarketplaceIndex(selectedSource.index_url)
     },
   })
 
@@ -239,7 +234,7 @@ function MarketplaceSourceSection(props: MarketplaceSourceSectionProps) {
           <AlertDescription>
             {t(
               'The index could not be fetched or parsed: {{message}}. The host may block cross-origin requests.',
-              { message: props.error.message }
+              { message: formatMarketplaceError(props.error, t) }
             )}
           </AlertDescription>
         </Alert>

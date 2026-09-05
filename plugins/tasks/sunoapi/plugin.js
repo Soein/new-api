@@ -133,23 +133,19 @@ export function extractUsage(ctx) {
   return { clips: action === "lyrics" ? 1 : 2, action: action };
 }
 
-export function buildBatchQueryRequest(ctx, tasks) {
+export function buildBatchQueryRequest(ctx, taskIds) {
   return {
     url: ctx.baseUrl + "/suno/fetch",
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
-    body: {
-      ids: (tasks || []).map(function (task) {
-        return task.taskId;
-      }),
-    },
+    body: { ids: taskIds || [] },
   };
 }
 
 // Required v1 per-task hooks remain defined for contract compatibility. Suno's
 // host polling path uses the batch hooks below.
 export function buildQueryRequest(ctx) {
-  return buildBatchQueryRequest(ctx, [ctx]);
+  return buildBatchQueryRequest(ctx, [ctx.taskId]);
 }
 
 export function parseBatchResult(ctx, body) {

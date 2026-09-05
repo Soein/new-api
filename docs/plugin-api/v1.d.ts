@@ -41,7 +41,7 @@ export declare const protocols: {
 export declare function buildSubmitRequest(ctx: DriverContext): RequestDescriptor;
 export declare function parseSubmitResponse(ctx: DriverContext, response: UpstreamResponse): {taskId: string; taskData?: unknown; immediate?: NormalizedTaskResult; state?: unknown};
 export declare function buildQueryRequest(ctx: TaskQueryContext): RequestDescriptor;
-export declare function buildBatchQueryRequest(ctx: BatchQueryContext, tasks: readonly TaskQueryContext[]): RequestDescriptor;
+export declare function buildBatchQueryRequest(ctx: BatchQueryContext, taskIds: readonly string[]): RequestDescriptor;
 export declare function parseTaskResult(ctx: TaskQueryContext, body: unknown, response: HookHTTPResponse): NormalizedTaskResult;
 export declare function parseBatchResult(ctx: BatchQueryContext, body: unknown, response: HookHTTPResponse): readonly (NormalizedTaskResult & {taskId: string; data?: unknown; state?: unknown})[];
 export declare function extractUsage(ctx: DriverContext & {usagePurpose?: "facts" | "billing_ratios"}): Readonly<Record<string, string | number | boolean>> | null;

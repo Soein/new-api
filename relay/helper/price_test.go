@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -723,6 +724,78 @@ func TestModelPriceHelperHonorsCustomClaudeThinkingAlias(t *testing.T) {
 	assert.Empty(t, info.BillingModelName)
 	assert.Equal(t, "claude-3-7-sonnet-thinking", info.GetBillingModelName())
 	assert.Equal(t, 3.0, priceData.ModelRatio)
+}
+
+func TestModelPriceHelperResponsesToolPricesFollowFrozenBillingIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	savedRatios := ratio_setting.ModelRatio2JSONString()
+	savedGroups := ratio_setting.GroupRatio2JSONString()
+	var savedTools string
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		if key == operation_setting.ToolPriceOptionKey {
+			savedTools = value
+		}
+		return nil
+	}))
+	savedPreConsume := common.PreConsumedQuota
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroups))
+		operation_setting.LoadToolPricesFromJSONString(savedTools)
+		common.PreConsumedQuota = savedPreConsume
+	})
+	common.PreConsumedQuota = 0
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{
+		"qwen3-max@effort:high@thinking:on":4,
+		"claude-3-7-sonnet-thinking":4,
+		"claude-3-7-sonnet@thinking:on":8
+	}`))
+
+	for _, tc := range []struct {
+		name, model, billingModel string
+		imagePrice, functionPrice float64
+	}{
+		{"canonical", "qwen3-max@effort:high@thinking:on", "qwen3-max@effort:high@thinking:on", 900, 17},
+		{"reordered modifiers", "qwen3-max@thinking:on@effort:high@temperature:0.2", "qwen3-max@effort:high@thinking:on", 900, 17},
+		{"explicit legacy override", "claude-3-7-sonnet-thinking", "claude-3-7-sonnet-thinking", 700, 19},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			operation_setting.LoadToolPricesFromJSONString(`{
+				"image_generation":150,
+				"image_generation:qwen3-max@effort:high@thinking:on*":900,
+				"lookup_customer:qwen3-max@effort:high@thinking:on*":17,
+				"image_generation:claude-3-7-sonnet-thinking*":700,
+				"lookup_customer:claude-3-7-sonnet-thinking*":19,
+				"image_generation:claude-3-7-sonnet@thinking:on*":800
+			}`)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			ctx.Set(string(constant.ContextKeyOriginalModel), tc.model)
+			ctx.Set(string(constant.ContextKeyUserGroup), "default")
+			ctx.Set(string(constant.ContextKeyUsingGroup), "default")
+			request := &dto.OpenAIResponsesRequest{
+				Model: tc.model,
+				Tools: []byte(`[{"type":"image_generation"},{"type":"function","name":"lookup_customer"}]`),
+			}
+			info := relaycommon.GenRelayInfoResponses(ctx, request)
+			// A configuration update between parsing and pre-consume must not
+			// replace the request's original model-specific tool prices.
+			operation_setting.LoadToolPricesFromJSONString(`{"image_generation":1,"lookup_customer":2}`)
+
+			price, err := ModelPriceHelper(ctx, info, 1, &types.TokenCountMeta{MaxTokens: 1})
+			require.NoError(t, err)
+			assert.Equal(t, tc.billingModel, info.GetBillingModelName())
+			assert.Equal(t, tc.model, info.GetOriginModelName())
+			assert.Equal(t, tc.imagePrice, info.GetToolPrice(dto.BuildInToolImageGeneration))
+			assert.Equal(t, tc.functionPrice, info.GetToolPrice("lookup_customer"))
+			assert.Equal(t, 8+common.QuotaFromFloat(tc.imagePrice/1000*common.QuotaPerUnit), price.QuotaToPreConsume)
+
+			operation_setting.LoadToolPricesFromJSONString(`{"image_generation":3,"lookup_customer":4}`)
+			assert.Equal(t, tc.imagePrice, info.GetToolPrice(dto.BuildInToolImageGeneration))
+			assert.Equal(t, tc.functionPrice, info.GetToolPrice("lookup_customer"))
+		})
+	}
 }
 
 func TestModelPriceHelperCanonicalBillingLadder(t *testing.T) {

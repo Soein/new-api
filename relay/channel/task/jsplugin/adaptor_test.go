@@ -1218,7 +1218,7 @@ export function buildSubmitRequest(ctx) { return { url: ctx.baseUrl + "/submit",
 export function parseSubmitResponse(ctx, resp) { return { taskId: resp.body.id }; }
 export function buildQueryRequest(ctx) { return { url: ctx.baseUrl + "/tasks/" + ctx.taskId }; }
 export function parseTaskResult(ctx, body) { return { taskId: body.id, status: "SUCCESS" }; }
-export function buildBatchQueryRequest(ctx, tasks) { return { url: ctx.baseUrl + "/batch", method: "POST", headers: { "X-Plugin": "batch" }, body: { ids: (tasks || []).map(function (task) { return task.taskId; }) } }; }
+export function buildBatchQueryRequest(ctx, taskIds) { return { url: ctx.baseUrl + "/batch", method: "POST", headers: { "X-Plugin": "batch" }, body: { ids: taskIds } }; }
 export function parseBatchResult(ctx, body) {
   return body.items.map(function (item) {
     return { taskId: item.id, action: item.action, status: item.status, progress: item.progress, url: (item.urls || [])[0] || "", finishTime: item.finish || 0, data: item };
@@ -1497,12 +1497,12 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	assert.JSONEq(t, `{"req_key":"from-submit"}`, string(parsed.PluginState))
 }
 
-func TestTaskAdaptorBatchQueryReceivesTaskObjects(t *testing.T) {
+func TestTaskAdaptorBatchHooksPreserveTaskContexts(t *testing.T) {
 	service.InitHttpClient()
 	var captured map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.NoError(t, common.DecodeJson(r.Body, &captured))
-		_, _ = w.Write([]byte(`{"items":[]}`))
+		_, _ = w.Write([]byte(`{"items":[{"id":"task-b","units":11},{"id":"task-a","units":7}]}`))
 	}))
 	defer server.Close()
 
@@ -1512,26 +1512,51 @@ export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit"}}
 export function parseSubmitResponse(){return {taskId:"1"}}
 export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/q"}}
 export function parseTaskResult(){return {status:"SUCCESS"}}
-export function buildBatchQueryRequest(ctx, tasks){
+export function buildBatchQueryRequest(ctx, taskIds){
+  const tasks = ctx.tasks;
   return {url:ctx.baseUrl+"/batch",method:"POST",body:{
-    ids: (tasks||[]).map(function(task){return task.taskId;}),
+    ids: taskIds,
     models: (tasks||[]).map(function(task){return task.model;}),
+    states: (tasks||[]).map(function(task){return task.state;}),
+    data: (tasks||[]).map(function(task){return task.data;}),
     hasRequestBody: (tasks||[]).some(function(task){return Object.prototype.hasOwnProperty.call(task,"requestBody");})
   }};
 }
-export function parseBatchResult(){return [];}
+export function parseBatchResult(ctx, body){
+  return body.items.map(function(item){
+    const task = ctx.tasks.find(function(task){return task.taskId === item.id;});
+    return {taskId:item.id,status:"SUCCESS",progress:task.data.progress,state:task.state,data:item};
+  });
+}
+export function extractUsageOnComplete(task, result, body){
+  return {upstreamUnits:task.state.units + task.data.units + body.units};
+}
 `
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	tasks := []*model.Task{
-		{Properties: model.Properties{OriginModelName: "model-a"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-a"}},
-		{Properties: model.Properties{OriginModelName: "model-b"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-b"}},
+		{Properties: model.Properties{OriginModelName: "model-a"}, Data: []byte(`{"units":3,"progress":"90%"}`), PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-a", PluginState: []byte(`{"units":2}`)}},
+		{Properties: model.Properties{OriginModelName: "model-b"}, Data: []byte(`{"units":5,"progress":"95%"}`), PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-b", PluginState: []byte(`{"units":4}`)}},
 	}
 	resp, err := adaptor.FetchBatchTasks(server.URL, "secret", tasks, "")
+	require.NoError(t, err)
+	payload, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, []any{"task-a", "task-b"}, captured["ids"])
 	assert.Equal(t, []any{"model-a", "model-b"}, captured["models"])
+	assert.Equal(t, []any{map[string]any{"units": float64(2)}, map[string]any{"units": float64(4)}}, captured["states"])
+	assert.Equal(t, []any{map[string]any{"units": float64(3), "progress": "90%"}, map[string]any{"units": float64(5), "progress": "95%"}}, captured["data"])
 	assert.Equal(t, false, captured["hasRequestBody"])
+	results, err := adaptor.ParseBatchResult(tasks, resp, payload)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	for i, id := range []string{"task-a", "task-b"} {
+		result := results[id]
+		require.NotNil(t, result)
+		assert.Equal(t, []string{"90%", "95%"}[i], result.TaskInfo.Progress)
+		assert.JSONEq(t, string(tasks[i].PrivateData.PluginState), string(result.TaskInfo.PluginState))
+		assert.EqualValues(t, []int{12, 20}[i], result.TaskInfo.UsageFacts["upstreamUnits"])
+	}
 }

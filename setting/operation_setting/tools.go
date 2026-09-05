@@ -75,12 +75,14 @@ type prefixEntry struct {
 	price  float64
 }
 
-type toolPriceIndex struct {
+// ToolPriceSnapshot is an immutable tool-price index, safe for concurrent reads.
+// It retains its configuration even after administrators update tool prices.
+type ToolPriceSnapshot struct {
 	defaults map[string]float64
 	prefixes map[string][]prefixEntry
 }
 
-var currentIndex atomic.Pointer[toolPriceIndex]
+var currentIndex atomic.Pointer[ToolPriceSnapshot]
 
 func isValidToolPrice(price float64) bool {
 	return price >= 0 && !math.IsNaN(price) && !math.IsInf(price, 0)
@@ -156,7 +158,7 @@ func RebuildToolPriceIndex() {
 		merged[k] = v
 	}
 
-	idx := &toolPriceIndex{
+	idx := &ToolPriceSnapshot{
 		defaults: make(map[string]float64),
 		prefixes: make(map[string][]prefixEntry),
 	}
@@ -190,15 +192,26 @@ func RebuildToolPriceIndex() {
 // GetToolPriceForModel returns the price ($/1K calls) for a tool given a model name.
 // Lookup: longest prefix match → tool default → 0.
 func GetToolPriceForModel(toolName, modelName string) float64 {
+	return SnapshotToolPrices().GetToolPriceForModel(toolName, modelName)
+}
+
+// SnapshotToolPrices freezes the current price index for a request. The returned
+// snapshot supports concurrent lookups with a billing identity resolved later.
+func SnapshotToolPrices() *ToolPriceSnapshot {
 	idx := currentIndex.Load()
 	if idx == nil {
 		RebuildToolPriceIndex()
 		idx = currentIndex.Load()
-		if idx == nil {
-			return 0
-		}
 	}
+	return idx
+}
 
+// GetToolPriceForModel returns the frozen price in USD per 1,000 calls, using
+// the longest matching model prefix, then the tool default, or zero if absent.
+func (idx *ToolPriceSnapshot) GetToolPriceForModel(toolName, modelName string) float64 {
+	if idx == nil {
+		return 0
+	}
 	if entries, ok := idx.prefixes[toolName]; ok && modelName != "" {
 		for _, e := range entries {
 			if strings.HasPrefix(modelName, e.prefix) {

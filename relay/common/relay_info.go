@@ -60,28 +60,17 @@ type ResponsesUsageInfo struct {
 	BuiltInTools map[string]*BuildInToolInfo
 }
 
-func (info *RelayInfo) snapshotKnownToolPrices() {
-	for name := range reservedBillableToolNames {
-		info.GetToolPrice(name)
-	}
-}
-
-// GetToolPrice returns the tool price frozen for this request. The first
-// lookup snapshots the current model-specific price so pre-consume and
-// settlement cannot observe different admin configurations.
+// GetToolPrice uses the request's frozen price index and effective billing
+// identity. Resolving model modifiers must not retain a raw-model fallback
+// price or observe a subsequent administrator price update.
 func (info *RelayInfo) GetToolPrice(name string) float64 {
 	if info == nil || name == "" {
 		return 0
 	}
-	if price, ok := info.ToolPriceSnapshot[name]; ok {
-		return price
-	}
-	price := operation_setting.GetToolPriceForModel(name, info.GetBillingModelName())
 	if info.ToolPriceSnapshot == nil {
-		info.ToolPriceSnapshot = make(map[string]float64)
+		info.ToolPriceSnapshot = operation_setting.SnapshotToolPrices()
 	}
-	info.ToolPriceSnapshot[name] = price
-	return price
+	return info.ToolPriceSnapshot.GetToolPriceForModel(name, info.GetBillingModelName())
 }
 
 type ChannelMeta struct {
@@ -204,7 +193,7 @@ type RelayInfo struct {
 	// and again before settlement. Non-nil only when billing mode is "tiered_expr".
 	TieredBillingSnapshot *billingexpr.BillingSnapshot
 	BillingRequestInput   *billingexpr.RequestInput
-	ToolPriceSnapshot     map[string]float64
+	ToolPriceSnapshot     *operation_setting.ToolPriceSnapshot
 	// ImageBillingCount is the validated image quantity used by fixed-price
 	// and expression billing. It starts from the request and may be replaced
 	// with a trusted upstream response count before settlement.
@@ -460,28 +449,6 @@ func GenRelayInfoClaude(c *gin.Context, request dto.Request) *RelayInfo {
 	info := genBaseRelayInfo(c, request)
 	info.RelayFormat = types.RelayFormatClaude
 	info.ShouldIncludeUsage = false
-	if claudeRequest, ok := request.(*dto.ClaudeRequest); ok {
-		for _, rawTool := range claudeRequest.GetTools() {
-			var name string
-			switch tool := rawTool.(type) {
-			case map[string]any:
-				name = common.Interface2String(tool["name"])
-			case dto.Tool:
-				name = tool.Name
-			case *dto.Tool:
-				if tool != nil {
-					name = tool.Name
-				}
-			case dto.ClaudeWebSearchTool:
-				name = tool.Name
-			case *dto.ClaudeWebSearchTool:
-				if tool != nil {
-					name = tool.Name
-				}
-			}
-			info.GetToolPrice(name)
-		}
-	}
 	info.ClaudeConvertInfo = &ClaudeConvertInfo{
 		LastMessagesType: LastMessageTypeNone,
 	}
@@ -523,7 +490,6 @@ func GenRelayInfoResponses(c *gin.Context, request *dto.OpenAIResponsesRequest) 
 	if len(request.Tools) > 0 {
 		for _, tool := range request.GetToolsMap() {
 			toolType := common.Interface2String(tool["type"])
-			info.GetToolPrice(toolType)
 			info.ResponsesUsageInfo.BuiltInTools[toolType] = &BuildInToolInfo{
 				ToolName:  toolType,
 				CallCount: 0,
@@ -538,10 +504,6 @@ func GenRelayInfoResponses(c *gin.Context, request *dto.OpenAIResponsesRequest) 
 			case dto.BuildInToolImageGeneration:
 				info.ResponsesUsageInfo.BuiltInTools[toolType].ImageGenerationQuality = common.Interface2String(tool["quality"])
 				info.ResponsesUsageInfo.BuiltInTools[toolType].ImageGenerationSize = common.Interface2String(tool["size"])
-			case "function":
-				if functionName := common.Interface2String(tool["name"]); functionName != "" {
-					info.GetToolPrice(functionName)
-				}
 			}
 		}
 	}
@@ -565,19 +527,6 @@ func GenRelayInfoImage(c *gin.Context, request dto.Request) *RelayInfo {
 func GenRelayInfoOpenAI(c *gin.Context, request dto.Request) *RelayInfo {
 	info := genBaseRelayInfo(c, request)
 	info.RelayFormat = types.RelayFormatOpenAI
-	if openAIRequest, ok := request.(*dto.GeneralOpenAIRequest); ok {
-		for _, tool := range openAIRequest.Tools {
-			info.GetToolPrice(tool.Function.Name)
-		}
-		if len(openAIRequest.Functions) > 0 {
-			var functions []dto.FunctionRequest
-			if err := common.Unmarshal(openAIRequest.Functions, &functions); err == nil {
-				for _, function := range functions {
-					info.GetToolPrice(function.Name)
-				}
-			}
-		}
-	}
 	return info
 }
 
@@ -682,7 +631,7 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 			estimatePromptTokens: common.GetContextKeyInt(c, constant.ContextKeyEstimatedTokens),
 		},
 	}
-	info.snapshotKnownToolPrices()
+	info.ToolPriceSnapshot = operation_setting.SnapshotToolPrices()
 
 	if info.RelayMode == relayconstant.RelayModeUnknown {
 		info.RelayMode = c.GetInt("relay_mode")

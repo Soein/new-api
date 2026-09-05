@@ -521,18 +521,22 @@ func (a *TaskAdaptor) FetchMode() string      { return a.plugin.Meta.FetchMode }
 
 func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
 	taskContexts := make([]map[string]any, 0, len(tasks))
+	taskIDs := make([]string, 0, len(tasks))
 	for _, task := range tasks {
 		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
 		if err != nil {
 			return nil, err
 		}
 		taskContexts = append(taskContexts, taskCtx)
+		taskIDs = append(taskIDs, common.Interface2String(taskCtx["taskId"]))
 	}
 	ctx, err := a.batchQueryContext(key, baseURL, proxy, taskContexts)
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "buildBatchQueryRequest", ctx, taskContexts)
+	// Keep the v1 ID-array argument compatible with persisted plugin sources;
+	// richer per-task polling state is available through ctx.tasks.
+	value, err := a.plugin.Engine.Call(context.Background(), "buildBatchQueryRequest", ctx, taskIDs)
 	if err != nil {
 		return nil, err
 	}

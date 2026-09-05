@@ -62,11 +62,12 @@ type BatchTaskResult struct {
 
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
+// 每次调用必须返回独立实例，避免并发渠道共享 Init 写入的上下文。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
 // GetTaskAdaptorForTaskFunc resolves the immutable plugin version captured at
 // task submission. Plugin-backed tasks fail closed when this resolver cannot
-// restore that exact version.
+// restore that exact version. Each call must return an independent adaptor.
 var GetTaskAdaptorForTaskFunc func(task *model.Task) TaskPollingAdaptor
 
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
@@ -254,14 +255,19 @@ func DispatchPlatformUpdate(ctx context.Context, platform constant.TaskPlatform,
 	sort.Strings(identities)
 	for _, identity := range identities {
 		group := groups[identity]
-		var adaptor TaskPollingAdaptor
-		if group.representative != nil && group.representative.PrivateData.Execution != nil && group.representative.PrivateData.Execution.TaskPlugin != nil {
-			if GetTaskAdaptorForTaskFunc != nil {
-				adaptor = GetTaskAdaptorForTaskFunc(group.representative)
+		newAdaptor := func() TaskPollingAdaptor {
+			if group.representative != nil && group.representative.PrivateData.Execution != nil && group.representative.PrivateData.Execution.TaskPlugin != nil {
+				if GetTaskAdaptorForTaskFunc != nil {
+					return GetTaskAdaptorForTaskFunc(group.representative)
+				}
+				return nil
 			}
-		} else if GetTaskAdaptorFunc != nil {
-			adaptor = GetTaskAdaptorFunc(platform)
+			if GetTaskAdaptorFunc != nil {
+				return GetTaskAdaptorFunc(platform)
+			}
+			return nil
 		}
+		adaptor := newAdaptor()
 		if adaptor == nil {
 			logger.LogError(ctx, fmt.Sprintf("Task polling adaptor unavailable for %s", identity))
 			continue
@@ -272,7 +278,7 @@ func DispatchPlatformUpdate(ctx context.Context, platform constant.TaskPlatform,
 			}
 			continue
 		}
-		if err := updateVideoTasksWithAdaptor(ctx, adaptor, group.channelTasks, group.tasks); err != nil {
+		if err := updateVideoTasksWithAdaptorFactory(ctx, newAdaptor, group.channelTasks, group.tasks); err != nil {
 			common.SysLog(fmt.Sprintf("UpdateVideoTasks fail: %s", err))
 		}
 	}
@@ -331,7 +337,10 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		}
 	}
 	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelBaseUrl: baseURL}
+	info.ChannelMeta = &relaycommon.ChannelMeta{
+		ChannelBaseUrl: baseURL,
+		ChannelSetting: ch.GetSetting(),
+	}
 	info.ApiKey = ch.Key
 	adaptor.Init(info)
 	resp, err := adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
@@ -442,41 +451,12 @@ func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskC
 	if GetTaskAdaptorFunc == nil {
 		return fmt.Errorf("video adaptor factory not configured")
 	}
-	channelIDs := make([]int, 0, len(taskChannelM))
-	for channelID := range taskChannelM {
-		channelIDs = append(channelIDs, channelID)
-	}
-	sort.Ints(channelIDs)
-
-	var wg sync.WaitGroup
-	for _, channelId := range channelIDs {
-		taskIds := taskChannelM[channelId]
-		if len(taskIds) == 0 {
-			continue
-		}
-		taskIds = append([]string(nil), taskIds...)
-
-		wg.Add(1)
-		gopool.Go(func() {
-			defer wg.Done()
-			adaptor := GetTaskAdaptorFunc(platform)
-			if adaptor == nil {
-				logger.LogError(ctx, fmt.Sprintf("Task polling adaptor unavailable for %s", platform))
-				return
-			}
-			if err := updateVideoTasks(ctx, adaptor, channelId, taskIds, taskM); err != nil {
-				logger.LogError(ctx, fmt.Sprintf("Channel #%d failed to update video async tasks: %s", channelId, err.Error()))
-			}
-		})
-	}
-	wg.Wait()
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return nil
+	return updateVideoTasksWithAdaptorFactory(ctx, func() TaskPollingAdaptor {
+		return GetTaskAdaptorFunc(platform)
+	}, taskChannelM, taskM)
 }
 
-func updateVideoTasksWithAdaptor(ctx context.Context, adaptor TaskPollingAdaptor, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
+func updateVideoTasksWithAdaptorFactory(ctx context.Context, newAdaptor func() TaskPollingAdaptor, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
 	channelIDs := make([]int, 0, len(taskChannelM))
 	for channelID := range taskChannelM {
 		channelIDs = append(channelIDs, channelID)
@@ -494,6 +474,11 @@ func updateVideoTasksWithAdaptor(ctx context.Context, adaptor TaskPollingAdaptor
 		wg.Add(1)
 		gopool.Go(func() {
 			defer wg.Done()
+			adaptor := newAdaptor()
+			if adaptor == nil {
+				logger.LogError(ctx, fmt.Sprintf("Task polling adaptor unavailable for channel #%d", channelId))
+				return
+			}
 			if err := updateVideoTasks(ctx, adaptor, channelId, taskIds, taskM); err != nil {
 				logger.LogError(ctx, fmt.Sprintf("Channel #%d failed to update video async tasks: %s", channelId, err.Error()))
 			}
@@ -533,9 +518,14 @@ func updateVideoTasks(ctx context.Context, adaptor TaskPollingAdaptor, channelId
 		}
 		return fmt.Errorf("CacheGetChannel failed: %w", err)
 	}
+	baseURL := cacheGetChannel.GetBaseURL()
+	if baseURL == "" {
+		baseURL = constant.GetChannelBaseURL(cacheGetChannel.Type)
+	}
 	info := &relaycommon.RelayInfo{}
 	info.ChannelMeta = &relaycommon.ChannelMeta{
-		ChannelBaseUrl: cacheGetChannel.GetBaseURL(),
+		ChannelBaseUrl: baseURL,
+		ChannelSetting: cacheGetChannel.GetSetting(),
 	}
 	info.ApiKey = cacheGetChannel.Key
 	adaptor.Init(info)

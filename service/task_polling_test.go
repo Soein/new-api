@@ -44,6 +44,66 @@ type terminalPollingAdaptor struct {
 	adjustments int
 }
 
+type pollingContextObservation struct {
+	taskID  string
+	request [3]string
+	parsed  [3]string
+}
+
+type channelContextPollingAdaptor struct {
+	taskPollingFetchAdaptor
+	info         *relaycommon.RelayInfo
+	mode         string
+	ready        chan<- struct{}
+	release      <-chan struct{}
+	observations chan<- pollingContextObservation
+}
+
+func (a *channelContextPollingAdaptor) Init(info *relaycommon.RelayInfo) {
+	a.mu.Lock()
+	a.info = info
+	a.mu.Unlock()
+}
+
+func (a *channelContextPollingAdaptor) FetchTask(baseURL, key string, _ *model.Task, proxy string) (*http.Response, error) {
+	if a.ready != nil {
+		a.ready <- struct{}{}
+		<-a.release
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"provider":"ok"}`)),
+		Header: http.Header{
+			"Test-Base-Url": {baseURL},
+			"Test-Key":      {key},
+			"Test-Proxy":    {proxy},
+		},
+	}, nil
+}
+
+func (a *channelContextPollingAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, _ []byte) (*relaycommon.TaskInfo, error) {
+	a.mu.Lock()
+	parsed := [3]string{a.info.ChannelBaseUrl, a.info.ApiKey, a.info.ChannelSetting.Proxy}
+	a.mu.Unlock()
+	a.observations <- pollingContextObservation{
+		taskID:  task.TaskID,
+		request: [3]string{resp.Header.Get("Test-Base-Url"), resp.Header.Get("Test-Key"), resp.Header.Get("Test-Proxy")},
+		parsed:  parsed,
+	}
+	return &relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Progress: "30%"}, nil
+}
+
+func (a *channelContextPollingAdaptor) FetchMode() string { return a.mode }
+
+func (a *channelContextPollingAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	return a.FetchTask(baseURL, key, tasks[0], proxy)
+}
+
+func (a *channelContextPollingAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*BatchTaskResult, error) {
+	result, err := a.ParseTaskResult(tasks[0], resp, body)
+	return map[string]*BatchTaskResult{tasks[0].GetUpstreamTaskID(): {TaskInfo: *result}}, err
+}
+
 func (a *terminalPollingAdaptor) FetchTask(_ string, _ string, task *model.Task, _ string) (*http.Response, error) {
 	taskID := task.GetUpstreamTaskID()
 	a.mu.Lock()
@@ -308,6 +368,93 @@ func TestDispatchPlatformUpdateUsesEachTasksPinnedPluginVersion(t *testing.T) {
 
 	assert.Equal(t, []string{v1Task.GetUpstreamTaskID()}, v1Adaptor.fetchedTaskIDs())
 	assert.Equal(t, []string{v2Task.GetUpstreamTaskID()}, v2Adaptor.fetchedTaskIDs())
+}
+
+func TestDispatchPlatformUpdatePreservesEachChannelsQueryContext(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		pinned bool
+		mode   string
+	}{
+		{name: "pinned concurrent channels", pinned: true, mode: "per_task"},
+		{name: "legacy concurrent channels", mode: "per_task"},
+		{name: "batch default URL and proxy", pinned: true, mode: "batch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			truncate(t)
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+			taskChannels := make(map[int][]string)
+			tasks := make(map[string]*model.Task)
+			for i, key := range []string{"channel-a-key", "channel-b-key"} {
+				channelID := 113 + i
+				seedTaskPollingChannel(t, channelID, true)
+				var channel model.Channel
+				require.NoError(t, model.DB.First(&channel, channelID).Error)
+				channel.Key = key
+				if i == 1 {
+					channel.BaseURL = common.GetPointer("https://channel-b.example")
+				}
+				channel.SetSetting(dto.ChannelSettings{Proxy: "http://proxy.example:8080"})
+				require.NoError(t, model.DB.Save(&channel).Error)
+				task := seedPollingTask(t, channelID, key, key+"-upstream")
+				if test.pinned {
+					task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+						Key: "pinned-poll", Version: "1.0.0", APIVersion: 1,
+					}}
+				}
+				taskChannels[channelID] = []string{task.GetUpstreamTaskID()}
+				tasks[task.GetUpstreamTaskID()] = task
+			}
+			observations := make(chan pollingContextObservation, 2)
+			ready := make(chan struct{}, 2)
+			release := make(chan struct{})
+			done := make(chan struct{})
+			var releaseOnce sync.Once
+			previousFactory, previousTaskFactory := GetTaskAdaptorFunc, GetTaskAdaptorForTaskFunc
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(release) })
+				<-done
+				GetTaskAdaptorFunc, GetTaskAdaptorForTaskFunc = previousFactory, previousTaskFactory
+			})
+			newAdaptor := func() TaskPollingAdaptor {
+				adaptor := &channelContextPollingAdaptor{mode: test.mode, observations: observations}
+				if test.mode == "per_task" {
+					adaptor.ready, adaptor.release = ready, release
+				}
+				return adaptor
+			}
+			GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+				assert.False(t, test.pinned, "pinned tasks must not resolve the current plugin")
+				return newAdaptor()
+			}
+			GetTaskAdaptorForTaskFunc = func(task *model.Task) TaskPollingAdaptor {
+				assert.Equal(t, "1.0.0", task.PrivateData.Execution.TaskPlugin.Version)
+				return newAdaptor()
+			}
+			go func() {
+				defer close(done)
+				DispatchPlatformUpdate(context.Background(), "pinned-poll", taskChannels, tasks)
+			}()
+			if test.mode == "per_task" {
+				for range 2 {
+					select {
+					case <-ready:
+					case <-time.After(5 * time.Second):
+						t.Fatal("both channels must fetch independently before either response is parsed")
+					}
+				}
+				releaseOnce.Do(func() { close(release) })
+			}
+			<-done
+			close(observations)
+			require.Len(t, observations, 2)
+			for observation := range observations {
+				assert.Equal(t, observation.request, observation.parsed, observation.taskID)
+			}
+		})
+	}
 }
 
 func TestDispatchPlatformUpdateSeparatesSameVersionPluginSources(t *testing.T) {

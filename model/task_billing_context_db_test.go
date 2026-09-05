@@ -48,6 +48,8 @@ func testTaskBillingUsageSchemaPersistence(t *testing.T, db *gorm.DB, recorder *
 		},
 		PrivateData: TaskPrivateData{
 			BillingSource: "wallet",
+			PluginState:   json.RawMessage(`{"cursor":"next-round"}`),
+			PollFailures:  2,
 			BillingContext: &TaskBillingContext{
 				OriginModelName: "usage-schema-model",
 				GroupRatio:      1,
@@ -62,6 +64,8 @@ func testTaskBillingUsageSchemaPersistence(t *testing.T, db *gorm.DB, recorder *
 	require.NoError(t, tableDB.Where("task_id = ?", task.TaskID).First(&firstRead).Error)
 	require.NotNil(t, firstRead.PrivateData.BillingContext)
 	assert.Equal(t, expectedSchema, firstRead.PrivateData.BillingContext.UsageSchema)
+	assert.JSONEq(t, string(task.PrivateData.PluginState), string(firstRead.PrivateData.PluginState))
+	assert.Equal(t, 2, firstRead.PrivateData.PollFailures)
 
 	recorder.reset()
 	require.NoError(t, tableDB.AutoMigrate(&Task{}))
@@ -71,6 +75,8 @@ func testTaskBillingUsageSchemaPersistence(t *testing.T, db *gorm.DB, recorder *
 	require.NoError(t, tableDB.Where("task_id = ?", task.TaskID).First(&secondRead).Error)
 	require.NotNil(t, secondRead.PrivateData.BillingContext)
 	assert.Equal(t, expectedSchema, secondRead.PrivateData.BillingContext.UsageSchema)
+	assert.JSONEq(t, string(task.PrivateData.PluginState), string(secondRead.PrivateData.PluginState))
+	assert.Equal(t, 2, secondRead.PrivateData.PollFailures)
 }
 
 func TestTaskBillingUsageSchemaPersistenceSQLite(t *testing.T) {

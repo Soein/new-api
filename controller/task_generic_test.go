@@ -351,8 +351,10 @@ func TestDisabledArtifactStorePreservesPluginUpstreamContent(t *testing.T) {
 		"base_url": upstream.URL,
 	}).Error)
 	task.Platform = constant.TaskPlatform("google")
+	plugin, ok := pluginruntime.DefaultRegistry.FactoryPlugin("google")
+	require.True(t, ok)
 	task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
-		Key: "google", Name: "Google Veo (Gemini API)", Version: "1.0.0", APIVersion: 1,
+		Key: plugin.Meta.Key, Name: plugin.Meta.Name, Version: plugin.Meta.Version, APIVersion: plugin.Meta.APIVersion,
 	}}
 	task.SetData(map[string]any{"response": map[string]any{
 		"generateVideoResponse": map[string]any{

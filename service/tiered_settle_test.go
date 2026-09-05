@@ -132,9 +132,10 @@ func TestInjectTieredBillingInfoIncludesImageRuleTrace(t *testing.T) {
 		ImageCount:   3,
 		MatchedRules: []billingexpr.MatchedRule{{Name: "quality=high", Multiplier: 2}},
 	}
-	other := map[string]interface{}{}
+	logOther := model.NewLogOther()
 
-	InjectTieredBillingInfo(other, relayInfo, result)
+	InjectTieredBillingInfo(logOther, relayInfo, result)
+	other := logOther.Snapshot()
 
 	assert.Equal(t, "tiered_expr", other["billing_mode"])
 	assert.Equal(t, "image", other["matched_tier"])

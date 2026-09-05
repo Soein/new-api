@@ -185,6 +185,9 @@ func reconcileMidjourneyCharge(ctx context.Context, task *model.Midjourney) bool
 		return true
 	}
 
+	other := model.NewLogOther()
+	other.SetPublic("task_id", task.MjId)
+	other.SetPublic("reason", "billing_recovery")
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
 		UserId:    task.UserId,
 		LogType:   model.LogTypeConsume,
@@ -193,10 +196,7 @@ func reconcileMidjourneyCharge(ctx context.Context, task *model.Midjourney) bool
 		ModelName: CovertMjpActionToModelName(task.Action),
 		Quota:     task.Quota,
 		TokenId:   task.TokenId,
-		Other: map[string]interface{}{
-			"task_id": task.MjId,
-			"reason":  "billing_recovery",
-		},
+		Other:     other,
 	})
 	return true
 }
@@ -219,6 +219,9 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		return true
 	}
 
+	other := model.NewLogOther()
+	other.SetPublic("task_id", task.MjId)
+	other.SetPublic("reason", reason)
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
 		UserId:    task.UserId,
 		LogType:   model.LogTypeRefund,
@@ -227,10 +230,7 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		ModelName: CovertMjpActionToModelName(task.Action),
 		Quota:     result.Quota,
 		TokenId:   result.TokenId,
-		Other: map[string]interface{}{
-			"task_id": task.MjId,
-			"reason":  reason,
-		},
+		Other:     other,
 	})
 
 	return true

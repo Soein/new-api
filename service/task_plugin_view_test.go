@@ -94,3 +94,24 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	assert.Equal(t, pluginruntime.PluginLayerFactory, snapshot.TaskPlugin.Layer)
 	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(source))), snapshot.TaskPlugin.SourceHash)
 }
+
+func TestBuildTaskPluginViewOmitsPrivatePollState(t *testing.T) {
+	task := &model.Task{
+		TaskID: "task_public_view",
+		Data:   []byte(`{"ok":true}`),
+		PrivateData: model.TaskPrivateData{
+			PluginState:  []byte(`{"req_key":"secret"}`),
+			PollFailures: 7,
+		},
+	}
+
+	view, err := BuildTaskPluginView(task)
+	require.NoError(t, err)
+	encoded, err := common.Marshal(view)
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &payload))
+	assert.NotContains(t, payload, "plugin_state")
+	assert.NotContains(t, payload, "poll_failures")
+	assert.NotContains(t, payload, "private_data")
+}

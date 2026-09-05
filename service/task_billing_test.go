@@ -234,7 +234,7 @@ func TestTaskBillingOtherFiltersHistoricalOtherRatios(t *testing.T) {
 		"inf":      math.Inf(1),
 	}
 
-	other := taskBillingOther(task)
+	other := taskBillingOther(task).Snapshot()
 
 	assert.Equal(t, 2.0, other["seconds"])
 	assert.Equal(t, 1.0, other["identity"])
@@ -260,7 +260,7 @@ func TestTaskBillingOtherIncludesTieredSnapshotAndKeepsUsageFactsNested(t *testi
 		},
 	}
 
-	other := taskBillingOther(task)
+	other := taskBillingOther(task).Snapshot()
 
 	assert.Equal(t, "tiered_expr", other["billing_mode"])
 	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(expression)), other["expr_b64"])
@@ -284,7 +284,7 @@ func TestTaskBillingOtherOmitsEmptyUsageFacts(t *testing.T) {
 		UsageFacts:    map[string]any{},
 	}
 
-	other := taskBillingOther(task)
+	other := taskBillingOther(task).Snapshot()
 
 	assert.Equal(t, "tiered_expr", other["billing_mode"])
 	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(expression)), other["expr_b64"])
@@ -303,7 +303,7 @@ func TestTaskBillingOtherIncludesFrozenUsageSchemaSnapshot(t *testing.T) {
 	}`), &billingContext))
 	task.PrivateData.BillingContext = &billingContext
 
-	other := taskBillingOther(task)
+	other := taskBillingOther(task).Snapshot()
 
 	encoded, err := common.Marshal(other["billing_usage_schema"])
 	require.NoError(t, err)
@@ -332,7 +332,7 @@ func TestTaskBillingOtherIncludesFrozenUsageSchemaSnapshot(t *testing.T) {
 func TestTaskBillingOtherKeepsHistoricalTasksWithoutUsageSchemaCompatible(t *testing.T) {
 	task := makeTask(1, 1, 100, 0, BillingSourceWallet, 0)
 
-	other := taskBillingOther(task)
+	other := taskBillingOther(task).Snapshot()
 
 	assert.NotContains(t, other, "billing_usage_schema")
 }
@@ -489,7 +489,7 @@ func TestTaskBillingOtherSeparatesPluginAndRootDiagnostics(t *testing.T) {
 		},
 	}
 
-	other := taskBillingOther(task)
+	other := taskBillingOther(task).Snapshot()
 
 	assert.Equal(t, "task_public", other["task_id"])
 	adminInfo, ok := other["admin_info"].(map[string]interface{})
@@ -1995,10 +1995,12 @@ type mockAdaptor struct {
 }
 
 func (m *mockAdaptor) Init(_ *relaycommon.RelayInfo) {}
-func (m *mockAdaptor) FetchTask(string, string, map[string]any, string) (*http.Response, error) {
+func (m *mockAdaptor) FetchTask(string, string, *model.Task, string) (*http.Response, error) {
 	return nil, nil
 }
-func (m *mockAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) { return nil, nil }
+func (m *mockAdaptor) ParseTaskResult(*model.Task, *http.Response, []byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
 func (m *mockAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
 	return m.adjustReturn
 }

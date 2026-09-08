@@ -31,38 +31,74 @@ const options = [
 
 function Fixture() {
   const [value, setValue] = useState('openai')
-  return <><Combobox options={options} value={value} onValueChange={(next) => setValue(next ?? '')} aria-label='Provider' emptyText='No matching provider' /><output>{value}</output></>
+  return (
+    <>
+      <Combobox
+        options={options}
+        value={value}
+        onValueChange={(next) => setValue(next ?? '')}
+        aria-label='Provider'
+        emptyText='No matching provider'
+      />
+      <output>{value}</output>
+    </>
+  )
 }
 
 describe('searchable single selection', () => {
   it('searches labels and values without committing text, shows empty results, and restores the selection on Escape', async () => {
-    render(<Fixture />)
-    const user = userEvent.setup()
-    const input = screen.getByRole('combobox', { name: 'Provider' })
-    expect(input).toHaveValue('OpenAI')
-    await user.click(input)
-    await user.type(input, 'missing')
-    expect(screen.getByText('No matching provider')).toBeVisible()
-    expect(screen.getByText('openai')).toHaveTextContent('openai')
-    await user.keyboard('{Escape}')
-    expect(input).toHaveValue('OpenAI')
-    await user.click(input)
-    await user.type(input, 'gemini')
-    expect(screen.getByRole('option', { name: 'Google' })).toBeVisible()
-    await user.keyboard('{ArrowDown}{Enter}')
-    await waitFor(() => expect(input).toHaveValue('Google'))
-    expect(screen.getByText('gemini')).toHaveTextContent('gemini')
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      render(<Fixture />)
+      const user = userEvent.setup()
+      const input = screen.getByRole('combobox', { name: 'Provider' })
+      expect(input).toHaveValue('OpenAI')
+      await user.click(input)
+      await user.type(input, 'missing')
+      expect(screen.getByText('No matching provider')).toBeVisible()
+      expect(screen.getByText('openai')).toHaveTextContent('openai')
+      await user.keyboard('{Escape}')
+      expect(input).toHaveValue('OpenAI')
+      await user.click(input)
+      await user.type(input, 'gemini')
+      expect(screen.getByRole('option', { name: 'Google' })).toBeVisible()
+      await user.keyboard('{ArrowDown}{Enter}')
+      await waitFor(() => expect(input).toHaveValue('Google'))
+      expect(screen.getByText('gemini')).toHaveTextContent('gemini')
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('respects disabled controls and options', async () => {
     const change = vi.fn()
-    const view = render(<Combobox options={options} value='openai' onValueChange={change} aria-label='Provider' disabled />)
+    const view = render(
+      <Combobox
+        options={options}
+        value='openai'
+        onValueChange={change}
+        aria-label='Provider'
+        disabled
+      />
+    )
     const user = userEvent.setup()
     expect(screen.getByRole('combobox', { name: 'Provider' })).toBeDisabled()
-    view.rerender(<Combobox options={options} value='openai' onValueChange={change} aria-label='Provider' />)
+    view.rerender(
+      <Combobox
+        options={options}
+        value='openai'
+        onValueChange={change}
+        aria-label='Provider'
+      />
+    )
     await user.click(screen.getByRole('combobox', { name: 'Provider' }))
-    expect(screen.getByRole('option', { name: 'Unavailable provider' })).toHaveAttribute('aria-disabled', 'true')
-    await user.click(screen.getByRole('option', { name: 'Unavailable provider' }))
+    expect(
+      screen.getByRole('option', { name: 'Unavailable provider' })
+    ).toHaveAttribute('aria-disabled', 'true')
+    await user.click(
+      screen.getByRole('option', { name: 'Unavailable provider' })
+    )
     expect(change).not.toHaveBeenCalled()
   })
 })

@@ -120,6 +120,76 @@ export function parseTaskResult() { return {}; }
 				t.Skip("set " + dialect.env + " to run this database")
 			}
 			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			t.Run("pricing_aliases_match_relay_without_overwriting_exact_fields", func(t *testing.T) {
+				const name, sibling, alias = "gpt-4o-gizmo-matrix-a", "gpt-4o-gizmo-matrix-b", "gpt-4o-gizmo-*"
+				require.NoError(t, model.UpdateModelPricingOptions(map[string]string{
+					"ModelPrice": `{"gpt-4o-gizmo-matrix-a":99}`,
+					"CacheRatio": `{"gpt-4o-gizmo-matrix-a":0.25,"gpt-4o-gizmo-*":0.75}`,
+					"ImageRatio": `{"gpt-4o-gizmo-matrix-a":3,"gpt-4o-gizmo-*":9}`,
+				}))
+				before, err := model.GetModelPricingSnapshot([]string{name, sibling})
+				require.NoError(t, err)
+				assert.Equal(t, alias, before.Entries[0].NumericModelName)
+				assert.Equal(t, alias, before.Entries[1].NumericModelName)
+				assert.NotContains(t, before.Entries[0].Configured, "ModelPrice")
+				assert.NotContains(t, before.Entries[0].Effective, "ModelPrice")
+				assert.Equal(t, 0.25, before.Entries[0].Effective["CacheRatio"])
+				assert.Equal(t, float64(3), before.Entries[0].Effective["ImageRatio"])
+				pricing := model.PricingValues{"ModelPrice": float64(0), "CompletionRatio": float64(3), "AudioRatio": float64(4), "AudioCompletionRatio": float64(5), "CacheRatio": 0.5, "CreateCacheRatio": 1.5, "ImageRatio": float64(2), "billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("base", p * 2)`}
+				require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: name, ExpectedVersion: before.Entries[0].Version, Pricing: pricing}}))
+				after, err := model.GetModelPricingSnapshot([]string{name, sibling})
+				require.NoError(t, err)
+				assert.NotEqual(t, before.Entries[1].Version, after.Entries[1].Version)
+				assert.Equal(t, pricing, after.Entries[0].Configured)
+				assert.NotContains(t, after.Entries[1].Configured, "billing_setting.billing_expr")
+				assert.NotContains(t, after.Entries[1].Configured, "CacheRatio")
+				for _, modelName := range []string{name, sibling} {
+					price, exists := ratio_setting.GetModelPrice(modelName, false)
+					assert.True(t, exists)
+					assert.Equal(t, float64(0), price)
+					assert.Equal(t, float64(3), ratio_setting.GetCompletionRatio(modelName))
+					assert.Equal(t, float64(4), ratio_setting.GetAudioRatio(modelName))
+					assert.Equal(t, float64(5), ratio_setting.GetAudioCompletionRatio(modelName))
+				}
+				cache, _ := ratio_setting.GetCacheRatio(name)
+				assert.Equal(t, 0.5, cache)
+				image, _ := ratio_setting.GetImageRatio(name)
+				assert.Equal(t, float64(2), image)
+				var storedPrices map[string]float64
+				require.NoError(t, common.UnmarshalJsonStr(after.Options["ModelPrice"], &storedPrices))
+				assert.Equal(t, float64(99), storedPrices[name], "preserve ignored legacy administrator entries")
+				assert.Contains(t, storedPrices, alias)
+				assert.ErrorIs(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: sibling, ExpectedVersion: before.Entries[1].Version, Pricing: model.PricingValues{"ModelPrice": float64(9)}}}), model.ErrModelPricingConflict)
+
+				// Shared targets use one initial version snapshot. Identical writes
+				// coexist with exact expressions; conflicting writes roll back together.
+				changes := []model.ModelPricingChange{
+					{ModelName: name, ExpectedVersion: after.Entries[0].Version, Pricing: model.PricingValues{"ModelPrice": float64(2), "billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("base", p * 2)`}},
+					{ModelName: sibling, ExpectedVersion: after.Entries[1].Version, Pricing: model.PricingValues{"ModelPrice": float64(3), "billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("base", p * 3)`}},
+				}
+				assert.ErrorIs(t, model.UpdateModelPricing(changes), model.ErrModelPricingConflict)
+				unchanged, err := model.GetModelPricingSnapshot([]string{name, sibling})
+				require.NoError(t, err)
+				assert.Equal(t, after.Entries, unchanged.Entries)
+				changes[1].Pricing["ModelPrice"] = float64(2)
+				require.NoError(t, model.UpdateModelPricing(changes))
+				after, err = model.GetModelPricingSnapshot([]string{name, sibling})
+				require.NoError(t, err)
+				assert.Equal(t, `tier("base", p * 2)`, after.Entries[0].Configured["billing_setting.billing_expr"])
+				assert.Equal(t, `tier("base", p * 3)`, after.Entries[1].Configured["billing_setting.billing_expr"])
+				require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: name, ExpectedVersion: after.Entries[0].Version, Reset: true}}))
+				reset, err := model.GetModelPricingSnapshot([]string{name, sibling})
+				require.NoError(t, err)
+				assert.NotContains(t, reset.Entries[0].Configured, "ModelPrice")
+				assert.NotContains(t, reset.Entries[0].Configured, "billing_setting.billing_expr")
+				assert.Equal(t, `tier("base", p * 3)`, reset.Entries[1].Configured["billing_setting.billing_expr"])
+				ratio, exists, matched := ratio_setting.GetModelRatio(name)
+				assert.True(t, exists)
+				assert.Equal(t, alias, matched)
+				assert.Equal(t, ratio_setting.GetDefaultModelRatioMap()[alias], ratio)
+				_, exists = ratio_setting.GetModelPrice(name, false)
+				assert.False(t, exists)
+			})
 			t.Run("pricing_saves_zero_switches_modes_and_rejects_stale_batches", func(t *testing.T) {
 				before, err := model.GetModelPricingSnapshot([]string{"matrix-priced", "matrix-other"})
 				require.NoError(t, err)

@@ -4045,6 +4045,7 @@
     "Price": "价格",
     "Price ($/1K calls)": "价格（$/1K 次）",
     "Price (local currency / USD)": "价格（本地货币/美元）",
+    "Price and text/audio rates apply to all models matching {{model}}, while cache, image, and expression settings apply only to this model.": "价格和文本/语音费率适用于所有匹配 {{model}} 的模型，而缓存、图像和表达式设置仅适用于当前模型。",
     "Price display": "价格显示",
     "Price display mode": "价格显示模式",
     "Price estimation": "价格预估",

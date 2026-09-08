@@ -4045,6 +4045,7 @@
     "Price": "價格",
     "Price ($/1K calls)": "價格（$/1K 次）",
     "Price (local currency / USD)": "價格（本地貨幣/美元）",
+    "Price and text/audio rates apply to all models matching {{model}}, while cache, image, and expression settings apply only to this model.": "價格和文字/語音費率適用於所有符合 {{model}} 的模型，而快取、圖像和表達式設定僅適用於目前模型。",
     "Price display": "價格顯示",
     "Price display mode": "價格顯示模式",
     "Price estimation": "價格估算",

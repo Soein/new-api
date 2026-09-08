@@ -4045,6 +4045,7 @@
     "Price": "価格",
     "Price ($/1K calls)": "価格（$/1K 回）",
     "Price (local currency / USD)": "価格 (現地通貨 / USD)",
+    "Price and text/audio rates apply to all models matching {{model}}, while cache, image, and expression settings apply only to this model.": "価格およびテキスト/音声レートは {{model}} に一致するすべてのモデルに適用され、キャッシュ、画像、式の設定はこのモデルにのみ適用されます。",
     "Price display": "価格表示",
     "Price display mode": "価格表示モード",
     "Price estimation": "料金見積もり",

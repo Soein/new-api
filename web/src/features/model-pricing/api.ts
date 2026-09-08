@@ -31,14 +31,19 @@ import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  EXACT_PRICING_KEYS,
   PRICING_KEYS,
   pricingValuesByModel,
+  SHARED_PRICING_KEYS,
+  type PricingKey,
   type PricingOptions,
   type PricingValues,
+  type SharedPricingKey,
 } from './pricing'
 
 export type ModelPricingEntry = {
   model_name: string
+  numeric_model_name?: string
   version: string
   configured: PricingValues
   effective: PricingValues
@@ -130,30 +135,179 @@ export function buildPricingChanges(
   const entries = new Map(
     snapshot.entries.map((entry) => [entry.model_name, entry])
   )
-  const changes: ModelPricingChange[] = []
-  for (const name of new Set([...previous.keys(), ...next.keys()])) {
+  const allNames = new Set([...previous.keys(), ...next.keys()])
+
+  type DirtyItem = {
+    name: string
+    entry?: ModelPricingEntry
+    dirty: PricingKey[]
+    newValues: PricingValues
+  }
+
+  const dirtyItems: DirtyItem[] = []
+  for (const name of allNames) {
     const oldValues = previous.get(name) ?? {}
     const newValues = next.get(name) ?? {}
     const dirty = PRICING_KEYS.filter(
       (key) => oldValues[key] !== newValues[key]
     )
     if (!dirty.length) continue
-    const entry = entries.get(name)
-    const pricing = { ...entry?.configured }
-    for (const key of dirty) {
-      delete pricing[key]
-      if (newValues[key] !== undefined) pricing[key] = newValues[key]
+    dirtyItems.push({
+      name,
+      entry: entries.get(name),
+      dirty,
+      newValues,
+    })
+  }
+
+  if (!dirtyItems.length) return []
+
+  const sharedPatches = new Map<
+    string,
+    Map<SharedPricingKey, number | undefined>
+  >()
+
+  for (const item of dirtyItems) {
+    const aliasKey = item.entry?.numeric_model_name ?? item.name
+    for (const key of item.dirty) {
+      if (!SHARED_PRICING_KEYS.includes(key as SharedPricingKey)) continue
+      const sharedKey = key as SharedPricingKey
+      const proposedValue = item.newValues[sharedKey] as number | undefined
+      let aliasMap = sharedPatches.get(aliasKey)
+      if (!aliasMap) {
+        aliasMap = new Map()
+        sharedPatches.set(aliasKey, aliasMap)
+      }
+      if (aliasMap.has(sharedKey)) {
+        if (aliasMap.get(sharedKey) !== proposedValue) {
+          throw new Error(t('Reload pricing'))
+        }
+      } else {
+        aliasMap.set(sharedKey, proposedValue)
+      }
     }
-    if (newValues['billing_setting.billing_mode'] === 'tiered_expr') {
+  }
+
+  const changes: ModelPricingChange[] = []
+  for (const item of dirtyItems) {
+    const entry = item.entry
+    const pricing: PricingValues = { ...entry?.configured }
+    const aliasKey = entry?.numeric_model_name ?? item.name
+    const aliasPatch = sharedPatches.get(aliasKey)
+
+    for (const key of item.dirty) {
+      if (SHARED_PRICING_KEYS.includes(key as SharedPricingKey)) continue
+      delete pricing[key]
+      if (item.newValues[key] !== undefined) {
+        pricing[key] = item.newValues[key]
+      }
+    }
+
+    if (aliasPatch) {
+      for (const [key, value] of aliasPatch.entries()) {
+        delete pricing[key]
+        if (value !== undefined) {
+          pricing[key] = value
+        }
+      }
+    }
+
+    if (item.newValues['billing_setting.billing_mode'] === 'tiered_expr') {
       pricing['billing_setting.billing_mode'] = 'tiered_expr'
       pricing['billing_setting.billing_expr'] =
-        newValues['billing_setting.billing_expr']
+        item.newValues['billing_setting.billing_expr']
     }
+
     changes.push({
-      model_name: name,
+      model_name: item.name,
       expected_version: entry?.version ?? snapshot.empty_version,
       pricing,
     })
   }
+
   return changes
+}
+
+export async function resolvePricingSnapshot(
+  snapshot: ModelPricingConfig,
+  names: string[] = []
+): Promise<ModelPricingConfig> {
+  const knownEntries = new Map(
+    snapshot.entries.map((entry) => [entry.model_name, entry])
+  )
+  const missingNames = [...new Set(names)].filter(
+    (name) => !knownEntries.has(name)
+  )
+
+  if (!missingNames.length) {
+    return snapshot
+  }
+
+  const freshConfig = await getModelPricing(missingNames)
+  const freshEntries = new Map(
+    freshConfig.entries.map((entry) => [entry.model_name, entry])
+  )
+
+  const rawPrevious = pricingValuesByModel(snapshot.options)
+  const missingEntryList: ModelPricingEntry[] = []
+
+  for (const name of missingNames) {
+    const entry = freshEntries.get(name)
+    if (!entry) {
+      throw new Error(t('Failed to load model pricing'))
+    }
+    missingEntryList.push(entry)
+    const targetSharedName = entry.numeric_model_name ?? entry.model_name
+
+    const rawSharedValues = rawPrevious.get(targetSharedName) ?? {}
+    for (const key of SHARED_PRICING_KEYS) {
+      const newlyRead = entry.configured[key]
+      const oldRaw = rawSharedValues[key]
+      if (newlyRead !== oldRaw) {
+        throw new Error(t('Reload pricing'))
+      }
+    }
+
+    const rawExactValues = rawPrevious.get(entry.model_name) ?? {}
+    for (const key of EXACT_PRICING_KEYS) {
+      const newlyRead = entry.configured[key]
+      const oldRaw = rawExactValues[key]
+      if (newlyRead !== oldRaw) {
+        throw new Error(t('Reload pricing'))
+      }
+    }
+  }
+
+  return {
+    ...snapshot,
+    entries: [...snapshot.entries, ...missingEntryList],
+  }
+}
+
+export async function preparePricingChanges(
+  snapshot: ModelPricingConfig,
+  before: PricingOptions,
+  after: PricingOptions
+): Promise<ModelPricingChange[]> {
+  const previous = pricingValuesByModel(before)
+  const next = pricingValuesByModel(after)
+  const knownEntries = new Map(
+    snapshot.entries.map((entry) => [entry.model_name, entry])
+  )
+
+  const allNames = new Set([...previous.keys(), ...next.keys()])
+  const missingNames: string[] = []
+  for (const name of allNames) {
+    const oldValues = previous.get(name) ?? {}
+    const newValues = next.get(name) ?? {}
+    const isDirty = PRICING_KEYS.some(
+      (key) => oldValues[key] !== newValues[key]
+    )
+    if (isDirty && !knownEntries.has(name)) {
+      missingNames.push(name)
+    }
+  }
+
+  const resolved = await resolvePricingSnapshot(snapshot, missingNames)
+  return buildPricingChanges(resolved, before, after)
 }

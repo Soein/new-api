@@ -27,11 +27,15 @@ import { Button } from '@/components/ui/button'
 import {
   buildPricingChanges,
   getModelPricing,
-  saveModelPricing,
   invalidateModelPricing,
+  resolvePricingSnapshot,
+  saveModelPricing,
   type ModelPricingConfig,
 } from '@/features/model-pricing/api'
-import { applyPriceSyncSelections } from '@/features/model-pricing/pricing'
+import {
+  applyPriceSyncSelections,
+  pricingDisplayOptions,
+} from '@/features/model-pricing/pricing'
 
 import { fetchUpstreamRatios, getUpstreamChannels } from '../api'
 import type {
@@ -170,13 +174,14 @@ export function UpstreamRatioSync() {
   const syncMutation = useMutation({
     mutationFn: async () => {
       if (!pricingBaseline) throw new Error(t('Reload pricing'))
-      const after = applyPriceSyncSelections(
-        pricingBaseline.options,
-        resolutions
+      const resolved = await resolvePricingSnapshot(
+        pricingBaseline,
+        Object.keys(resolutions)
       )
-      await saveModelPricing(
-        buildPricingChanges(pricingBaseline, pricingBaseline.options, after)
-      )
+      const before = pricingDisplayOptions(resolved)
+      const after = applyPriceSyncSelections(before, resolutions)
+      const changes = buildPricingChanges(resolved, before, after)
+      await saveModelPricing(changes)
       return resolutions
     },
     onSuccess: async (saved) => {

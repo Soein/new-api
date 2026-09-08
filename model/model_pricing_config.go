@@ -30,11 +30,14 @@ type ModelPricingChange struct {
 }
 
 type ModelPricingEntry struct {
-	ModelName   string                               `json:"model_name"`
-	Version     string                               `json:"version"`
-	Configured  PricingValues                        `json:"configured"`
-	Effective   PricingValues                        `json:"effective"`
-	UsageSchema map[string]jsplugin.UsageFieldSchema `json:"usage_schema,omitempty"`
+	ModelName string `json:"model_name"`
+	// NumericModelName is the shared key for price, model/completion and audio
+	// ratios. Cache/image ratios and billing expressions remain model-specific.
+	NumericModelName string                               `json:"numeric_model_name"`
+	Version          string                               `json:"version"`
+	Configured       PricingValues                        `json:"configured"`
+	Effective        PricingValues                        `json:"effective"`
+	UsageSchema      map[string]jsplugin.UsageFieldSchema `json:"usage_schema,omitempty"`
 }
 
 type ModelPricingSnapshot struct {
@@ -111,15 +114,29 @@ func modelPricingValues(values map[string]map[string]any, name string) PricingVa
 	return result
 }
 
-func effectiveModelPricing(values map[string]map[string]any, name string) PricingValues {
-	result := modelPricingValues(values, name)
-	// Legacy wildcard aliases are resolved by the same normalization as relay.
-	alias := ratio_setting.FormatMatchingModelName(name)
-	for _, key := range modelPricingOptionKeys[:8] {
-		if value, exists := values[key][alias]; exists {
+// modelPricingTarget follows each relay getter's lookup contract. In particular,
+// cache and image ratios do not use the legacy wildcard normalization.
+func modelPricingTarget(key, name string) string {
+	switch key {
+	case "ModelPrice", "ModelRatio", "CompletionRatio", "AudioRatio", "AudioCompletionRatio":
+		return ratio_setting.FormatMatchingModelName(name)
+	default:
+		return name
+	}
+}
+
+func configuredModelPricing(values map[string]map[string]any, name string) PricingValues {
+	result := make(PricingValues)
+	for _, key := range modelPricingOptionKeys {
+		if value, exists := values[key][modelPricingTarget(key, name)]; exists {
 			result[key] = value
 		}
 	}
+	return result
+}
+
+func effectiveModelPricing(values map[string]map[string]any, name string) PricingValues {
+	result := configuredModelPricing(values, name)
 	mode, _ := result["billing_setting.billing_mode"].(string)
 	if mode == "" {
 		_, hasPrice := result["ModelPrice"]
@@ -175,8 +192,8 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 	result := &ModelPricingSnapshot{Entries: make([]ModelPricingEntry, 0, len(names)), Options: make(map[string]string), EmptyVersion: ModelPricingVersion(PricingValues{})}
 	generation := jsplugin.DefaultRegistry.Generation()
 	for _, name := range names {
-		configured := modelPricingValues(values, name)
-		entry := ModelPricingEntry{ModelName: name, Version: ModelPricingVersion(configured), Configured: configured, Effective: effectiveModelPricing(values, name)}
+		configured := configuredModelPricing(values, name)
+		entry := ModelPricingEntry{ModelName: name, NumericModelName: ratio_setting.FormatMatchingModelName(name), Version: ModelPricingVersion(configured), Configured: configured, Effective: effectiveModelPricing(values, name)}
 		if plugin, ok := generation.GetByModel(name); ok {
 			entry.UsageSchema = plugin.Meta.UsageSchema
 		} else if target, ok := ResolveTaskModelAlias(generation, name); ok {
@@ -281,18 +298,37 @@ func UpdateModelPricing(changes []ModelPricingChange) error {
 	}
 	return mutateModelPricingOptions(func(_ *gorm.DB, values map[string]map[string]any) error {
 		defaults := defaultPricingMaps()
+		// Validate every version against the same snapshot before applying any
+		// writes: multiple model names can address the same numeric pricing key.
 		for _, change := range changes {
-			if ModelPricingVersion(modelPricingValues(values, change.ModelName)) != change.ExpectedVersion {
+			if ModelPricingVersion(configuredModelPricing(values, change.ModelName)) != change.ExpectedVersion {
 				return fmt.Errorf("%w: %s", ErrModelPricingConflict, change.ModelName)
 			}
+		}
+		writes := make(map[string]map[string]any, len(modelPricingOptionKeys))
+		for _, change := range changes {
 			pricing := change.Pricing
 			if change.Reset {
-				pricing = modelPricingValues(defaults, change.ModelName)
+				pricing = configuredModelPricing(defaults, change.ModelName)
 			}
 			for _, key := range modelPricingOptionKeys {
-				delete(values[key], change.ModelName)
-				if value, exists := pricing[key]; exists {
-					values[key][change.ModelName] = value
+				target := modelPricingTarget(key, change.ModelName)
+				if writes[key] == nil {
+					writes[key] = make(map[string]any)
+				}
+				// Valid values are strings or finite numbers; nil represents deletion.
+				value := pricing[key]
+				if previous, exists := writes[key][target]; exists && previous != value {
+					return fmt.Errorf("%w: conflicting %s for %s", ErrModelPricingConflict, key, target)
+				}
+				writes[key][target] = value
+			}
+		}
+		for key, entries := range writes {
+			for target, value := range entries {
+				delete(values[key], target)
+				if value != nil {
+					values[key][target] = value
 				}
 			}
 		}

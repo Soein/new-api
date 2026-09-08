@@ -119,6 +119,16 @@ export function ModelPricingPanel(props: {
     ...pricingRow(entry.model_name, entry.effective),
     hasConflict: false,
   }
+  const hasSharedAlias = Boolean(
+    entry.numeric_model_name && entry.numeric_model_name !== entry.model_name
+  )
+  const sharedScopeNotice =
+    hasSharedAlias && entry.numeric_model_name
+      ? t(
+          'Price and text/audio rates apply to all models matching {{model}}, while cache, image, and expression settings apply only to this model.',
+          { model: entry.numeric_model_name }
+        )
+      : null
 
   return (
     <div className='flex min-h-0 flex-1 flex-col gap-3'>
@@ -133,6 +143,11 @@ export function ModelPricingPanel(props: {
             {t('Current Billing')}: {getPriceSummary(effectivePricing, t)} ·{' '}
             {getPriceDetail(effectivePricing, t)}
           </p>
+          {sharedScopeNotice && (
+            <p className='text-muted-foreground mt-1 text-xs'>
+              {sharedScopeNotice}
+            </p>
+          )}
         </div>
         <Button
           variant='outline'
@@ -179,9 +194,22 @@ export function ModelPricingPanel(props: {
         open={resetOpen}
         onOpenChange={setResetOpen}
         title={t('Restore default pricing')}
-        desc={t(
-          'Remove this model’s custom pricing and use the built-in defaults. A model without a default may become unpriced.'
-        )}
+        desc={
+          hasSharedAlias ? (
+            <div className='space-y-2'>
+              <p>
+                {t(
+                  'Remove this model’s custom pricing and use the built-in defaults. A model without a default may become unpriced.'
+                )}
+              </p>
+              <p>{sharedScopeNotice}</p>
+            </div>
+          ) : (
+            t(
+              'Remove this model’s custom pricing and use the built-in defaults. A model without a default may become unpriced.'
+            )
+          )
+        }
         confirmText={t('Restore defaults')}
         isLoading={save.isPending}
         handleConfirm={() => void persist(true)}

@@ -30,12 +30,15 @@ import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
-  buildPricingChanges,
+  preparePricingChanges,
   useModelPricing,
   useSaveModelPricing,
   type ModelPricingConfig,
 } from '@/features/model-pricing/api'
-import { pricingOptions } from '@/features/model-pricing/pricing'
+import {
+  pricingDisplayOptions,
+  pricingOptions,
+} from '@/features/model-pricing/pricing'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { SettingsPageTitleStatusPortal } from '../components/settings-page-context'
@@ -183,19 +186,21 @@ export function RatioSettingsCard({
       setPricingBaseline(pricingQuery.data)
     }
   }, [pricingBaseline, pricingQuery.data])
+  const projectedOptions = useMemo(
+    () => (pricingBaseline ? pricingDisplayOptions(pricingBaseline) : null),
+    [pricingBaseline]
+  )
   const modelDefaults = useMemo(
     () =>
-      pricingBaseline
+      projectedOptions
         ? {
             ...initialModelDefaults,
-            ...pricingBaseline.options,
-            BillingMode:
-              pricingBaseline.options['billing_setting.billing_mode'],
-            BillingExpr:
-              pricingBaseline.options['billing_setting.billing_expr'],
+            ...projectedOptions,
+            BillingMode: projectedOptions['billing_setting.billing_mode'],
+            BillingExpr: projectedOptions['billing_setting.billing_expr'],
           }
         : initialModelDefaults,
-    [initialModelDefaults, pricingBaseline]
+    [initialModelDefaults, projectedOptions]
   )
   const resetMutation = useMutation({
     mutationFn: async () => {
@@ -368,7 +373,7 @@ export function RatioSettingsCard({
 
       if (!pricingBaseline) return
       try {
-        const changes = buildPricingChanges(
+        const changes = await preparePricingChanges(
           pricingBaseline,
           pricingOptions(modelNormalizedDefaults.current),
           pricingOptions(normalized)

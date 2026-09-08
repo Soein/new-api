@@ -152,6 +152,11 @@ export const getPriceDetail = (
   return details.length > 0 ? details.join(' · ') : t('Base input price only')
 }
 
+const getOwnPricingValue = <T>(
+  map: Record<string, T>,
+  name: string
+): T | undefined => (Object.hasOwn(map, name) ? map[name] : undefined)
+
 export const buildModelSnapshots = ({
   modelPrice,
   modelRatio,
@@ -219,18 +224,20 @@ export const buildModelSnapshots = ({
   ])
 
   return [...modelNames].map((name) => {
-    const price = priceMap[name]?.toString() || ''
-    const ratio = ratioMap[name]?.toString() || ''
-    const cache = cacheMap[name]?.toString() || ''
-    const createCache = createCacheMap[name]?.toString() || ''
-    const completion = completionMap[name]?.toString() || ''
-    const image = imageMap[name]?.toString() || ''
-    const audio = audioMap[name]?.toString() || ''
-    const audioCompletion = audioCompletionMap[name]?.toString() || ''
+    const price = getOwnPricingValue(priceMap, name)?.toString() || ''
+    const ratio = getOwnPricingValue(ratioMap, name)?.toString() || ''
+    const cache = getOwnPricingValue(cacheMap, name)?.toString() || ''
+    const createCache =
+      getOwnPricingValue(createCacheMap, name)?.toString() || ''
+    const completion = getOwnPricingValue(completionMap, name)?.toString() || ''
+    const image = getOwnPricingValue(imageMap, name)?.toString() || ''
+    const audio = getOwnPricingValue(audioMap, name)?.toString() || ''
+    const audioCompletion =
+      getOwnPricingValue(audioCompletionMap, name)?.toString() || ''
 
-    const modeForModel = billingModeMap[name]
+    const modeForModel = getOwnPricingValue(billingModeMap, name)
     if (modeForModel === 'tiered_expr') {
-      const fullExpr = billingExprMap[name] || ''
+      const fullExpr = getOwnPricingValue(billingExprMap, name) || ''
       const { billingExpr: pureExpr, requestRuleExpr } =
         splitBillingExprAndRequestRules(fullExpr)
       return {

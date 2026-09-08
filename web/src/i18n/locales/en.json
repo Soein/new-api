@@ -4045,6 +4045,7 @@
     "Price": "Price",
     "Price ($/1K calls)": "Price ($/1K calls)",
     "Price (local currency / USD)": "Price (local currency / USD)",
+    "Price and text/audio rates apply to all models matching {{model}}, while cache, image, and expression settings apply only to this model.": "Price and text/audio rates apply to all models matching {{model}}, while cache, image, and expression settings apply only to this model.",
     "Price display": "Price display",
     "Price display mode": "Price display mode",
     "Price estimation": "Price estimation",

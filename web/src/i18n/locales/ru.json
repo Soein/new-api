@@ -4045,6 +4045,7 @@
     "Price": "Цена",
     "Price ($/1K calls)": "Цена ($/1K вызовов)",
     "Price (local currency / USD)": "Цена (местная валюта / USD)",
+    "Price and text/audio rates apply to all models matching {{model}}, while cache, image, and expression settings apply only to this model.": "Цена и тарифы на текст/аудио применяются ко всем моделям, соответствующим {{model}}, тогда как настройки кэша, изображений и выражений применяются только к этой модели.",
     "Price display": "Отображение цены",
     "Price display mode": "Режим отображения цены",
     "Price estimation": "Оценка стоимости",

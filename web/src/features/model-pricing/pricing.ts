@@ -25,6 +25,8 @@ import {
   type ModelPricingSnapshot,
 } from '@/features/system-settings/models/model-pricing-snapshots'
 
+import type { ModelPricingConfig } from './api'
+
 export const PRICING_KEYS = [
   'ModelPrice',
   'ModelRatio',
@@ -40,6 +42,54 @@ export const PRICING_KEYS = [
 export type PricingKey = (typeof PRICING_KEYS)[number]
 export type PricingValues = Partial<Record<PricingKey, number | string>>
 export type PricingOptions = Record<PricingKey, string>
+
+export const SHARED_PRICING_KEYS = [
+  'ModelPrice',
+  'ModelRatio',
+  'CompletionRatio',
+  'AudioRatio',
+  'AudioCompletionRatio',
+] as const
+export type SharedPricingKey = (typeof SHARED_PRICING_KEYS)[number]
+
+export const EXACT_PRICING_KEYS = [
+  'CacheRatio',
+  'CreateCacheRatio',
+  'ImageRatio',
+  'billing_setting.billing_mode',
+  'billing_setting.billing_expr',
+] as const
+export type ExactPricingKey = (typeof EXACT_PRICING_KEYS)[number]
+
+export function pricingDisplayOptions(
+  snapshot: ModelPricingConfig
+): PricingOptions {
+  const maps = Object.fromEntries(
+    PRICING_KEYS.map((key) => [
+      key,
+      parsePricingOptionsMap(snapshot.options[key]),
+    ])
+  ) as Record<PricingKey, Record<string, number | string>>
+
+  for (const entry of snapshot.entries) {
+    for (const key of SHARED_PRICING_KEYS) {
+      const configuredVal = entry.configured[key]
+      delete maps[key][entry.model_name]
+      if (configuredVal !== undefined) {
+        Object.defineProperty(maps[key], entry.model_name, {
+          value: configuredVal,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        })
+      }
+    }
+  }
+
+  return Object.fromEntries(
+    PRICING_KEYS.map((key) => [key, JSON.stringify(maps[key])])
+  ) as PricingOptions
+}
 
 export const pricingFieldMap = {
   price: 'ModelPrice',
@@ -135,6 +185,22 @@ export function applyPricingDraft(
   return applyPricingValues(options, pricingFromDraft(data), names)
 }
 
+function parsePricingOptionsMap(
+  raw: string | undefined
+): Record<string, number | string> {
+  const text = typeof raw === 'string' && raw.trim() !== '' ? raw : '{}'
+  const parsed: unknown = JSON.parse(text)
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(t('Pricing must be a JSON object'))
+  }
+  for (const [, value] of Object.entries(parsed)) {
+    if (typeof value !== 'number' && typeof value !== 'string') {
+      throw new Error(t('Invalid pricing value'))
+    }
+  }
+  return { ...(parsed as Record<string, number | string>) }
+}
+
 function applyPricingValues(
   options: PricingOptions,
   values: PricingValues,
@@ -142,7 +208,7 @@ function applyPricingValues(
 ): PricingOptions {
   return Object.fromEntries(
     PRICING_KEYS.map((key) => {
-      const map = JSON.parse(options[key]) as Record<string, number | string>
+      const map = parsePricingOptionsMap(options[key])
       for (const name of names) {
         delete map[name]
         if (values[key] !== undefined) {
@@ -164,14 +230,8 @@ export function pricingValuesByModel(
 ): Map<string, PricingValues> {
   const models = new Map<string, PricingValues>()
   for (const key of PRICING_KEYS) {
-    const map: unknown = JSON.parse(options[key])
-    if (map === null || typeof map !== 'object' || Array.isArray(map)) {
-      throw new Error(t('Pricing must be a JSON object'))
-    }
+    const map = parsePricingOptionsMap(options[key])
     for (const [name, value] of Object.entries(map)) {
-      if (typeof value !== 'number' && typeof value !== 'string') {
-        throw new Error(t('Invalid pricing value'))
-      }
       const model = models.get(name) ?? {}
       model[key] = value
       models.set(name, model)
@@ -193,6 +253,22 @@ export function applyPriceSyncSelections(
     if (expression) {
       next['billing_setting.billing_mode'] = 'tiered_expr'
       next['billing_setting.billing_expr'] = fields.billing_expr
+      for (const sharedKey of SHARED_PRICING_KEYS) {
+        const rawMap = parsePricingOptionsMap(result[sharedKey])
+        if (Object.hasOwn(rawMap, name)) {
+          next[sharedKey] = rawMap[name]
+        }
+      }
+      for (const [field, value] of Object.entries(fields)) {
+        if (field === 'billing_mode' || field === 'billing_expr') continue
+        const key = field
+          .split('_')
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join('') as PricingKey
+        if (EXACT_PRICING_KEYS.includes(key as ExactPricingKey)) {
+          next[key] = value
+        }
+      }
     } else {
       next['billing_setting.billing_mode'] = 'ratio'
       const fixed = fields.model_price !== undefined

@@ -97,6 +97,37 @@ func newTestUserSession(sid string, userID int, now int64) *UserSession {
 	}
 }
 
+func TestCreateUserSessionFromLoginFlowUsesTransactionConnection(t *testing.T) {
+	setupUserSessionTest(t)
+	createUserSessionTestUser(t, 1997, 1)
+	generation, err := GetUserSessionGeneration(1997)
+	require.NoError(t, err)
+	flowToken, _, err := CreateAuthFlow(AuthFlowCreate{
+		Purpose: AuthFlowPurposeLoginVerification, UserId: 1997,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+	require.NoError(t, err)
+
+	// The fixture has one connection; the deadline bounds a regression that
+	// tries to acquire it again while the login transaction already holds it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	previousDB := DB
+	DB = DB.WithContext(ctx)
+	t.Cleanup(func() { DB = previousDB })
+	session := newTestUserSession("login-flow-transaction", 1997, time.Now().Unix())
+	session.UserGeneration = ""
+	require.NoError(t, CreateUserSessionFromLoginFlow(flowToken, session, func(*AuthFlow, *UserVerificationState) error {
+		return nil
+	}))
+	var stored UserSession
+	require.NoError(t, DB.First(&stored, "sid = ?", session.SID).Error)
+	assert.Equal(t, generation, stored.UserGeneration)
+	var consumed AuthFlow
+	require.NoError(t, DB.First(&consumed, "token_hash = ?", authFlowTokenHash(flowToken)).Error)
+	assert.NotNil(t, consumed.ConsumedAt)
+}
+
 func TestUserSessionCacheTTLUsesShortCacheWindow(t *testing.T) {
 	setupUserSessionTest(t)
 	server := useUserCacheMiniRedis(t)

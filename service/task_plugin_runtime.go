@@ -72,7 +72,7 @@ func cacheHistoricalTaskPlugin(cacheKey string, plugin *pluginruntime.LoadedPlug
 }
 
 func restoreHistoricalOverrideTaskPlugin(snapshot *model.TaskPluginSnapshot, override *model.TaskPlugin, requireSourceHash bool) *pluginruntime.LoadedPlugin {
-	if !pluginruntime.DefaultRegistry.OverrideEnabled() || override == nil || !override.Enabled {
+	if !pluginruntime.DefaultRegistry.Enabled() || override == nil || !override.Enabled {
 		return nil
 	}
 	if requireSourceHash && (snapshot.SourceHash == "" || override.SourceHash != snapshot.SourceHash) {

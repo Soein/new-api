@@ -231,6 +231,52 @@ func TestAccessTokenUpdateRejectsReusedUserID(t *testing.T) {
 	assert.Empty(t, stored.GetAccessToken())
 }
 
+func TestAccessTokenRevokeRejectsReusedUserID(t *testing.T) {
+	truncateTables(t)
+	original := seedAdminTestUser(t, "deleted-before-pat-revoke", common.RoleCommonUser, 0)
+	require.NoError(t, DB.Unscoped().Delete(&User{}, original.Id).Error)
+	createdAt := int64(1234)
+	replacement := &User{
+		Id: original.Id, Username: "replacement-pat-owner", Password: "password",
+		Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default",
+		AffCode: "replacement-pat-owner", AccessToken: common.GetPointer("replacement-pat"),
+		AccessTokenCreatedAt: &createdAt,
+	}
+	require.NoError(t, DB.Create(replacement).Error)
+
+	for _, tc := range []struct {
+		name       string
+		id         int
+		generation string
+	}{
+		{name: "reused identity", id: original.Id, generation: original.SessionGeneration},
+		{name: "missing generation", id: replacement.Id},
+		{name: "invalid id", generation: replacement.SessionGeneration},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref, err := RevokeUserAccessToken(tc.id, tc.generation)
+			require.ErrorIs(t, err, ErrUserNotFound)
+			assert.Empty(t, ref)
+			var stored User
+			require.NoError(t, DB.First(&stored, replacement.Id).Error)
+			assert.Equal(t, "replacement-pat", stored.GetAccessToken())
+			require.NotNil(t, stored.AccessTokenCreatedAt)
+			assert.Equal(t, createdAt, *stored.AccessTokenCreatedAt)
+		})
+	}
+
+	ref, err := RevokeUserAccessToken(replacement.Id, replacement.SessionGeneration)
+	require.NoError(t, err)
+	assert.Equal(t, AccessTokenFingerprint("replacement-pat"), ref)
+	var stored User
+	require.NoError(t, DB.First(&stored, replacement.Id).Error)
+	assert.Nil(t, stored.AccessToken)
+	assert.Nil(t, stored.AccessTokenCreatedAt)
+	ref, err = RevokeUserAccessToken(replacement.Id, replacement.SessionGeneration)
+	require.NoError(t, err)
+	assert.Empty(t, ref)
+}
+
 func TestEnsureUserSessionGenerationUpgradesLegacyUser(t *testing.T) {
 	truncateTables(t)
 	user := seedAdminTestUser(t, "legacy-session-user", common.RoleCommonUser, 0)

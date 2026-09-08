@@ -19,6 +19,7 @@ import (
 
 func setupUserAdminControllerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
+	require.NoError(t, i18n.Init())
 	db := openTokenControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(
 		&model.User{},
@@ -32,6 +33,7 @@ func setupUserAdminControllerTestDB(t *testing.T) *gorm.DB {
 		&model.TwoFA{},
 		&model.TwoFABackupCode{},
 		&model.Log{},
+		&model.AuditLog{},
 	))
 	return db
 }
@@ -161,7 +163,7 @@ func TestDeleteUsersBatchRejectsUnauthorizedTargetAtomically(t *testing.T) {
 	require.NoError(t, db.Model(&model.User{}).Count(&remaining).Error)
 	assert.EqualValues(t, 3, remaining)
 
-	var auditLogs []model.Log
+	var auditLogs []model.AuditLog
 	require.NoError(t, db.Order("id asc").Find(&auditLogs).Error)
 	require.Len(t, auditLogs, 2)
 	type auditPayload struct {
@@ -175,8 +177,12 @@ func TestDeleteUsersBatchRejectsUnauthorizedTargetAtomically(t *testing.T) {
 	}
 	var requested auditPayload
 	var failed auditPayload
-	require.NoError(t, common.Unmarshal([]byte(auditLogs[0].Other), &requested))
-	require.NoError(t, common.Unmarshal([]byte(auditLogs[1].Other), &failed))
+	requestedJSON, err := common.Marshal(auditLogs[0].Other)
+	require.NoError(t, err)
+	failedJSON, err := common.Marshal(auditLogs[1].Other)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(requestedJSON, &requested))
+	require.NoError(t, common.Unmarshal(failedJSON, &failed))
 	assert.Equal(t, "user.delete_batch_request", requested.Op.Action)
 	assert.ElementsMatch(t, []int{commonUser.Id, peerAdmin.Id}, requested.Op.Params.Ids)
 	assert.Equal(t, "user.delete_batch_failure", failed.Op.Action)
@@ -188,7 +194,7 @@ func TestDeleteUsersBatchDoesNotDeleteWhenAuditIsUnavailable(t *testing.T) {
 	db := setupUserAdminControllerTestDB(t)
 	actor := seedUserAdminControllerTestUser(t, db, "audit-root", common.RoleRootUser, 0)
 	target := seedUserAdminControllerTestUser(t, db, "audit-target", common.RoleCommonUser, -1)
-	require.NoError(t, db.Migrator().DropTable(&model.Log{}))
+	require.NoError(t, db.Migrator().DropTable(&model.AuditLog{}))
 
 	ctx, recorder := newAuthenticatedContext(
 		t,
@@ -206,7 +212,7 @@ func TestDeleteUsersBatchDoesNotDeleteWhenAuditIsUnavailable(t *testing.T) {
 
 	response := decodeAPIResponse(t, recorder)
 	assert.False(t, response.Success)
-	assert.Equal(t, i18n.MsgDatabaseError, response.Message)
+	assert.Equal(t, i18n.T(ctx, i18n.MsgDatabaseError), response.Message)
 
 	var remaining int64
 	require.NoError(t, db.Model(&model.User{}).Count(&remaining).Error)

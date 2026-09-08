@@ -212,7 +212,9 @@ describe('pricing unit duplication and model card regression tests', () => {
 
       expect(screen.getByText(/dall-e-3/)).toBeInTheDocument()
       expect(screen.getByText(/\$0\.04/)).toBeInTheDocument()
-      expect(screen.getByText(/\/image/)).toBeInTheDocument()
+      const pricingGroup = screen.getByRole('group', { name: /pricing/i })
+      expect(within(pricingGroup).getByText(/\/\s*image/)).toBeInTheDocument()
+      expect(within(pricingGroup).queryByText(/\/\s*1M/)).toBeNull()
       expect(screen.queryByText(/^1M$/)).toBeNull()
     })
 
@@ -272,7 +274,12 @@ describe('pricing unit duplication and model card regression tests', () => {
       )
 
       expect(screen.getByText(/gpt-4o-card/)).toBeInTheDocument()
-      expect(screen.getByText('1M')).toBeInTheDocument()
+      expect(screen.getByText(/\$2\.5/)).toBeInTheDocument()
+      expect(screen.getByText(/\$10/)).toBeInTheDocument()
+      const pricingGroup = screen.getByRole('group', { name: /pricing/i })
+      const tokenUnits = within(pricingGroup).getAllByText(/\/\s*1M/)
+      expect(tokenUnits).toHaveLength(2)
+      expect(within(pricingGroup).queryByText(/\/\s*image/)).toBeNull()
     })
 
     test('mixed dynamic model card displays /image and 1M token unit', () => {
@@ -299,8 +306,11 @@ describe('pricing unit duplication and model card regression tests', () => {
       )
 
       expect(screen.getByText(/mixed-card-model/)).toBeInTheDocument()
-      expect(screen.getByText(/\/image/)).toBeInTheDocument()
-      expect(screen.getByText('1M')).toBeInTheDocument()
+      expect(screen.getByText(/\$2\.5/)).toBeInTheDocument()
+      expect(screen.getByText(/\$0\.04/)).toBeInTheDocument()
+      const pricingGroup = screen.getByRole('group', { name: /pricing/i })
+      expect(within(pricingGroup).getByText(/\/\s*image/)).toBeInTheDocument()
+      expect(within(pricingGroup).getByText(/\/\s*1M/)).toBeInTheDocument()
     })
   })
 })

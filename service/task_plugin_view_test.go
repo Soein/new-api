@@ -95,6 +95,71 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(source))), snapshot.TaskPlugin.SourceHash)
 }
 
+func TestHistoricalTaskPluginRespectsMasterAndPluginSwitches(t *testing.T) {
+	const source = `
+export const meta = {apiVersion: 1, key: "historical-switches", name: "Historical Switches", version: "1.0.0", author: {name: "Test"}, models: ["history"], fetchMode: "per_task"};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`
+	previousRegistry := pluginruntime.DefaultRegistry
+	registry := pluginruntime.NewRegistry()
+	pluginruntime.DefaultRegistry = registry
+	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+	require.NoError(t, model.DB.AutoMigrate(&model.TaskPlugin{}))
+	historical := &model.TaskPlugin{
+		Key: "historical-switches", APIVersion: 1, Version: "1.0.0",
+		Source: source, SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source))), Enabled: true,
+	}
+	active := &model.TaskPlugin{
+		Key: historical.Key, APIVersion: 1, Version: "2.0.0",
+		Source: "unused active source", SourceHash: "active-source", Enabled: true, Active: true,
+	}
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Where(&model.TaskPlugin{Key: historical.Key}).Delete(&model.TaskPlugin{}).Error)
+	})
+	require.NoError(t, model.DB.Create(historical).Error)
+	require.NoError(t, model.DB.Create(active).Error)
+	task := &model.Task{PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{
+		TaskPlugin: &model.TaskPluginSnapshot{
+			Key: historical.Key, APIVersion: 1, Version: historical.Version,
+			Layer: pluginruntime.PluginLayerOverride, SourceHash: historical.SourceHash,
+		},
+	}}}
+
+	for _, tc := range []struct {
+		name              string
+		masterEnabled     bool
+		activeEnabled     bool
+		historicalEnabled bool
+		wantRestored      bool
+	}{
+		{"enabled historical source", true, true, true, true},
+		{"master disabled after cache warmup", false, true, true, false},
+		{"master reenabled", true, true, true, true},
+		{"active plugin disabled", true, false, true, false},
+		{"historical version disabled", true, true, false, false},
+		{"plugin reenabled", true, true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registry.SetEnabled(tc.masterEnabled)
+			require.NoError(t, model.DB.Model(active).Update("enabled", tc.activeEnabled).Error)
+			require.NoError(t, model.DB.Model(historical).Update("enabled", tc.historicalEnabled).Error)
+			plugin, _, ok := ResolveExactTaskPluginForTask(task)
+			require.Equal(t, tc.wantRestored, ok)
+			if !tc.wantRestored {
+				assert.Nil(t, plugin)
+				return
+			}
+			require.NotNil(t, plugin)
+			assert.Equal(t, historical.Version, plugin.Meta.Version)
+			assert.Equal(t, historical.SourceHash, plugin.SourceHash)
+			assert.Equal(t, pluginruntime.PluginLayerOverride, plugin.Layer)
+		})
+	}
+}
+
 func TestBuildTaskPluginViewOmitsPrivatePollState(t *testing.T) {
 	task := &model.Task{
 		TaskID: "task_public_view",

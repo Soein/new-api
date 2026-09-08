@@ -125,7 +125,7 @@ func ResolveExactTaskPluginForTask(task *model.Task) (*pluginruntime.LoadedPlugi
 		if !pluginruntime.DefaultRegistry.FactoryEnabled(snapshot.Key) {
 			return nil, generation, false
 		}
-		plugin, ok := pluginruntime.DefaultRegistry.FactoryPlugin(snapshot.Key)
+		plugin, ok := pluginruntime.DefaultRegistry.FactoryPluginVersion(snapshot.Key, snapshot.Version)
 		if !ok || plugin.Layer != pluginruntime.PluginLayerFactory || !taskPluginSnapshotMatches(plugin, snapshot, true) {
 			return nil, generation, false
 		}
@@ -150,7 +150,7 @@ func ResolveExactTaskPluginForTask(task *model.Task) (*pluginruntime.LoadedPlugi
 
 	override, err := model.GetTaskPluginVersionForExecution(snapshot.Key, snapshot.Version)
 	if err == nil {
-		if factory, ok := pluginruntime.DefaultRegistry.FactoryPlugin(snapshot.Key); ok && factory.Meta.Version == snapshot.Version {
+		if _, ok := pluginruntime.DefaultRegistry.FactoryPluginVersion(snapshot.Key, snapshot.Version); ok {
 			logger.LogWarn(context.Background(), fmt.Sprintf(
 				"Legacy task plugin %s@%s has ambiguous factory and override sources; refusing to execute",
 				snapshot.Key, snapshot.Version,
@@ -168,7 +168,7 @@ func ResolveExactTaskPluginForTask(task *model.Task) (*pluginruntime.LoadedPlugi
 		return nil, generation, false
 	}
 
-	plugin, ok := pluginruntime.DefaultRegistry.FactoryPlugin(snapshot.Key)
+	plugin, ok := pluginruntime.DefaultRegistry.FactoryPluginVersion(snapshot.Key, snapshot.Version)
 	if !pluginruntime.DefaultRegistry.FactoryEnabled(snapshot.Key) || !ok || plugin.Layer != pluginruntime.PluginLayerFactory || !taskPluginSnapshotMatches(plugin, snapshot, false) {
 		logger.LogWarn(context.Background(), fmt.Sprintf(
 			"Exact task plugin %s@%s is unavailable; refusing to use the current active version",

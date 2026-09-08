@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay/channel"
 	jspluginadaptor "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -278,6 +279,77 @@ func TestGetTaskAdaptorForTaskFailsClosedWhenHistoricalFactoryVersionIsUnavailab
 	}}
 
 	assert.Nil(t, GetTaskAdaptorForTask(task), "a removed factory source must never fall forward to the active factory version")
+}
+
+func TestGetTaskAdaptorForTaskRestoresArchivedFactoryIdentity(t *testing.T) {
+	originalDB := model.DB
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.TaskPluginState{}, &model.TaskPlugin{}))
+	model.DB = database
+	t.Cleanup(func() { model.DB = originalDB })
+
+	for _, test := range []struct {
+		key, hash string
+	}{
+		{"alibaba", "336dc982f878047fa1c9dd8a31280964f9f44e158020a95c26dbbdc6e9501676"},
+		{"sunoapi", "4d5d1253b051202a31b1432f8888a7eef19957ccdd908ecf2b503b9759111930"},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			registry := pluginruntime.DefaultRegistry
+			active, ok := registry.Get(test.key)
+			require.True(t, ok)
+			require.NotEqual(t, "1.0.1", active.Meta.Version)
+			task := &model.Task{Platform: constant.TaskPlatform(test.key)}
+			snapshot := &model.TaskPluginSnapshot{
+				Key: test.key, Version: "1.0.1", APIVersion: 1, Generation: 42,
+				Layer: pluginruntime.PluginLayerFactory, SourceHash: test.hash,
+			}
+			task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: snapshot}
+			require.NotNil(t, GetTaskAdaptorForTask(task), "upgrades must retain the original factory task adaptor")
+			restored, generation, ok := service.ResolveExactTaskPluginForTask(task)
+			require.True(t, ok)
+			assert.Equal(t, test.hash, restored.SourceHash)
+			assert.Equal(t, pluginruntime.PluginLayerFactory, restored.Layer)
+			assert.Equal(t, uint64(42), generation.Number)
+			current, ok := registry.Get(test.key)
+			require.True(t, ok)
+			assert.Same(t, active, current, "historical execution must not replace new-request routing")
+
+			for _, hash := range []string{"", active.SourceHash} {
+				snapshot.SourceHash = hash
+				assert.Nil(t, GetTaskAdaptorForTask(task), "a factory version requires its exact original source hash")
+			}
+			snapshot.SourceHash = test.hash
+			snapshot.APIVersion = 2
+			assert.Nil(t, GetTaskAdaptorForTask(task))
+			snapshot.APIVersion = 1
+
+			previousDisabled := registry.Snapshot().DisabledFactory
+			t.Cleanup(func() { registry.SetDisabledFactoryKeys(previousDisabled); registry.SetEnabled(true) })
+			registry.SetDisabledFactoryKeys(append(append([]string(nil), previousDisabled...), test.key))
+			assert.Nil(t, GetTaskAdaptorForTask(task), "disabling a factory must also stop its history")
+			registry.SetDisabledFactoryKeys(previousDisabled)
+			registry.SetEnabled(false)
+			assert.Nil(t, GetTaskAdaptorForTask(task), "the master switch must also stop historical execution")
+			registry.SetEnabled(true)
+
+			snapshot.Layer, snapshot.SourceHash = "", ""
+			require.NotNil(t, GetTaskAdaptorForTask(task), "unambiguous legacy snapshots may restore archived factories")
+			source := `export const meta = {apiVersion: 1, key: "` + test.key + `", name: "Override", version: "1.0.1", author: {name: "Test"}, models: ["doc"], fetchMode: "per_task"};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }`
+			require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+				Key: test.key, Version: "1.0.1", APIVersion: 1, Enabled: true,
+				Source: source, SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source))),
+			}))
+			assert.Nil(t, GetTaskAdaptorForTask(task), "legacy factory/override ambiguity must include archived versions")
+			snapshot.Layer, snapshot.SourceHash = pluginruntime.PluginLayerFactory, test.hash
+			require.NotNil(t, GetTaskAdaptorForTask(task), "a same-version override must not mask a pinned factory")
+		})
+	}
 }
 
 func TestGetTaskAdaptorForRequestUsesExactPinnedPlugin(t *testing.T) {

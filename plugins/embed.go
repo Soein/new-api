@@ -4,11 +4,15 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"strings"
 
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 )
 
-//go:embed tasks/*/plugin.js
+// Previous factory sources must remain byte-identical: task snapshots pin their
+// SHA-256 hashes. Archive a replaced version before updating its current source.
+//
+//go:embed tasks/*/plugin.js tasks/*/history/*/plugin.js
 var taskPlugins embed.FS
 
 func init() {
@@ -27,6 +31,20 @@ func init() {
 		}
 		if _, registerErr := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: key}); registerErr != nil {
 			panic(fmt.Sprintf("register embedded task plugin %s: %v", key, registerErr))
+		}
+		history, historyErr := fs.Glob(taskPlugins, "tasks/"+key+"/history/*/plugin.js")
+		if historyErr != nil {
+			panic(fmt.Sprintf("read embedded task plugin history %s: %v", key, historyErr))
+		}
+		for _, path := range history {
+			archived, readErr := taskPlugins.ReadFile(path)
+			if readErr != nil {
+				panic(fmt.Sprintf("read embedded task plugin history %s: %v", path, readErr))
+			}
+			version := strings.Split(path, "/")[3]
+			if _, registerErr := jsplugin.DefaultRegistry.RegisterFactoryHistory(string(archived), jsplugin.Options{Key: key, Version: version}); registerErr != nil {
+				panic(fmt.Sprintf("register embedded task plugin history %s: %v", path, registerErr))
+			}
 		}
 	}
 }

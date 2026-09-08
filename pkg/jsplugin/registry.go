@@ -200,6 +200,7 @@ type RoutingGenerationPreparer func(candidate, current *RoutingGeneration) (Prep
 type Registry struct {
 	mu              sync.RWMutex
 	factory         map[string]*LoadedPlugin
+	factoryHistory  map[factoryPluginVersion]*LoadedPlugin
 	override        map[string]*LoadedPlugin
 	activeOverride  map[string]*LoadedPlugin
 	disabledFactory map[string]struct{}
@@ -211,9 +212,14 @@ type Registry struct {
 	lastRebuild     RoutingRebuildOutcome
 }
 
+type factoryPluginVersion struct {
+	key, version string
+}
+
 func NewRegistry() *Registry {
 	registry := &Registry{
 		factory:        make(map[string]*LoadedPlugin),
+		factoryHistory: make(map[factoryPluginVersion]*LoadedPlugin),
 		override:       make(map[string]*LoadedPlugin),
 		activeOverride: make(map[string]*LoadedPlugin),
 		routingErrors:  make(map[string]string),
@@ -239,6 +245,33 @@ func (r *Registry) RegisterFactory(source string, options Options) (*LoadedPlugi
 	return r.register(source, options, true)
 }
 
+// RegisterFactoryHistory retains an immutable factory version for existing
+// tasks without publishing its routes or admitting new requests to that version.
+func (r *Registry) RegisterFactoryHistory(source string, options Options) (*LoadedPlugin, error) {
+	plugin, err := CompilePlugin(source, options)
+	if err != nil {
+		return nil, err
+	}
+	if plugin.Meta.Key != options.Key || plugin.Meta.Version != options.Version {
+		return nil, fmt.Errorf("historical factory metadata does not match %s@%s", options.Key, options.Version)
+	}
+	plugin.Layer = PluginLayerFactory
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	identity := factoryPluginVersion{plugin.Meta.Key, plugin.Meta.Version}
+	if existing := r.factoryHistory[identity]; existing != nil {
+		if existing.SourceHash != plugin.SourceHash {
+			return nil, fmt.Errorf("historical factory %s@%s has conflicting source", options.Key, options.Version)
+		}
+		return existing, nil
+	}
+	if current := r.factory[plugin.Meta.Key]; current != nil && current.Meta.Version == plugin.Meta.Version && current.SourceHash != plugin.SourceHash {
+		return nil, fmt.Errorf("historical factory %s@%s conflicts with current source", options.Key, options.Version)
+	}
+	r.factoryHistory[identity] = plugin
+	return plugin, nil
+}
+
 func (r *Registry) register(source string, options Options, factory bool) (*LoadedPlugin, error) {
 	plugin, err := CompilePlugin(source, options)
 	if err != nil {
@@ -250,6 +283,9 @@ func (r *Registry) register(source string, options Options, factory bool) (*Load
 	factoryPlugins := clonePluginMap(r.factory)
 	overridePlugins := clonePluginMap(r.override)
 	if factory {
+		if archived := r.factoryHistory[factoryPluginVersion{plugin.Meta.Key, plugin.Meta.Version}]; archived != nil && archived.SourceHash != plugin.SourceHash {
+			return nil, fmt.Errorf("factory %s@%s conflicts with archived source", plugin.Meta.Key, plugin.Meta.Version)
+		}
 		plugin.Layer = PluginLayerFactory
 		factoryPlugins[plugin.Meta.Key] = plugin
 	} else {
@@ -497,6 +533,19 @@ func (r *Registry) FactoryPlugin(key string) (*LoadedPlugin, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	plugin, ok := r.factory[key]
+	return plugin, ok
+}
+
+// FactoryPluginVersion returns the current or archived factory source for a
+// version. Callers must check FactoryEnabled and the task's pinned source hash
+// before executing it; archived versions never participate in active routing.
+func (r *Registry) FactoryPluginVersion(key, version string) (*LoadedPlugin, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if current := r.factory[key]; current != nil && current.Meta.Version == version {
+		return current, true
+	}
+	plugin, ok := r.factoryHistory[factoryPluginVersion{key, version}]
 	return plugin, ok
 }
 

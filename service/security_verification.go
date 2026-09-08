@@ -19,6 +19,7 @@ const (
 	VerificationMethodPasskey            = "passkey"
 	VerificationMethodPassword           = "password"
 	VerificationMethodOAuth              = "oauth"
+	VerificationMethodWeChat             = "wechat"
 	VerificationMethodSession            = "session"
 	VerificationScopeChannelKeyRead      = "channel.key.read"
 	VerificationScopePasskeyRegister     = "passkey.register"
@@ -165,6 +166,7 @@ type VerificationRequirements struct {
 	Methods                   []VerificationMethodOption  `json:"methods"`
 	OAuthProviders            []VerificationOAuthProvider `json:"oauth_providers"`
 	PasswordEncryptionEnabled bool                        `json:"password_encryption_enabled"`
+	WeChatQRCodeURL           string                      `json:"wechat_qr_code_url,omitempty"`
 }
 
 // securityVerificationPolicy is the only operation-to-method policy. Device
@@ -257,6 +259,20 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 		if err != nil {
 			return nil, err
 		}
+		wechatMethod := VerificationMethodOption{Method: VerificationMethodWeChat, Available: methods[i].Available, Reason: methods[i].Reason}
+		if user.WeChatId != "" {
+			if !common.WeChatAuthEnabled || common.WeChatServerAddress == "" || common.WeChatServerToken == "" {
+				wechatMethod.Available, wechatMethod.Reason = false, ErrVerificationUnavailable.Error()
+			}
+			if wechatMethod.Available {
+				requirements.WeChatQRCodeURL = common.WeChatAccountQRCodeImageURL
+			}
+			if len(requirements.OAuthProviders) == 0 {
+				methods[i] = wechatMethod
+				continue
+			}
+			methods = append(methods, wechatMethod)
+		}
 		if len(requirements.OAuthProviders) == 0 {
 			methods[i].Available, methods[i].Reason = false, "No linked OAuth provider is available."
 			if user.TelegramId != "" {
@@ -266,6 +282,7 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 			}
 		}
 	}
+	requirements.Methods = methods
 	return requirements, nil
 }
 
@@ -420,6 +437,25 @@ func VerifySecurityInput(identity AuthIdentity, input VerificationInput) (*Secur
 		return nil, err
 	}
 	switch input.Method {
+	case VerificationMethodWeChat:
+		if _, _, err := ValidateLoginSession(identity); err != nil {
+			return nil, err
+		}
+		user, err := model.GetUserById(identity.UserID, false)
+		if err != nil {
+			return nil, err
+		}
+		wechatID, err := ResolveWeChatIDByCode(input.Code)
+		if err != nil || wechatID != user.WeChatId {
+			return nil, ErrVerificationFailed
+		}
+		current, err := model.GetUserById(identity.UserID, false)
+		if err != nil {
+			return nil, err
+		}
+		if current.WeChatId != wechatID {
+			return nil, ErrVerificationFailed
+		}
 	case VerificationMethodPassword:
 		password := input.Password
 		if common.PasswordLoginEncryptionEnabled {

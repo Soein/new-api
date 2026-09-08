@@ -46,6 +46,7 @@ const methodLabels: Record<VerificationMethod, string> = {
   password: 'Password',
   oauth: 'Linked account',
   session: 'Login session',
+  wechat: 'WeChat',
 }
 
 export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
@@ -70,6 +71,10 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
   if (input?.method === 'oauth') {
     canVerify = canVerify && Boolean(input.provider)
   }
+  if (input?.method === 'wechat') {
+    const trimmed = input.code.trim()
+    canVerify = canVerify && trimmed.length > 0 && trimmed.length <= 128
+  }
   const error = 'error' in state ? state.error : undefined
   const formId = `${inputId}-form`
 
@@ -89,6 +94,9 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
           method,
           provider: ready?.requirements.oauth_providers[0]?.slug ?? '',
         })
+        break
+      case 'wechat':
+        props.onInputChange({ method, code: '' })
         break
     }
   }
@@ -263,6 +271,44 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
                       {provider.name}
                     </Button>
                   ))}
+                </div>
+              </TabsContent>
+              <TabsContent value='wechat' className='space-y-4'>
+                {ready.requirements.wechat_qr_code_url ? (
+                  <div className='flex justify-center'>
+                    <img
+                      src={ready.requirements.wechat_qr_code_url}
+                      alt={t('WeChat login QR code')}
+                      className='size-48 rounded-lg border object-contain'
+                    />
+                  </div>
+                ) : (
+                  <p className='text-muted-foreground text-sm'>
+                    {t('QR code is not configured. Please contact support.')}
+                  </p>
+                )}
+                <p className='text-muted-foreground text-sm'>
+                  {t(
+                    'Scan the QR code with your currently linked WeChat account to obtain a verification code.'
+                  )}
+                </p>
+                <div className='space-y-2'>
+                  <Label htmlFor={inputId}>{t('Verification code')}</Label>
+                  <Input
+                    id={inputId}
+                    autoComplete='one-time-code'
+                    maxLength={128}
+                    autoFocus
+                    disabled={verifying}
+                    placeholder={t('Enter the verification code')}
+                    value={input.method === 'wechat' ? input.code : ''}
+                    onChange={(event) =>
+                      props.onInputChange({
+                        method: 'wechat',
+                        code: event.target.value,
+                      })
+                    }
+                  />
                 </div>
               </TabsContent>
             </Tabs>

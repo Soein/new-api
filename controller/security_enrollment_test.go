@@ -170,7 +170,7 @@ func TestSecurityEnrollmentAccessTokenMethodPolicy(t *testing.T) {
 		{name: "disabled passkey blocks fallback", method: "passkey", password: true, passkey: true, disabledPasskey: true},
 		{name: "disabled passkey does not block password", method: "password", password: true, disabledPasskey: true, available: true},
 		{name: "linked oauth", method: "oauth", oauth: true, available: true},
-		{name: "wechat session cannot manage tokens", method: "oauth", wechat: true},
+		{name: "disabled wechat cannot manage tokens", method: "wechat", wechat: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			user, identity := setupSecurityEnrollmentTest(t)
@@ -1434,6 +1434,136 @@ func completeFirstSecurityFactor(t *testing.T, identity service.AuthIdentity, pr
 	assert.Error(t, err)
 }
 
+// The configured WeChat server consumes codes atomically, including failed identity matches.
+func setupWeChatSecurityVerification(t *testing.T, codes map[string]string) (*model.User, service.AuthIdentity) {
+	t.Helper()
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"password": "", "wechat_id": "wechat-user"}).Error)
+	previousEnabled, previousAddress, previousToken, previousQRCode := common.WeChatAuthEnabled, common.WeChatServerAddress, common.WeChatServerToken, common.WeChatAccountQRCodeImageURL
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/wechat/user", r.URL.Path)
+		assert.Equal(t, "wechat-test-token", r.Header.Get("Authorization"))
+		code := r.URL.Query().Get("code")
+		wechatID := codes[code]
+		delete(codes, code)
+		payload, err := common.Marshal(map[string]any{"success": true, "data": wechatID})
+		require.NoError(t, err)
+		_, err = w.Write(payload)
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+	common.WeChatAuthEnabled, common.WeChatServerAddress = true, server.URL
+	common.WeChatServerToken, common.WeChatAccountQRCodeImageURL = "wechat-test-token", "https://example.com/wechat-qr.png"
+	t.Cleanup(func() {
+		common.WeChatAuthEnabled, common.WeChatServerAddress, common.WeChatServerToken, common.WeChatAccountQRCodeImageURL = previousEnabled, previousAddress, previousToken, previousQRCode
+	})
+	return user, identity
+}
+
+func TestSecurityEnrollmentWeChatVerification(t *testing.T) {
+	user, identity := setupWeChatSecurityVerification(t, map[string]string{"other-code": "another-user", "fresh+&code": "wechat-user"})
+	operation := service.VerificationOperation{Scope: service.VerificationScopeAccountBind, Context: json.RawMessage(`{"provider":"email","email":"linked@example.com"}`)}
+	requirements, err := service.GetVerificationRequirements(identity, operation.Scope)
+	require.NoError(t, err)
+	assert.Contains(t, requirements.Methods, service.VerificationMethodOption{Method: "wechat", Available: true})
+	for _, code := range []string{"", strings.Repeat("a", 129), "expired", "other-code"} {
+		proof, err := service.VerifySecurityInput(identity, service.VerificationInput{Method: "wechat", Scope: operation.Scope, Context: operation.Context, Code: code})
+		assert.Error(t, err, code)
+		assert.Nil(t, proof)
+	}
+	proof, err := service.VerifySecurityInput(identity, service.VerificationInput{Method: "wechat", Scope: operation.Scope, Context: operation.Context, Code: " fresh+&code "})
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+	assert.Equal(t, "wechat", proof.Method)
+	assert.Equal(t, operation.Scope, proof.Scope)
+	replayed, err := service.VerifySecurityInput(identity, service.VerificationInput{Method: "wechat", Scope: operation.Scope, Context: operation.Context, Code: "fresh+&code"})
+	assert.Error(t, err)
+	assert.Nil(t, replayed)
+	_, err = service.ConsumeOperationProof(proof.ProofToken, identity, service.VerificationOperation{Scope: service.VerificationScopeAccessTokenGenerate})
+	assert.Error(t, err)
+	_, err = service.ConsumeOperationProof(proof.ProofToken, identity, service.VerificationOperation{Scope: operation.Scope, Context: json.RawMessage(`{"provider":"email","email":"different@example.com"}`)})
+	assert.Error(t, err)
+	_, err = service.ConsumeOperationProof(proof.ProofToken, identity, operation)
+	require.NoError(t, err)
+	_, err = service.ConsumeOperationProof(proof.ProofToken, identity, operation)
+	assert.ErrorIs(t, err, service.ErrProofConsumed)
+	stored, err := model.GetUserById(user.Id, true)
+	require.NoError(t, err)
+	assert.Empty(t, stored.Password)
+	assert.Equal(t, "wechat-user", stored.WeChatId)
+}
+
+func TestSecurityEnrollmentWeChatRejectsChangedIdentityAndProviderErrors(t *testing.T) {
+	for _, scenario := range []string{"binding changed", "session revoked", "auth version changed", "password enrolled", "mfa enrolled", "provider disabled", "provider error", "malformed response", "redirect"} {
+		t.Run(scenario, func(t *testing.T) {
+			user, identity := setupWeChatSecurityVerification(t, nil)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				switch scenario {
+				case "binding changed":
+					err = model.DB.Model(user).Update("wechat_id", "different-user").Error
+				case "session revoked":
+					err = model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("revoked_at", time.Now().Unix()).Error
+				case "auth version changed":
+					err = model.DB.Model(user).Update("auth_version", identity.UserAuthVersion+1).Error
+				case "password enrolled":
+					err = model.DB.Model(user).Update("password", "new-password-hash").Error
+				case "mfa enrolled":
+					err = model.DB.Create(&model.PasskeyCredential{UserID: user.Id, CredentialID: "new-key", PublicKey: "public-key"}).Error
+				case "provider disabled":
+					common.WeChatAuthEnabled = false
+				case "provider error":
+					w.WriteHeader(http.StatusBadGateway)
+				case "malformed response":
+					_, err = w.Write([]byte("invalid"))
+					assert.NoError(t, err)
+					return
+				case "redirect":
+					w.Header().Set("Location", "/api/wechat/user?code=sensitive-code")
+					w.WriteHeader(http.StatusFound)
+				}
+				assert.NoError(t, err)
+				_, err = w.Write([]byte(`{"success":true,"data":"wechat-user"}`))
+				assert.NoError(t, err)
+			}))
+			t.Cleanup(server.Close)
+			common.WeChatServerAddress = server.URL
+			proof, err := service.VerifySecurityInput(identity, service.VerificationInput{Method: "wechat", Scope: service.VerificationScopeAccessTokenGenerate, Code: "sensitive-code"})
+			require.Error(t, err)
+			assert.Nil(t, proof)
+			assert.NotContains(t, err.Error(), "sensitive-code")
+			var proofCount int64
+			require.NoError(t, model.DB.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeSecurityProof).Count(&proofCount).Error)
+			assert.Zero(t, proofCount)
+		})
+	}
+}
+
+func TestSecurityEnrollmentWeChatRequirements(t *testing.T) {
+	user, identity := setupWeChatSecurityVerification(t, nil)
+	for _, scope := range []string{service.VerificationScopeTwoFASetup, service.VerificationScopePasskeyRegister,
+		service.VerificationScopeAccessTokenGenerate, service.VerificationScopeAccessTokenRevoke,
+		service.VerificationScopeAccountBind, service.VerificationScopeAccountUnbind,
+		service.VerificationScopePasswordSet, service.VerificationScopeAccountDelete} {
+		requirements, err := service.GetVerificationRequirements(identity, scope)
+		require.NoError(t, err)
+		assert.Equal(t, []service.VerificationMethodOption{{Method: "wechat", Available: true}}, requirements.Methods)
+		assert.Equal(t, common.WeChatAccountQRCodeImageURL, requirements.WeChatQRCodeURL)
+	}
+	require.NoError(t, model.DB.Model(user).Update("github_id", "linked-user").Error)
+	oauth.Register("wechat-alternative-oauth", &enrollmentOAuthProvider{externalID: "linked-user"})
+	t.Cleanup(func() { oauth.Unregister("wechat-alternative-oauth") })
+	requirements, err := service.GetVerificationRequirements(identity, service.VerificationScopePasswordSet)
+	require.NoError(t, err)
+	assert.Equal(t, []service.VerificationMethodOption{{Method: "oauth", Available: true}, {Method: "wechat", Available: true}}, requirements.Methods)
+	system_setting.GetPasskeySettings().Enabled = false
+	requirements, err = service.GetVerificationRequirements(identity, service.VerificationScopePasskeyRegister)
+	require.NoError(t, err)
+	for _, method := range requirements.Methods {
+		assert.False(t, method.Available)
+	}
+}
+
 func TestSecurityEnrollmentTelegramAndWeChatFirstFactor(t *testing.T) {
 	for _, provider := range []string{"telegram", "wechat"} {
 		for _, scope := range []string{service.VerificationScopeTwoFASetup, service.VerificationScopePasskeyRegister} {
@@ -1454,19 +1584,14 @@ func TestSecurityEnrollmentTelegramAndWeChatFirstFactor(t *testing.T) {
 					response = telegramOAuthCallback(state, code, identity)
 					method = service.VerificationMethodOAuth
 				} else {
-					user, identity = setupSecurityEnrollmentTest(t)
-					require.NoError(t, model.DB.Model(user).Updates(map[string]any{"password": "", "wechat_id": "wechat-user"}).Error)
-					request, err := common.Marshal(service.VerificationInput{Scope: scope, Method: method})
+					user, identity = setupWeChatSecurityVerification(t, map[string]string{"fresh-code": "wechat-user"})
+					method = "wechat"
+					request, err := common.Marshal(service.VerificationInput{Scope: scope, Method: method, Code: "fresh-code"})
 					require.NoError(t, err)
 					response = securityEnrollmentRequest("POST", "/api/verify", string(request), "", identity, UniversalVerify)
 				}
 				var body securityEnrollmentResponse
 				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
-				if provider == "wechat" {
-					assert.False(t, body.Success)
-					assert.NotContains(t, response.Body.String(), "proof_token")
-					return
-				}
 				require.True(t, body.Success, response.Body.String())
 				var proof service.SecurityProof
 				require.NoError(t, common.Unmarshal(body.Data, &proof))

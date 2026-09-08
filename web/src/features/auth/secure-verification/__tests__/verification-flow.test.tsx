@@ -418,3 +418,203 @@ it('keeps an enrolled Passkey unavailable when this browser cannot use it', asyn
   expect(screen.getByRole('button', { name: 'Verify' })).toBeDisabled()
   expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
 })
+
+it('handles WeChat-only security verification with QR code, instructions, and code submission', async () => {
+  const qrUrl = 'https://example.com/wechat-verify-qr.png'
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        scope: 'account.delete',
+        methods: [{ method: 'wechat', available: true }],
+        wechat_qr_code_url: qrUrl,
+        oauth_providers: [],
+        password_encryption_enabled: false,
+      },
+    },
+  })
+  const proof: SecurityProof = {
+    proof_token: 'wechat-proof-token',
+    method: 'wechat',
+    scope: 'account.delete',
+    expires_at: Math.floor(Date.now() / 1000) + 300,
+  }
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: proof },
+  })
+  const result = vi.fn()
+  const user = userEvent.setup()
+  render(
+    <Harness
+      operation={{
+        scope: 'account.delete',
+      }}
+      onResult={result}
+    />
+  )
+  await user.click(screen.getByText('Protected action'))
+
+  expect(
+    await screen.findByRole('tab', { name: /WeChat/i })
+  ).toBeInTheDocument()
+
+  const qrImg = screen.getByRole('img')
+  expect(qrImg).toHaveAttribute('src', qrUrl)
+
+  expect(
+    screen.getByText(/currently linked WeChat account|linked WeChat/i)
+  ).toBeVisible()
+
+  const codeInput = screen.getByLabelText(/verification code/i)
+  expect(codeInput).toHaveAttribute('autocomplete', 'one-time-code')
+
+  const verifyButton = screen.getByRole('button', { name: 'Verify' })
+  expect(verifyButton).toBeDisabled()
+
+  await user.type(codeInput, 'wx-code-789')
+  expect(verifyButton).toBeEnabled()
+
+  await user.click(verifyButton)
+
+  await waitFor(() => expect(result).toHaveBeenCalledExactlyOnceWith(proof))
+  expect(post).toHaveBeenCalledWith(
+    '/api/verify',
+    {
+      method: 'wechat',
+      code: 'wx-code-789',
+      scope: 'account.delete',
+    },
+    expect.objectContaining({ signal: expect.any(AbortSignal) })
+  )
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+})
+
+it('displays localized fallback text when WeChat QR code is not configured', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        scope: 'account.delete',
+        methods: [{ method: 'wechat', available: true }],
+        oauth_providers: [],
+        password_encryption_enabled: false,
+      },
+    },
+  })
+  const user = userEvent.setup()
+  render(
+    <Harness
+      operation={{
+        scope: 'account.delete',
+      }}
+      onResult={vi.fn()}
+    />
+  )
+  await user.click(screen.getByText('Protected action'))
+
+  expect(
+    await screen.findByRole('tab', { name: /WeChat/i })
+  ).toBeInTheDocument()
+  expect(
+    screen.getByText('QR code is not configured. Please contact support.')
+  ).toBeVisible()
+  expect(screen.queryByRole('img')).not.toBeInTheDocument()
+})
+
+it('clears the sensitive WeChat verification code on rejection and displays the error', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        scope: 'account.delete',
+        methods: [{ method: 'wechat', available: true }],
+        oauth_providers: [],
+        password_encryption_enabled: false,
+      },
+    },
+  })
+  const proof: SecurityProof = {
+    proof_token: 'proof-after-retry',
+    method: 'wechat',
+    scope: 'account.delete',
+    expires_at: Math.floor(Date.now() / 1000) + 300,
+  }
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: { success: false, message: 'Invalid verification code' },
+    })
+    .mockResolvedValueOnce({
+      data: { success: true, data: proof },
+    })
+  const result = vi.fn()
+  const user = userEvent.setup()
+  render(
+    <Harness
+      operation={{
+        scope: 'account.delete',
+      }}
+      onResult={result}
+    />
+  )
+  await user.click(screen.getByText('Protected action'))
+
+  const codeInput = await screen.findByLabelText(/verification code/i)
+  await user.type(codeInput, 'bad-code')
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Invalid verification code'
+  )
+  expect(codeInput).toHaveValue('')
+  expect(result).not.toHaveBeenCalled()
+
+  await user.type(codeInput, 'correct-code')
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+
+  await waitFor(() => expect(result).toHaveBeenCalledWith(proof))
+  expect(post).toHaveBeenLastCalledWith(
+    '/api/verify',
+    {
+      method: 'wechat',
+      code: 'correct-code',
+      scope: 'account.delete',
+    },
+    expect.anything()
+  )
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+})
+
+it('clears WeChat verification code and resolves null on cancellation', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        scope: 'account.delete',
+        methods: [{ method: 'wechat', available: true }],
+        oauth_providers: [],
+        password_encryption_enabled: false,
+      },
+    },
+  })
+  const post = vi.spyOn(api, 'post')
+  const result = vi.fn()
+  const user = userEvent.setup()
+  render(
+    <Harness
+      operation={{
+        scope: 'account.delete',
+      }}
+      onResult={result}
+    />
+  )
+  await user.click(screen.getByText('Protected action'))
+
+  const codeInput = await screen.findByLabelText(/verification code/i)
+  await user.type(codeInput, 'secret-wechat-code')
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+
+  await waitFor(() => expect(result).toHaveBeenCalledWith(null))
+  expect(post).not.toHaveBeenCalled()
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+})

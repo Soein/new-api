@@ -4615,6 +4615,7 @@
     "Saving...": "正在保存...",
     "Scan QR Code": "扫描二维码",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "扫描二维码关注官方账号，回复“验证码”以接收您的验证码。",
+    "Scan the QR code with your currently linked WeChat account to obtain a verification code.": "请使用当前绑定的微信账号扫描二维码以获取验证码。",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "使用您的身份验证器应用（Google Authenticator、Microsoft Authenticator 等）扫描此二维码",
     "Scenario Templates": "场景模板",
     "Scheduled channel tests": "定期渠道测试",

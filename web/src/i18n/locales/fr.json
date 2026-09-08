@@ -4615,6 +4615,7 @@
     "Saving...": "Enregistrement en cours...",
     "Scan QR Code": "Scanner le code QR",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "Scannez le code QR pour suivre le compte officiel et répondez par « 验证码 » pour recevoir votre code de vérification.",
+    "Scan the QR code with your currently linked WeChat account to obtain a verification code.": "Scannez le code QR avec votre compte WeChat actuellement associé pour obtenir un code de vérification.",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "Scannez ce code QR avec votre application d'authentification (Google Authenticator, Microsoft Authenticator, etc.)",
     "Scenario Templates": "Modèles de scénario",
     "Scheduled channel tests": "Tests de canaux planifiés",

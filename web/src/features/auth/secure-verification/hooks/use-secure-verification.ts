@@ -79,6 +79,9 @@ function verificationReducer(
             provider: action.requirements.oauth_providers[0]?.slug ?? '',
           }
           break
+        case 'wechat':
+          input = { method: 'wechat', code: '' }
+          break
       }
       return {
         phase: 'ready',
@@ -104,6 +107,7 @@ function verificationReducer(
         input = { method: 'password', password: '' }
       }
       if (input?.method === '2fa') input = { method: '2fa', code: '' }
+      if (input?.method === 'wechat') input = { method: 'wechat', code: '' }
       return { ...state, phase: 'verifying', input, error: undefined }
     }
     case 'error':
@@ -111,7 +115,14 @@ function verificationReducer(
       if (state.phase === 'loading' || state.phase === 'error') {
         return { phase: 'error', request: state.request, error: action.error }
       }
-      return { ...state, phase: 'ready', error: action.error }
+      let input = state.input
+      if (input?.method === 'password') {
+        input = { method: 'password', password: '' }
+      }
+      if (input?.method === 'wechat') {
+        input = { method: 'wechat', code: '' }
+      }
+      return { ...state, phase: 'ready', input, error: action.error }
   }
 }
 

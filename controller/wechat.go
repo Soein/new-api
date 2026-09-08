@@ -1,13 +1,9 @@
 package controller
 
 import (
-	"errors"
-	"fmt"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
@@ -18,43 +14,6 @@ import (
 	"gorm.io/gorm"
 )
 
-type wechatLoginResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Data    string `json:"data"`
-}
-
-func getWeChatIdByCode(code string) (string, error) {
-	if code == "" {
-		return "", errors.New("无效的参数")
-	}
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/wechat/user?code=%s", common.WeChatServerAddress, url.QueryEscape(code)), nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", common.WeChatServerToken)
-	client := http.Client{
-		Timeout: 5 * time.Second,
-	}
-	httpResponse, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer httpResponse.Body.Close()
-	var res wechatLoginResponse
-	err = common.DecodeJson(httpResponse.Body, &res)
-	if err != nil {
-		return "", err
-	}
-	if !res.Success {
-		return "", errors.New(res.Message)
-	}
-	if res.Data == "" {
-		return "", errors.New("验证码错误或已过期")
-	}
-	return res.Data, nil
-}
-
 func WeChatAuth(c *gin.Context) {
 	if !common.WeChatAuthEnabled {
 		c.JSON(http.StatusOK, gin.H{
@@ -64,7 +23,7 @@ func WeChatAuth(c *gin.Context) {
 		return
 	}
 	code := c.Query("code")
-	wechatId, err := getWeChatIdByCode(code)
+	wechatId, err := service.ResolveWeChatIDByCode(code)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"message": err.Error(),
@@ -162,7 +121,7 @@ func WeChatBind(c *gin.Context) {
 	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeAccountBind, Context: context}) == nil {
 		return
 	}
-	wechatId, err := getWeChatIdByCode(code)
+	wechatId, err := service.ResolveWeChatIDByCode(code)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"message": err.Error(),

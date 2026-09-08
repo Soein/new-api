@@ -247,6 +247,24 @@ export async function verify(
       case 'oauth':
         proof = await verifyOAuth(input.provider, operation, signal)
         break
+      case 'wechat': {
+        const trimmedCode = input.code.trim()
+        if (trimmedCode.length === 0 || trimmedCode.length > 128) {
+          throw new AuthOperationError('Invalid verification code')
+        }
+        proof = await authResult<SecurityProof>(
+          api.post(
+            '/api/verify',
+            {
+              method: input.method,
+              ...operationFields,
+              code: trimmedCode,
+            },
+            { ...authRequestOptions, signal }
+          )
+        )
+        break
+      }
     }
     signal.throwIfAborted()
     if (

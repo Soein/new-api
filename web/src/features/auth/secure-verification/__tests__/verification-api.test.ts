@@ -37,8 +37,13 @@ import {
   clearPasswordEncryptionCache,
   encryptPassword,
 } from '../../lib/password-encryption'
-import { checkVerificationMethods, verify } from '../api'
-import type { SecurityProof } from '../types'
+import {
+  checkVerificationMethods,
+  isLoginChallenge,
+  verify,
+  verifyLogin,
+} from '../api'
+import type { LoginChallenge, SecurityProof, VerificationInput } from '../types'
 
 const originalAdapter = api.defaults.adapter
 const originalLocation = window.location.href
@@ -497,4 +502,143 @@ it('displays a generic internal error even if the server includes database detai
     },
   })
   expect(failure.message).toBe('Please try again later.')
+})
+
+it('retrieves WeChat verification method availability and optional QR code url', async () => {
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        scope: 'account.delete',
+        methods: [{ method: 'wechat', available: true }],
+        wechat_qr_code_url: 'https://example.com/qr.png',
+        oauth_providers: [],
+        password_encryption_enabled: false,
+      },
+    },
+  })
+  const requirements = await checkVerificationMethods('account.delete')
+  expect(get).toHaveBeenCalledWith(
+    '/api/verify/methods',
+    expect.objectContaining({ params: { scope: 'account.delete' } })
+  )
+  expect(requirements.methods).toEqual([{ method: 'wechat', available: true }])
+  expect(requirements.wechat_qr_code_url).toBe('https://example.com/qr.png')
+})
+
+it('submits WeChat security verification with trimmed code, exact scope, and context without session fallback', async () => {
+  const proof: SecurityProof = {
+    proof_token: 'wechat-proof-xyz',
+    method: 'wechat',
+    scope: 'account.binding.bind',
+    expires_at: Math.floor(Date.now() / 1000) + 120,
+  }
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: proof },
+  })
+  const input: VerificationInput = {
+    method: 'wechat',
+    code: '  wx_opaque_#code-123  ',
+  }
+  const result = await verify(
+    input,
+    {
+      scope: 'account.binding.bind',
+      context: { provider: 'email', email: 'linked@example.com' },
+    },
+    false,
+    new AbortController().signal
+  )
+  expect(result).toEqual(proof)
+  expect(post).toHaveBeenCalledWith(
+    '/api/verify',
+    {
+      method: 'wechat',
+      code: 'wx_opaque_#code-123',
+      scope: 'account.binding.bind',
+      context: { provider: 'email', email: 'linked@example.com' },
+    },
+    expect.objectContaining({ signal: expect.any(AbortSignal) })
+  )
+})
+
+it.each([
+  {
+    name: 'proof token is missing',
+    proof: {
+      proof_token: '',
+      method: 'wechat' as const,
+      scope: 'account.delete' as const,
+      expires_at: Math.floor(Date.now() / 1000) + 300,
+    },
+  },
+  {
+    name: 'proof method does not match',
+    proof: {
+      proof_token: 'valid-proof-token',
+      method: 'password' as const,
+      scope: 'account.delete' as const,
+      expires_at: Math.floor(Date.now() / 1000) + 300,
+    },
+  },
+])('rejects WeChat verification when $name', async ({ proof }) => {
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: proof },
+  })
+  const input: VerificationInput = {
+    method: 'wechat',
+    code: 'valid-code',
+  }
+  await expect(
+    verify(
+      input,
+      { scope: 'account.delete' },
+      false,
+      new AbortController().signal
+    )
+  ).rejects.toMatchObject({
+    message: 'Verification proof was not returned',
+  })
+})
+
+it('rejects empty, whitespace-only, or oversized WeChat verification codes', async () => {
+  const post = vi.spyOn(api, 'post')
+  for (const code of ['', '   ', 'a'.repeat(129)]) {
+    const input: VerificationInput = { method: 'wechat', code }
+    await expect(
+      verify(
+        input,
+        { scope: 'account.delete' },
+        false,
+        new AbortController().signal
+      )
+    ).rejects.toThrow('Invalid verification code')
+  }
+  expect(post).not.toHaveBeenCalled()
+})
+
+it('does not allow WeChat verification in login challenge flow', async () => {
+  const challengeWithWechat = {
+    require_verification: true,
+    flow_token: 'login-flow-token',
+    expires_at: Math.floor(Date.now() / 1000) + 300,
+    methods: [{ method: 'wechat', available: true }],
+  }
+  expect(isLoginChallenge(challengeWithWechat)).toBe(false)
+
+  const validChallenge: LoginChallenge = {
+    require_verification: true,
+    flow_token: 'login-flow-token',
+    expires_at: Math.floor(Date.now() / 1000) + 300,
+    methods: [{ method: '2fa', available: true }],
+  }
+  const wechatInput: VerificationInput = {
+    method: 'wechat',
+    code: '123456',
+  }
+  await expect(
+    verifyLogin(wechatInput, validChallenge, new AbortController().signal)
+  ).rejects.toMatchObject({
+    message: 'This verification method is not allowed for this action.',
+  })
 })

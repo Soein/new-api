@@ -4615,6 +4615,7 @@
     "Saving...": "保存中...",
     "Scan QR Code": "QRコードをスキャン",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "公式アカウントのQRコードを読み取り、「验证码」と返信して認証コードを受け取ってください。",
+    "Scan the QR code with your currently linked WeChat account to obtain a verification code.": "現在連携されているWeChatアカウントでQRコードをスキャンして確認コードを取得してください。",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "このQRコードを認証アプリ（Google Authenticator、Microsoft Authenticatorなど）でスキャンしてください。",
     "Scenario Templates": "シナリオテンプレート",
     "Scheduled channel tests": "スケジュールされたチャネルテスト",

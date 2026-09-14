@@ -202,8 +202,9 @@ function tokenTier(
     if (Object.hasOwn(prices, variable)) return null
     prices[variable] = price
   }
-  if (Object.keys(prices).length === 0 && perImagePrice === undefined)
+  if (Object.keys(prices).length === 0 && perImagePrice === undefined) {
     return null
+  }
   return {
     label: node.args[0].value,
     conditions,

@@ -10,7 +10,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -96,4 +98,343 @@ func TestOllamaChatHandlerNonStreamToolCalls(t *testing.T) {
 			assert.Equal(t, float64(0), args["days"])
 		})
 	}
+}
+
+func TestBuildOllamaStreamDelta(t *testing.T) {
+	tests := []struct {
+		name          string
+		raw           string
+		startIndex    int
+		wantContent   string
+		wantReasoning string
+		wantToolCalls []struct {
+			id        string
+			name      string
+			index     int
+			arguments string
+		}
+		wantNextIndex int
+		wantPayload   bool
+	}{
+		{
+			name:        "chat content",
+			raw:         `{"message":{"content":"hello"}}`,
+			wantContent: "hello",
+			wantPayload: true,
+		},
+		{
+			name:        "generate content",
+			raw:         `{"response":"hello"}`,
+			wantContent: "hello",
+			wantPayload: true,
+		},
+		{
+			name:          "thinking json string",
+			raw:           `{"message":{"thinking":"consider this"}}`,
+			wantReasoning: "consider this",
+			wantPayload:   true,
+		},
+		{
+			name:          "thinking raw fallback",
+			raw:           `{"message":{"thinking":{"step":"consider this"}}}`,
+			wantReasoning: `{"step":"consider this"}`,
+			wantPayload:   true,
+		},
+		{
+			name:       "multiple tool calls",
+			raw:        `{"message":{"tool_calls":[{"id":"call_upstream","function":{"name":"get_weather","arguments":{"city":"Paris"}}},{"function":{"name":"get_time","arguments":{"timezone":"UTC"}}}]}}`,
+			startIndex: 2,
+			wantToolCalls: []struct {
+				id        string
+				name      string
+				index     int
+				arguments string
+			}{
+				{id: "call_upstream", name: "get_weather", index: 2, arguments: `{"city":"Paris"}`},
+				{id: "call_3", name: "get_time", index: 3, arguments: `{"timezone":"UTC"}`},
+			},
+			wantNextIndex: 4,
+			wantPayload:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var chunk ollamaChatStreamChunk
+			require.NoError(t, common.Unmarshal([]byte(tt.raw), &chunk))
+
+			toolCallIndex := tt.startIndex
+			delta, hasPayload := buildOllamaStreamDelta(&chunk, "response-id", 123, "model", &toolCallIndex)
+			assert.Equal(t, tt.wantPayload, hasPayload)
+			assert.Equal(t, tt.wantContent, delta.Choices[0].Delta.GetContentString())
+			assert.Equal(t, tt.wantReasoning, delta.Choices[0].Delta.GetReasoningContent())
+			assert.Equal(t, tt.wantNextIndex, toolCallIndex)
+
+			if tt.wantToolCalls == nil {
+				assert.Empty(t, delta.Choices[0].Delta.ToolCalls)
+				return
+			}
+			require.Len(t, delta.Choices[0].Delta.ToolCalls, len(tt.wantToolCalls))
+			for i, want := range tt.wantToolCalls {
+				got := delta.Choices[0].Delta.ToolCalls[i]
+				assert.Equal(t, want.id, got.ID)
+				assert.Equal(t, "function", got.Type)
+				assert.Equal(t, want.name, got.Function.Name)
+				assert.Equal(t, want.arguments, got.Function.Arguments)
+				require.NotNil(t, got.Index)
+				assert.Equal(t, want.index, *got.Index)
+			}
+		})
+	}
+}
+
+func TestOllamaStreamHandlerDoneToolCalls(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"model":"qwen3-coder","created_at":"2026-05-27T12:00:00Z","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"北京"}}},{"function":{"name":"get_time","arguments":{"timezone":"Asia/Shanghai"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":7}`)),
+	}
+
+	usage, apiErr := ollamaStreamHandler(c, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "fallback-model"},
+	}, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 12, usage.TotalTokens)
+
+	var chunks []dto.ChatCompletionsStreamResponse
+	for _, line := range strings.Split(w.Body.String(), "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok || data == "[DONE]" {
+			continue
+		}
+		var chunk dto.ChatCompletionsStreamResponse
+		require.NoError(t, common.Unmarshal([]byte(data), &chunk))
+		chunks = append(chunks, chunk)
+	}
+
+	var toolChunkIndex, stopChunkIndex int = -1, -1
+	for i := range chunks {
+		if len(chunks[i].Choices) == 0 {
+			continue
+		}
+		if len(chunks[i].Choices[0].Delta.ToolCalls) > 0 {
+			toolChunkIndex = i
+		}
+		if chunks[i].Choices[0].FinishReason != nil {
+			stopChunkIndex = i
+		}
+	}
+	require.NotEqual(t, -1, toolChunkIndex)
+	require.NotEqual(t, -1, stopChunkIndex)
+	assert.Less(t, toolChunkIndex, stopChunkIndex)
+
+	toolCalls := chunks[toolChunkIndex].Choices[0].Delta.ToolCalls
+	require.Len(t, toolCalls, 2)
+	assert.Equal(t, "call_0", toolCalls[0].ID)
+	assert.Equal(t, "call_1", toolCalls[1].ID)
+	require.NotNil(t, toolCalls[0].Index)
+	require.NotNil(t, toolCalls[1].Index)
+	assert.Equal(t, 0, *toolCalls[0].Index)
+	assert.Equal(t, 1, *toolCalls[1].Index)
+	assert.Equal(t, constant.FinishReasonToolCalls, *chunks[stopChunkIndex].Choices[0].FinishReason)
+	assert.Contains(t, w.Body.String(), "data: [DONE]")
+}
+
+func TestOllamaOpenAIChatProtocolContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	adaptor := &Adaptor{}
+
+	t.Run("request url routing", func(t *testing.T) {
+		tests := []struct {
+			name        string
+			relayMode   int
+			openAIChat  bool
+			expectedURL string
+		}{
+			{
+				name:        "chat default native url",
+				relayMode:   relayconstant.RelayModeChatCompletions,
+				openAIChat:  false,
+				expectedURL: "http://ollama.local/api/chat",
+			},
+			{
+				name:        "chat with openai chat enabled",
+				relayMode:   relayconstant.RelayModeChatCompletions,
+				openAIChat:  true,
+				expectedURL: "http://ollama.local/v1/chat/completions",
+			},
+			{
+				name:        "completions still routes to generate when openai chat disabled",
+				relayMode:   relayconstant.RelayModeCompletions,
+				openAIChat:  false,
+				expectedURL: "http://ollama.local/api/generate",
+			},
+			{
+				name:        "completions still routes to generate when openai chat enabled",
+				relayMode:   relayconstant.RelayModeCompletions,
+				openAIChat:  true,
+				expectedURL: "http://ollama.local/api/generate",
+			},
+			{
+				name:        "embeddings routes to embed when openai chat disabled",
+				relayMode:   relayconstant.RelayModeEmbeddings,
+				openAIChat:  false,
+				expectedURL: "http://ollama.local/api/embed",
+			},
+			{
+				name:        "embeddings routes to embed when openai chat enabled",
+				relayMode:   relayconstant.RelayModeEmbeddings,
+				openAIChat:  true,
+				expectedURL: "http://ollama.local/api/embed",
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				info := &relaycommon.RelayInfo{
+					ChannelMeta: &relaycommon.ChannelMeta{
+						ChannelBaseUrl: "http://ollama.local",
+						ChannelOtherSettings: dto.ChannelOtherSettings{
+							OllamaOpenAIChat: tc.openAIChat,
+						},
+					},
+					RelayMode: tc.relayMode,
+				}
+				url, err := adaptor.GetRequestURL(info)
+				require.NoError(t, err)
+				assert.Equal(t, tc.expectedURL, url)
+			})
+		}
+	})
+
+	t.Run("request conversion", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+
+		// 1. Chat: OllamaOpenAIChat = false returns native OllamaChatRequest
+		infoNative := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelOtherSettings: dto.ChannelOtherSettings{
+					OllamaOpenAIChat: false,
+				},
+			},
+			RelayMode: relayconstant.RelayModeChatCompletions,
+		}
+		chatReq := &dto.GeneralOpenAIRequest{
+			Model: "llama3",
+			Messages: []dto.Message{
+				{Role: "user", Content: "hello native"},
+			},
+		}
+		convertedNative, err := adaptor.ConvertOpenAIRequest(c, infoNative, chatReq)
+		require.NoError(t, err)
+		ollamaReq, ok := convertedNative.(*OllamaChatRequest)
+		require.True(t, ok)
+		assert.Equal(t, "llama3", ollamaReq.Model)
+		require.Len(t, ollamaReq.Messages, 1)
+		assert.Equal(t, "hello native", ollamaReq.Messages[0].Content)
+
+		// 2. Chat: OllamaOpenAIChat = true keeps OpenAI chat completions request
+		infoOpenAI := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelOtherSettings: dto.ChannelOtherSettings{
+					OllamaOpenAIChat: true,
+				},
+			},
+			RelayMode: relayconstant.RelayModeChatCompletions,
+		}
+		convertedOpenAI, err := adaptor.ConvertOpenAIRequest(c, infoOpenAI, chatReq)
+		require.NoError(t, err)
+		oaiReq, ok := convertedOpenAI.(*dto.GeneralOpenAIRequest)
+		require.True(t, ok)
+		assert.Equal(t, "llama3", oaiReq.Model)
+		require.Len(t, oaiReq.Messages, 1)
+		assert.Equal(t, "hello native", oaiReq.Messages[0].Content)
+
+		// 3. Completions: still converts to OllamaGenerateRequest regardless of OllamaOpenAIChat
+		infoCompletions := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelOtherSettings: dto.ChannelOtherSettings{
+					OllamaOpenAIChat: true,
+				},
+			},
+			RelayMode: relayconstant.RelayModeCompletions,
+		}
+		compReq := &dto.GeneralOpenAIRequest{
+			Model:  "llama3",
+			Prompt: "complete this sentence",
+		}
+		convertedComp, err := adaptor.ConvertOpenAIRequest(c, infoCompletions, compReq)
+		require.NoError(t, err)
+		genReq, ok := convertedComp.(*OllamaGenerateRequest)
+		require.True(t, ok)
+		assert.Equal(t, "llama3", genReq.Model)
+		assert.Equal(t, "complete this sentence", genReq.Prompt)
+
+		// 4. Embeddings: unaffected by OllamaOpenAIChat
+		embedReq := dto.EmbeddingRequest{
+			Model: "all-minilm",
+			Input: "embedding test",
+		}
+		convertedEmbed, err := adaptor.ConvertEmbeddingRequest(c, infoOpenAI, embedReq)
+		require.NoError(t, err)
+		embedOllamaReq, ok := convertedEmbed.(*OllamaEmbeddingRequest)
+		require.True(t, ok)
+		assert.Equal(t, "all-minilm", embedOllamaReq.Model)
+	})
+
+	t.Run("sse response parsing with openai chat enabled", func(t *testing.T) {
+		oldTimeout := constant.StreamingTimeout
+		constant.StreamingTimeout = 30
+		t.Cleanup(func() {
+			constant.StreamingTimeout = oldTimeout
+		})
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+		info := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelBaseUrl:    "http://ollama.local",
+				UpstreamModelName: "llama3",
+				ChannelOtherSettings: dto.ChannelOtherSettings{
+					OllamaOpenAIChat: true,
+				},
+			},
+			RelayFormat: types.RelayFormatOpenAI,
+			RelayMode:   relayconstant.RelayModeChatCompletions,
+			IsStream:    true,
+		}
+		adaptor.Init(info)
+
+		rawSSE := "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"llama3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello from ollama openai\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"llama3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":6,\"total_tokens\":14}}\n\n" +
+			"data: [DONE]\n\n"
+
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(rawSSE)),
+		}
+
+		usage, apiErr := adaptor.DoResponse(c, resp, info)
+		require.Nil(t, apiErr)
+		require.NotNil(t, usage)
+
+		u, ok := usage.(*dto.Usage)
+		require.True(t, ok)
+		assert.Equal(t, 8, u.PromptTokens)
+		assert.Equal(t, 6, u.CompletionTokens)
+		assert.Equal(t, 14, u.TotalTokens)
+
+		body := w.Body.String()
+		assert.Contains(t, body, "hello from ollama openai")
+		assert.Contains(t, body, "data: [DONE]")
+	})
 }

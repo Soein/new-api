@@ -19,9 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 import { FileCode } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
+import { cn } from '@/lib/utils'
+
 import { computeSourceDiff } from '../lib/source-diff'
 
-export type SourceDiffProps = { before: string; after: string }
+export type SourceDiffProps = {
+  before: string
+  after: string
+  className?: string
+}
 
 export function SourceDiff(props: SourceDiffProps) {
   const { t } = useTranslation()
@@ -54,11 +60,25 @@ export function SourceDiff(props: SourceDiffProps) {
     )
   }
 
+  if (props.before === props.after) {
+    return (
+      <p
+        role='status'
+        className='text-muted-foreground rounded-md border px-3 py-6 text-center text-sm'
+      >
+        {t('No source changes')}
+      </p>
+    )
+  }
+
   return (
     <div
       role='region'
       aria-label={t('Source diff')}
-      className='max-h-96 overflow-auto rounded-md border font-mono text-xs'
+      className={cn(
+        'max-h-96 overflow-auto rounded-md border font-mono text-xs',
+        props.className
+      )}
     >
       {diffResult.lines.map((line) => {
         let prefix = ' '

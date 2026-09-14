@@ -378,7 +378,7 @@ var ErrMidjourneySubmissionUnknown = errors.New("midjourney submission outcome i
 // BuildMidjourneyHttpRequest completes all local parsing and request creation
 // before quota is reserved or the upstream can be contacted.
 func BuildMidjourneyHttpRequest(c *gin.Context, fullRequestURL string) (*http.Request, error) {
-	var mapResult map[string]interface{}
+	var mapResult map[string]any
 	if c.Request.Method != "GET" {
 		if err := common.DecodeJson(c.Request.Body, &mapResult); err != nil {
 			return nil, err

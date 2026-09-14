@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -241,6 +242,9 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 				}
 				*target = encoded
 			}
+			if parameters := formData.Get("parameters"); parameters != "" {
+				imageRequest.Extra = map[string]json.RawMessage{"parameters": json.RawMessage(parameters)}
+			}
 			if streamValue := strings.TrimSpace(formData.Get("stream")); streamValue != "" {
 				stream, err := strconv.ParseBool(streamValue)
 				if err != nil {
@@ -274,26 +278,8 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 		if err != nil {
 			return nil, err
 		}
-		// Some compatible image providers place the output count under
-		// parameters.n. Promote that validated value before pre-consume so
-		// system image_count cannot under-reserve and later jump at settlement.
-		if rawParameters, ok := imageRequest.Extra["parameters"]; ok {
-			var parameters map[string]json.RawMessage
-			if err := common.Unmarshal(rawParameters, &parameters); err == nil {
-				if rawN, exists := parameters["n"]; exists {
-					var nestedN float64
-					if err := common.Unmarshal(rawN, &nestedN); err != nil || nestedN < 0 || nestedN > dto.MaxImageN || math.IsNaN(nestedN) || math.IsInf(nestedN, 0) || math.Trunc(nestedN) != nestedN {
-						return nil, fmt.Errorf("parameters.n must be an integer between 1 and %d", dto.MaxImageN)
-					}
-					if nestedN > 0 {
-						imageRequest.N = common.GetPointer(uint(nestedN))
-					}
-				}
-			}
-		}
 
 		if imageRequest.Model == "" {
-			//imageRequest.Model = "dall-e-3"
 			return nil, errors.New("model is required")
 		}
 
@@ -305,25 +291,10 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 			return nil, fmt.Errorf("n must be an integer between 1 and %d", dto.MaxImageN)
 		}
 
-		// Not "256x256", "512x512", or "1024x1024"
-		if imageRequest.Model == "dall-e-2" || imageRequest.Model == "dall-e" {
-			if imageRequest.Size != "" && imageRequest.Size != "256x256" && imageRequest.Size != "512x512" && imageRequest.Size != "1024x1024" {
-				return nil, errors.New("size must be one of 256x256, 512x512, or 1024x1024 for dall-e-2 or dall-e")
-			}
-			if imageRequest.Size == "" {
-				imageRequest.Size = "1024x1024"
-			}
-		} else if imageRequest.Model == "dall-e-3" {
-			if imageRequest.Size != "" && imageRequest.Size != "1024x1024" && imageRequest.Size != "1024x1792" && imageRequest.Size != "1792x1024" {
-				return nil, errors.New("size must be one of 1024x1024, 1024x1792 or 1792x1024 for dall-e-3")
-			}
-			if imageRequest.Quality == "" {
-				imageRequest.Quality = "standard"
-			}
-			if imageRequest.Size == "" {
-				imageRequest.Size = "1024x1024"
-			}
-		} else if imageRequest.Model == "gpt-image-1" {
+		if err := imageRequest.NormalizeLegacyDalleImageRequest(); err != nil {
+			return nil, err
+		}
+		if imageRequest.Model == "gpt-image-1" {
 			if imageRequest.Quality == "" {
 				imageRequest.Quality = "auto"
 			}
@@ -338,6 +309,19 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 		}
 	}
 
+	// Provider parameters can override the top-level count. Validate before
+	// pricing so malformed multipliers return a client error, not a pricing
+	// failure after reservation has started.
+	if raw, exists := imageRequest.Extra["parameters"]; exists {
+		parameters := &dto.ImageBillingParameters{}
+		if err := common.Unmarshal(raw, parameters); err != nil {
+			return nil, fmt.Errorf("invalid image parameters: %w", err)
+		}
+		imageRequest.BillingParameters = parameters
+	}
+	if _, err := imageRequest.ImageCount(common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeAli); err != nil {
+		return nil, err
+	}
 	return imageRequest, nil
 }
 

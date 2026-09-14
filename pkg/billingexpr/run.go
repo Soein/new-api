@@ -6,11 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/relaykit/dto"
+
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
 	"github.com/tidwall/gjson"
-
-	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 // RunExpr compiles (with cache) and executes an expression string.
@@ -32,7 +32,7 @@ func RunExprWithRequest(exprStr string, params TokenParams, request RequestInput
 	if err != nil {
 		return 0, TraceResult{}, err
 	}
-	return runProgram(entry.prog, entry.requestRules, params, request)
+	return runProgram(entry.prog, entry.requestRules, entry.usedVars, entry.version, params, request)
 }
 
 // RunExprByHash is like RunExpr but accepts a pre-computed hash for the cache
@@ -47,21 +47,55 @@ func RunExprByHashWithRequest(exprStr, hash string, params TokenParams, request 
 	if err != nil {
 		return 0, TraceResult{}, err
 	}
-	return runProgram(entry.prog, entry.requestRules, params, request)
+	return runProgram(entry.prog, entry.requestRules, entry.usedVars, entry.version, params, request)
 }
 
-func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenParams, request RequestInput) (float64, TraceResult, error) {
+func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[string]bool, version int, params TokenParams, request RequestInput) (float64, TraceResult, error) {
 	trace := TraceResult{
+		BillingUnit:  BillingUnitToken,
 		RequestRules: append([]RequestRuleTrace(nil), requestRules...),
 	}
 	headers := normalizeHeaders(request.Headers)
 	var runtimeErr error
 	matchedRuleIndex := 0
-	if params.ImageCount < 0 || params.ImageCount > dto.MaxImageN || math.IsNaN(params.ImageCount) || math.IsInf(params.ImageCount, 0) || math.Trunc(params.ImageCount) != params.ImageCount {
+	if math.IsNaN(params.ImageCount) || math.IsInf(params.ImageCount, 0) || params.ImageCount < 0 || params.ImageCount > dto.MaxImageN || math.Trunc(params.ImageCount) != params.ImageCount {
 		return 0, trace, fmt.Errorf("image_count must be an integer between 0 and %d", dto.MaxImageN)
 	}
 
-	env := map[string]interface{}{
+	var imageCount int
+	if version == 2 {
+		imageCount = int(params.ImageCount)
+		hasExplicitImageCount := params.ImageCount > 0 || request.ImageCount != nil
+		if request.ImageCount != nil {
+			imageCount = *request.ImageCount
+		}
+		if imageCount < 0 || imageCount > dto.MaxImageN {
+			return 0, trace, fmt.Errorf("image_count must be between 0 and %d", dto.MaxImageN)
+		}
+		if usedVars["image_count"] || usedVars["per_image"] || hasExplicitImageCount {
+			trace.ImageCount = &imageCount
+		}
+	} else {
+		imageCount = 1
+		hasExplicitImageCount := false
+		if request.ImageCount != nil {
+			imageCount = *request.ImageCount
+			hasExplicitImageCount = true
+		} else if params.ImageCount > 0 {
+			imageCount = int(params.ImageCount)
+			hasExplicitImageCount = true
+		}
+
+		if usedVars["image_count"] || hasExplicitImageCount {
+			if imageCount < 1 || imageCount > dto.MaxImageN {
+				return 0, trace, fmt.Errorf("image_count must be between 1 and %d", dto.MaxImageN)
+			}
+			trace.ImageCount = &imageCount
+		}
+	}
+
+	env := map[string]any{
+		"image_count": float64(imageCount),
 		"p":           params.P,
 		"c":           params.C,
 		"len":         params.Len,
@@ -69,14 +103,19 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenP
 		"cc":          params.CC,
 		"cc1h":        params.CC1h,
 		"img":         params.Img,
+		"img_cr":      params.ImgCR,
 		"img_o":       params.ImgO,
 		"ai":          params.AI,
 		"ao":          params.AO,
-		"image_count": params.ImageCount,
 		"tier": func(name string, value float64) float64 {
 			trace.MatchedTier = name
 			trace.Cost = value
 			return value
+		},
+		"fixed": func(amount float64) float64 {
+			trace.BillingUnit = BillingUnitRequest
+			trace.FixedPrice = &amount
+			return amount * 1_000_000
 		},
 		"per_image": func(price float64) float64 {
 			if runtimeErr != nil {
@@ -88,7 +127,7 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenP
 			}
 			// v1 coefficients represent $/1M tokens. Scale a real per-image USD
 			// price into the same cost unit so token and image terms can coexist.
-			return price * params.ImageCount * 1_000_000
+			return price * float64(imageCount) * 1_000_000
 		},
 		"rule": func(name string, matched bool, multiplier float64) float64 {
 			currentRuleIndex := matchedRuleIndex
@@ -132,7 +171,7 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenP
 		"header": func(key string) string {
 			return headers[strings.ToLower(strings.TrimSpace(key))]
 		},
-		"param": func(path string) interface{} {
+		"param": func(path string) any {
 			path = strings.TrimSpace(path)
 			if path == "" {
 				return nil
@@ -151,13 +190,13 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenP
 			}
 			return nil
 		},
-		"u": func(name string) interface{} {
+		"u": func(name string) any {
 			if request.Usage == nil {
 				return nil
 			}
 			return request.Usage[strings.TrimSpace(name)]
 		},
-		"has": func(source interface{}, substr string) bool {
+		"has": func(source any, substr string) bool {
 			if source == nil || substr == "" {
 				return false
 			}

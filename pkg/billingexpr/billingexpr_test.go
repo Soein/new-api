@@ -2,6 +2,7 @@ package billingexpr_test
 
 import (
 	"math"
+	"os"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -10,6 +11,118 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFixedPriceBranches(t *testing.T) {
+	const expression = `(len <= 32000 ? tier("short", fixed(0.01)) : tier("long", p * 2 + c * 8)) * (param("fast") == true ? 2 : 1)`
+	for _, tc := range []struct {
+		name   string
+		params billingexpr.TokenParams
+		cost   float64
+		tier   string
+	}{
+		{"zero usage still charges once", billingexpr.TokenParams{}, 20000, "short"},
+		{"fixed branch ignores token prices", billingexpr.TokenParams{P: 32000, C: 9000, Len: 32000}, 20000, "short"},
+		{"token branch uses actual usage", billingexpr.TokenParams{P: 32001, C: 100, Len: 32001}, 129604, "long"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cost, trace, err := billingexpr.RunExprWithRequest(expression, tc.params, billingexpr.RequestInput{Body: []byte(`{"fast":true}`)})
+			require.NoError(t, err)
+			assert.Equal(t, tc.cost, cost)
+			assert.Equal(t, tc.tier, trace.MatchedTier)
+			require.Len(t, trace.RequestRules, 1)
+			assert.True(t, trace.RequestRules[0].Matched)
+		})
+	}
+	cost, _, err := billingexpr.RunExpr(`tier("free", fixed(0))`, billingexpr.TokenParams{P: 1000})
+	require.NoError(t, err)
+	assert.Zero(t, cost)
+	for _, count := range []int{-1, 0, 129} {
+		_, _, err := billingexpr.RunExprWithRequest(`tier("image", fixed(0.04)) * image_count`, billingexpr.TokenParams{}, billingexpr.RequestInput{ImageCount: &count})
+		require.ErrorContains(t, err, "image_count")
+	}
+
+	const fixedRuleExpr = `v2:tier("request", fixed(0.01)) * rule("fast", param("fast") == true, 2)`
+	costFast, traceFast, err := billingexpr.RunExprWithRequest(fixedRuleExpr, billingexpr.TokenParams{}, billingexpr.RequestInput{StructuredBody: []byte(`{"fast":true}`)})
+	require.NoError(t, err)
+	assert.Equal(t, 20000.0, costFast)
+	assert.Equal(t, "request", traceFast.MatchedTier)
+	assert.Equal(t, billingexpr.BillingUnitRequest, traceFast.BillingUnit)
+	require.Len(t, traceFast.MatchedRules, 1)
+	assert.Equal(t, "fast", traceFast.MatchedRules[0].Name)
+	assert.Equal(t, 2.0, traceFast.MatchedRules[0].Multiplier)
+
+	costSlow, traceSlow, err := billingexpr.RunExprWithRequest(fixedRuleExpr, billingexpr.TokenParams{}, billingexpr.RequestInput{StructuredBody: []byte(`{"fast":false}`)})
+	require.NoError(t, err)
+	assert.Equal(t, 10000.0, costSlow)
+	assert.Empty(t, traceSlow.MatchedRules)
+}
+
+func TestFixedPriceRejectsInvalidLeavesIncludingUnselectedBranches(t *testing.T) {
+	for _, expression := range []string{
+		`true ? tier("ok", p) : tier("bad", fixed(-0.01))`,
+		`tier("bad", fixed(p))`,
+		`tier("bad", fixed(0.01 + 0.02))`,
+		`tier("bad", fixed(1e308))`,
+		`tier("bad", fixed(0.01) + p * 2)`,
+		`tier("bad", p * fixed(0.01))`,
+		`tier("a", fixed(0.01)) + tier("b", p * 2)`,
+		`fixed(0.01)`,
+		`tier("bad", fixed(0.01)) * p`,
+		`tier("bad", fixed(0.01)) * (param("fast") == true ? -2 : 1)`,
+		`v2:tier("request", fixed(0.01)) * rule("bad", param("fast") == true, -2)`,
+		`v2:tier("request", fixed(0.01)) * rule("bad", param("fast") == true, 0)`,
+		`v2:tier("request", fixed(0.01)) * rule("bad", param("fast") == true && p > 0, 2)`,
+		`v2:tier("request", fixed(0.01)) * rule("bad", param("fast") == true, tier("second", 1))`,
+		`v2:tier("request", fixed(0.01)) * rule("bad", fixed(0.01) > 0, 2)`,
+		`v2:tier("request", fixed(0.01)) * rule("bad", 1 == 1, 2)`,
+		`v2:tier("request", fixed(0.01)) * rule("", param("fast") == true, 2)`,
+		`v2:tier("request", fixed(0.01)) * (param("fast") == true && p > 10 ? 2 : 1)`,
+		`v2:tier("request", fixed(0.01)) * (param("fast") == true ? 2 : -1)`,
+	} {
+		t.Run(expression, func(t *testing.T) {
+			_, err := billingexpr.CompileFromCache(expression)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestFixedPriceQuotaBoundariesAndUnsupportedTaskSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name, expression string
+		group            float64
+		want             int
+		clamped          bool
+	}{
+		{"normal group", `tier("request", fixed(0.01))`, 1.5, 7500, false},
+		{"free group", `tier("request", fixed(0.01))`, 0, 0, false},
+		{"explicit free price", `tier("free", fixed(0))`, 1, 0, false},
+		{"oversized price saturates instead of crediting", `tier("huge", fixed(1e20))`, 1, math.MaxInt32, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := &billingexpr.BillingSnapshot{ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), GroupRatio: tc.group, QuotaPerUnit: 500000}
+			result, err := billingexpr.ComputeTieredQuota(snap, billingexpr.TokenParams{})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, result.ActualQuotaAfterGroup)
+			assert.Equal(t, billingexpr.BillingUnitRequest, result.BillingUnit)
+			assert.Equal(t, tc.clamped, result.Clamp != nil)
+			_, err = billingexpr.QuotaRoundStrict(result.ActualQuotaBeforeGroup * tc.group)
+			if tc.clamped {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			snap.TaskUsageBilling = true
+			_, err = billingexpr.ComputeTieredQuota(snap, billingexpr.TokenParams{})
+			require.ErrorContains(t, err, "task usage")
+		})
+	}
+	const optimized = `true ? tier("tokens", p) : tier("request", fixed(0.01))`
+	assert.True(t, billingexpr.UsesFixedPricing(optimized))
+	_, trace, err := billingexpr.RunExpr(optimized, billingexpr.TokenParams{P: 10})
+	require.NoError(t, err)
+	assert.Equal(t, billingexpr.BillingUnitToken, trace.BillingUnit)
+	assert.Nil(t, trace.FixedPrice)
+}
 
 // ---------------------------------------------------------------------------
 // Claude-style: fixed tiers, input > 200K changes both input & output price
@@ -323,6 +436,54 @@ func TestV2PerImageUsesSystemCountAndTracesMatchedRules(t *testing.T) {
 	}, trace.MatchedRules)
 }
 
+func TestV2ImageCountZeroPositiveAndByHash(t *testing.T) {
+	const exprStr = `v2:tier("image", per_image(0.04))`
+	hash := billingexpr.ExprHashString(exprStr)
+
+	costZero, traceZero, err := billingexpr.RunExpr(exprStr, billingexpr.TokenParams{ImageCount: 0})
+	require.NoError(t, err)
+	assert.Zero(t, costZero)
+	require.NotNil(t, traceZero.ImageCount)
+	assert.Equal(t, 0, *traceZero.ImageCount)
+
+	costMissing, traceMissing, err := billingexpr.RunExpr(exprStr, billingexpr.TokenParams{})
+	require.NoError(t, err)
+	assert.Zero(t, costMissing)
+	require.NotNil(t, traceMissing.ImageCount)
+	assert.Equal(t, 0, *traceMissing.ImageCount)
+
+	costPos, tracePos, err := billingexpr.RunExpr(exprStr, billingexpr.TokenParams{ImageCount: 2})
+	require.NoError(t, err)
+	assert.Equal(t, 80_000.0, costPos)
+	require.NotNil(t, tracePos.ImageCount)
+	assert.Equal(t, 2, *tracePos.ImageCount)
+
+	costHashZero, traceHashZero, err := billingexpr.RunExprByHash(exprStr, hash, billingexpr.TokenParams{ImageCount: 0})
+	require.NoError(t, err)
+	assert.Zero(t, costHashZero)
+	require.NotNil(t, traceHashZero.ImageCount)
+	assert.Equal(t, 0, *traceHashZero.ImageCount)
+
+	costHashPos, traceHashPos, err := billingexpr.RunExprByHash(exprStr, hash, billingexpr.TokenParams{ImageCount: 3})
+	require.NoError(t, err)
+	assert.Equal(t, 120_000.0, costHashPos)
+	require.NotNil(t, traceHashPos.ImageCount)
+	assert.Equal(t, 3, *traceHashPos.ImageCount)
+
+	const countExpr = `v2:tier("cnt", image_count * 1000)`
+	costCntZero, traceCntZero, err := billingexpr.RunExpr(countExpr, billingexpr.TokenParams{ImageCount: 0})
+	require.NoError(t, err)
+	assert.Zero(t, costCntZero)
+	require.NotNil(t, traceCntZero.ImageCount)
+	assert.Equal(t, 0, *traceCntZero.ImageCount)
+
+	costCntPos, traceCntPos, err := billingexpr.RunExpr(countExpr, billingexpr.TokenParams{ImageCount: 4})
+	require.NoError(t, err)
+	assert.Equal(t, 4000.0, costCntPos)
+	require.NotNil(t, traceCntPos.ImageCount)
+	assert.Equal(t, 4, *traceCntPos.ImageCount)
+}
+
 func TestV2ParamPrefersStructuredBodyAndFallsBackToRawBody(t *testing.T) {
 	exprStr := `v2:rule("known", param("size") == "normalized", 2) * rule("vendor", param("vendor_mode") == "fast", 3)`
 
@@ -362,7 +523,8 @@ func TestV2SettlementPreservesNamedAndLegacyRequestRuleTraces(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 120_000, result.ActualQuotaAfterGroup)
-	assert.Equal(t, 2, result.ImageCount)
+	require.NotNil(t, result.ImageCount)
+	assert.Equal(t, 2, *result.ImageCount)
 	assert.Equal(t, []billingexpr.MatchedRule{
 		{Index: 0, Name: "quality=high", Multiplier: 2},
 	}, result.MatchedRules)
@@ -1153,5 +1315,49 @@ func BenchmarkExprRunCached(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		billingexpr.RunExpr(benchComplexExpr, params)
+	}
+}
+
+// Shared fixtures protect the frontend simulator against drift from the real engine.
+func TestFrontendSimulationContract(t *testing.T) {
+	data, err := os.ReadFile("testdata/frontend_simulation.json")
+	require.NoError(t, err)
+	var cases []struct {
+		Name        string
+		Expression  string
+		Tokens      billingexpr.TokenParams
+		Body        map[string]any
+		Headers     map[string]string
+		Usage       map[string]any
+		Cost        float64
+		Tier        string
+		Multipliers []float64
+		Matched     []bool
+		BillingUnit billingexpr.BillingUnit
+		FixedPrice  *float64
+		ImageCount  *int
+	}
+	require.NoError(t, common.Unmarshal(data, &cases))
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			body, err := common.Marshal(tc.Body)
+			require.NoError(t, err)
+			cost, trace, err := billingexpr.RunExprWithRequest(tc.Expression, tc.Tokens, billingexpr.RequestInput{Body: body, Headers: tc.Headers, Usage: tc.Usage, ImageCount: tc.ImageCount})
+			require.NoError(t, err)
+			assert.InDelta(t, tc.Cost, cost, 1e-9)
+			assert.Equal(t, tc.Tier, trace.MatchedTier)
+			if tc.ImageCount != nil {
+				assert.Equal(t, tc.ImageCount, trace.ImageCount)
+			}
+			if tc.BillingUnit != "" {
+				assert.Equal(t, tc.BillingUnit, trace.BillingUnit)
+				assert.Equal(t, tc.FixedPrice, trace.FixedPrice)
+			}
+			require.Len(t, trace.RequestRules, len(tc.Multipliers))
+			for i, rule := range trace.RequestRules {
+				assert.Equal(t, tc.Multipliers[i], rule.Multiplier)
+				assert.Equal(t, tc.Matched[i], rule.Matched)
+			}
+		})
 	}
 }

@@ -148,8 +148,8 @@ describe('historical billing usage schema selection', () => {
     )
 
     // Should render with historical unit '/s', not current '/unit'
-    expect(screen.getAllByText(/\$0\.0050\/s/).length).toBeGreaterThan(0)
-    expect(screen.queryByText(/\$0\.0050\/unit/)).toBeNull()
+    expect(screen.getAllByText(/\$0\.005\/s/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/\$0\.005\/unit/)).toBeNull()
   })
 
   test('falls back to current pricing schema when log lacks billing_usage_schema snapshot', () => {
@@ -187,6 +187,6 @@ describe('historical billing usage schema selection', () => {
     )
 
     // Should fall back to current pricing unit '/unit'
-    expect(screen.getAllByText(/\$0\.0050\/unit/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/\$0\.005\/unit/).length).toBeGreaterThan(0)
   })
 })

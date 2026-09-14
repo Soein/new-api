@@ -66,9 +66,10 @@ describe('pricing unit duplication and model card regression tests', () => {
 
       const { container } = render(<PricingCellTest model={model} />)
       const cellText = container.textContent || ''
-      const matches = cellText.match(/image/gi) || []
+      const matches = cellText.match(/\/\s*image/gi) || []
       expect(matches).toHaveLength(1)
-      expect(cellText).toMatch(/\$0\.04/)
+      expect(cellText).toMatch(/0\.04/)
+      expect(cellText).toMatch(/USD/)
       expect(cellText).toMatch(/\/\s*image/)
     })
 
@@ -86,8 +87,11 @@ describe('pricing unit duplication and model card regression tests', () => {
 
       const { container } = render(<PricingCellTest model={model} />)
       const cellText = container.textContent || ''
-      expect(cellText).toMatch(/\$2\.5/)
-      expect(cellText).toMatch(/\$10/)
+      expect(cellText).toMatch(/Input/)
+      expect(cellText).toMatch(/2\.5/)
+      expect(cellText).toMatch(/Output/)
+      expect(cellText).toMatch(/10/)
+      expect(cellText).toMatch(/USD/)
       expect(cellText).toMatch(/\/\s*1M\s*tokens/)
     })
 
@@ -108,9 +112,10 @@ describe('pricing unit duplication and model card regression tests', () => {
 
       const { container } = render(<PricingCellTest model={model} />)
       const cellText = container.textContent || ''
-      expect(cellText).toMatch(/\$0\.4/)
+      expect(cellText).toMatch(/seconds/)
+      expect(cellText).toMatch(/0\.4/)
       expect(cellText).toMatch(/\/s/)
-      expect(cellText).toMatch(/std/)
+      expect(cellText).toMatch(/USD/)
     })
 
     test('mixed unit model inlines unit on each entry', () => {
@@ -122,13 +127,14 @@ describe('pricing unit duplication and model card regression tests', () => {
         completion_ratio: 1,
         enable_groups: ['default'],
         billing_mode: 'tiered_expr',
-        billing_expr: 'tier("base", p * 1.5 + per_image(0.02))',
+        billing_expr: 'v2:tier("base", p * 1.5 + per_image(0.02))',
       }
 
       const { container } = render(<PricingCellTest model={model} />)
       const cellText = container.textContent || ''
-      expect(cellText).toMatch(/\$1\.5\/1M/)
-      expect(cellText).toMatch(/\$0\.02\/image/)
+      expect(cellText).toMatch(/1\.5\/1M/)
+      expect(cellText).toMatch(/0\.02\/image/)
+      expect(cellText).toMatch(/USD/)
     })
   })
 
@@ -144,7 +150,7 @@ describe('pricing unit duplication and model card regression tests', () => {
       })
       expect(imageHeader).toHaveTextContent('Per image ($/image)')
 
-      const priceCell = within(table).getByRole('cell', { name: '$0.0400' })
+      const priceCell = within(table).getByRole('cell', { name: '$0.04' })
       expect(priceCell).toBeInTheDocument()
       expect(priceCell.textContent).not.toContain('/image')
     })
@@ -162,7 +168,7 @@ describe('pricing unit duplication and model card regression tests', () => {
       const mobileLabel = screen.getByText('Per image')
       expect(mobileLabel).toHaveTextContent(/^Per image$/)
 
-      const mobileValue = screen.getByText('$0.0400/image')
+      const mobileValue = screen.getByText('$0.04/image')
       expect(mobileValue).toBeInTheDocument()
     })
 
@@ -179,8 +185,8 @@ describe('pricing unit duplication and model card regression tests', () => {
 
       const table = screen.getByRole('table')
       const cells = within(table).getAllByRole('cell')
-      expect(cells.some((c) => c.textContent?.includes('$0.4000/s'))).toBe(true)
-      expect(cells.some((c) => c.textContent?.includes('$0.1000/credit'))).toBe(
+      expect(cells.some((c) => c.textContent?.includes('$0.4/s'))).toBe(true)
+      expect(cells.some((c) => c.textContent?.includes('$0.1/credit'))).toBe(
         true
       )
     })
@@ -291,7 +297,7 @@ describe('pricing unit duplication and model card regression tests', () => {
         completion_ratio: 1,
         enable_groups: ['default'],
         billing_mode: 'tiered_expr',
-        billing_expr: 'tier("base", p * 2.5 + per_image(0.04))',
+        billing_expr: 'v2:tier("base", p * 2.5 + per_image(0.04))',
       }
 
       render(

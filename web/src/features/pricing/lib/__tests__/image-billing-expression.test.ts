@@ -165,6 +165,7 @@ describe('v2 per-image billing expressions', () => {
       cacheCreateTokens: 0,
       cacheCreate1hTokens: 0,
       imageTokens: 0,
+      imageCacheTokens: 0,
       imageOutputTokens: 0,
       audioInputTokens: 0,
       audioOutputTokens: 0,

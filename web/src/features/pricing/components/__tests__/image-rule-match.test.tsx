@@ -92,7 +92,7 @@ describe('image pricing rule trace', () => {
     assert.match(matchedRule.textContent || '', /quality_high/)
     assert.match(matchedRule.textContent || '', /Matched/)
     assert.match(matchedRule.textContent || '', /2x/)
-    assert.match(container.textContent || '', /\$0\.0400/)
+    assert.match(container.textContent || '', /\$0\.04/)
     assert.match(container.textContent || '', /\$\/image/)
   })
 

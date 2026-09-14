@@ -89,7 +89,7 @@ func ValidateTopUpQuotaCapacity(userId int, creditedQuota int) error {
 
 // creditTopUpQuota repays outstanding debt before crediting spendable quota,
 // while atomically enforcing the wallet ceiling during settlement.
-func creditTopUpQuota(tx *gorm.DB, userId int, creditedQuota int, updates map[string]interface{}) (int, error) {
+func creditTopUpQuota(tx *gorm.DB, userId int, creditedQuota int, updates map[string]any) (int, error) {
 	if _, err := topUpQuotaMaxCurrent(creditedQuota); err != nil {
 		return 0, err
 	}
@@ -268,7 +268,7 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 		if err != nil || quota <= 0 {
 			return ErrInvalidTopUpQuota
 		}
-		creditedQuota, err = creditTopUpQuota(tx, topUp.UserId, quota, map[string]interface{}{
+		creditedQuota, err = creditTopUpQuota(tx, topUp.UserId, quota, map[string]any{
 			"stripe_customer": customerId,
 		})
 		return err
@@ -567,7 +567,7 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 		}
 
 		// 构建更新字段，优先使用邮箱，如果邮箱为空则使用用户名
-		updateFields := map[string]interface{}{}
+		updateFields := map[string]any{}
 
 		// 如果有客户邮箱，尝试更新用户邮箱（仅当用户邮箱为空时）
 		if customerEmail != "" {

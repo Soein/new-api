@@ -6,7 +6,6 @@ it under the terms of the GNU Affero General Public License as
 published by the Free Software Foundation, either version 3 of the
 License, or (at your option) any later version.
 */
-import { Combobox } from '@/components/ui/combobox'
 import { useMutation } from '@tanstack/react-query'
 import { Play } from 'lucide-react'
 import { useState } from 'react'
@@ -14,7 +13,7 @@ import { useTranslation } from 'react-i18next'
 
 import { CodeBlock, CodeBlockEditor } from '@/components/ai-elements/code-block'
 import { Button } from '@/components/ui/button'
-
+import { Combobox } from '@/components/ui/combobox'
 
 import { dryRunTaskPlugin } from '../api'
 
@@ -39,10 +38,12 @@ export function PluginSandbox(props: { pluginKey: string }) {
   const [args, setArgs] = useState('[{}]')
   const [output, setOutput] = useState('')
   const mutation = useMutation({
+    meta: { errorToast: false },
     mutationFn: async () => {
       const parsed = JSON.parse(args) as unknown
-      if (!Array.isArray(parsed))
+      if (!Array.isArray(parsed)) {
         throw new Error(t('Arguments must be a JSON array'))
+      }
       const memberSeparator = hook.indexOf('.')
       return dryRunTaskPlugin(props.pluginKey, {
         hook: memberSeparator < 0 ? hook : hook.slice(0, memberSeparator),
@@ -59,11 +60,11 @@ export function PluginSandbox(props: { pluginKey: string }) {
   return (
     <div className='flex flex-col gap-4'>
       <Combobox
-  options={hooks.map((item) => ({ value: item, label: item }))}
-  value={hook}
-  onValueChange={(value) => setHook(value ?? '')}
-  aria-label={t('Hook')}
-/>
+        options={hooks.map((item) => ({ value: item, label: item }))}
+        value={hook}
+        onValueChange={(value) => setHook(value ?? '')}
+        aria-label={t('Hook')}
+      />
       <CodeBlockEditor
         ariaLabel={t('Arguments JSON')}
         language='json'

@@ -20,9 +20,12 @@ import type {
   MarketplaceIndex,
   MarketplaceIndexVersion,
   MarketplacePlugin,
+  MarketplacePluginIcon,
   TaskPluginListItem,
 } from '../types'
+import { pluginProtocolClaimsSchema } from './plugin-meta-preview'
 import { PluginSourceFetchError, readBoundedResponseText } from './plugin-url'
+import { getPluginWebsite } from './plugin-website'
 
 export const SUPPORTED_INDEX_VERSION = 1
 
@@ -187,7 +190,12 @@ export function parseMarketplaceIndex(payload: unknown): MarketplaceIndex {
       typeof raw.name === 'string'
         ? raw.name.slice(0, MAX_PLUGIN_NAME_LENGTH)
         : '',
-    plugins,
+    plugins: plugins.sort((left, right) => {
+      const difference = (right.sortPriority ?? 0) - (left.sortPriority ?? 0)
+      if (difference !== 0) return difference
+      if (left.key === right.key) return 0
+      return left.key < right.key ? -1 : 1
+    }),
   }
 }
 
@@ -255,6 +263,11 @@ function parseMarketplacePlugin(entry: unknown): MarketplacePlugin | null {
       typeof rawVersion.kind === 'string' ? rawVersion.kind.trim() : ''
     if (kind && kind !== SUPPORTED_PLUGIN_KIND) continue
 
+    const baseUrl =
+      typeof rawVersion.baseUrl === 'string' && rawVersion.baseUrl.trim()
+        ? rawVersion.baseUrl.trim()
+        : undefined
+
     versions.push({
       version: rawV,
       path: rawP,
@@ -264,6 +277,7 @@ function parseMarketplacePlugin(entry: unknown): MarketplacePlugin | null {
         : undefined,
       kind: kind || undefined,
       allowedHosts,
+      baseUrl,
       auth,
     })
   }
@@ -275,11 +289,35 @@ function parseMarketplacePlugin(entry: unknown): MarketplacePlugin | null {
     ? declaredLatest
     : versions[0].version
 
+  // `icon` is a LobeHub name or the text scheme, exactly what meta.icon admits.
+  // Inline data URIs and remote URLs are dropped: image logos ship as sidecar
+  // files declared in `iconFile`, and are only ever loaded from the index's own
+  // origin, so an index cannot turn the marketplace page into a beacon.
   let icon: string | undefined
   if (typeof raw.icon === 'string') {
     const trimmed = raw.icon.trim()
-    if (trimmed && trimmed.length <= MAX_PLUGIN_ICON_LENGTH) {
+    if (
+      trimmed &&
+      trimmed.length <= MAX_PLUGIN_ICON_LENGTH &&
+      !trimmed.startsWith('data:') &&
+      !trimmed.includes('://')
+    ) {
       icon = trimmed
+    }
+  }
+  let iconFile: MarketplacePluginIcon | undefined
+  if (raw.iconFile && typeof raw.iconFile === 'object') {
+    const rawIconFile = raw.iconFile as Record<string, unknown>
+    const iconPath =
+      typeof rawIconFile.path === 'string' ? rawIconFile.path.trim() : ''
+    if (/\.(svg|png)$/i.test(iconPath)) {
+      iconFile = {
+        path: iconPath,
+        sha256:
+          typeof rawIconFile.sha256 === 'string'
+            ? rawIconFile.sha256.trim()
+            : undefined,
+      }
     }
   }
 
@@ -289,11 +327,21 @@ function parseMarketplacePlugin(entry: unknown): MarketplacePlugin | null {
 
   return {
     key,
+    sortPriority:
+      typeof raw.sortPriority === 'number' &&
+      Number.isInteger(raw.sortPriority) &&
+      raw.sortPriority >= -2147483648 &&
+      raw.sortPriority <= 2147483647
+        ? raw.sortPriority
+        : 0,
+    website: getPluginWebsite(raw.website),
     name,
     icon,
+    iconFile,
     description: parseMarketplaceDescription(raw.description),
     channelTypes: parsePluginChannelTypes(raw.channelTypes),
     models: parsePluginModels(raw.models),
+    protocols: pluginProtocolClaimsSchema.safeParse(raw.protocols).data,
     latest,
     versions,
   }
@@ -322,11 +370,15 @@ function parsePluginModels(value: unknown): string[] | undefined {
   if (value.length > MAX_PLUGIN_MODELS) return undefined
   const models: string[] = []
   for (const item of value) {
-    if (typeof item === 'string' && item.length <= MAX_PLUGIN_MODEL_LENGTH) {
+    if (
+      typeof item === 'string' &&
+      item.length > 0 &&
+      item.length <= MAX_PLUGIN_MODEL_LENGTH
+    ) {
       models.push(item)
     }
   }
-  return models.length > 0 ? models : undefined
+  return models
 }
 
 function parsePluginChannelTypes(value: unknown): number[] | undefined {

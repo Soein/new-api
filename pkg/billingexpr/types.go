@@ -12,6 +12,9 @@ type RequestInput struct {
 	Body           []byte
 	StructuredBody []byte
 	Usage          map[string]any
+	// ImageCount is a validated billing quantity, separate from the frozen
+	// request's n. Settlement can replace it with the actual returned count.
+	ImageCount *int
 }
 
 // TokenParams holds all token dimensions passed into an Expr evaluation.
@@ -25,6 +28,7 @@ type TokenParams struct {
 	CC         float64 // cache creation tokens (5-min TTL for Claude, generic for others)
 	CC1h       float64 // cache creation tokens — 1-hour TTL (Claude only)
 	Img        float64 // image input tokens
+	ImgCR      float64 // image cache read tokens, separated only when explicitly priced
 	ImgO       float64 // image output tokens
 	AI         float64 // audio input tokens
 	AO         float64 // audio output tokens
@@ -47,8 +51,18 @@ type RequestRuleTrace struct {
 	Matched    bool    `json:"matched"`
 }
 
+type BillingUnit string
+
+const (
+	BillingUnitToken   BillingUnit = "token"
+	BillingUnitRequest BillingUnit = "request"
+)
+
 // TraceResult holds side-channel info captured while an expression runs.
 type TraceResult struct {
+	ImageCount   *int               `json:"image_count,omitempty"`
+	BillingUnit  BillingUnit        `json:"billing_unit"`
+	FixedPrice   *float64           `json:"fixed_price,omitempty"`
 	MatchedTier  string             `json:"matched_tier"`
 	MatchedRules []MatchedRule      `json:"matched_rules,omitempty"`
 	RequestRules []RequestRuleTrace `json:"request_rules,omitempty"`
@@ -60,6 +74,7 @@ type TraceResult struct {
 // auto-group retry and settlement. It is fully serializable and contains no
 // compiled program pointers.
 type BillingSnapshot struct {
+	EstimatedImageCount       *int           `json:"estimated_image_count,omitempty"`
 	BillingMode               string         `json:"billing_mode"`
 	ModelName                 string         `json:"model_name"`
 	ExprString                string         `json:"expr_string"`
@@ -72,6 +87,8 @@ type BillingSnapshot struct {
 	ToolPreConsumedQuota      int            `json:"tool_pre_consumed_quota,omitempty"`
 	ImageCount                int            `json:"image_count,omitempty"`
 	EstimatedTier             string         `json:"estimated_tier"`
+	EstimatedBillingUnit      BillingUnit    `json:"estimated_billing_unit,omitempty"`
+	EstimatedFixedPrice       *float64       `json:"estimated_fixed_price,omitempty"`
 	QuotaPerUnit              float64        `json:"quota_per_unit"`
 	ExprVersion               int            `json:"expr_version"`
 	TaskUsageBilling          bool           `json:"task_usage_billing,omitempty"`
@@ -80,12 +97,18 @@ type BillingSnapshot struct {
 
 // TieredResult holds everything needed after running tiered settlement.
 type TieredResult struct {
+	// BillingTokens records the actual normalized inputs for successful token
+	// billing that explicitly references img_cr. Logs serialize these through
+	// the shared injection path, not as additional snapshot state.
+	BillingTokens          *TokenParams       `json:"-"`
+	ImageCount             *int               `json:"image_count,omitempty"`
+	BillingUnit            BillingUnit        `json:"billing_unit"`
+	FixedPrice             *float64           `json:"fixed_price,omitempty"`
 	ActualQuotaBeforeGroup float64            `json:"actual_quota_before_group"`
 	ActualQuotaAfterGroup  int                `json:"actual_quota_after_group"`
 	MatchedTier            string             `json:"matched_tier"`
 	MatchedRules           []MatchedRule      `json:"matched_rules,omitempty"`
 	RequestRules           []RequestRuleTrace `json:"request_rules,omitempty"`
-	ImageCount             int                `json:"image_count,omitempty"`
 	CrossedTier            bool               `json:"crossed_tier"`
 	// Clamp records a single-request saturation event during quota conversion so the
 	// caller can surface it on the consume log for admin auditing. Nil when no

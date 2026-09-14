@@ -178,7 +178,7 @@ func persistTokenQuotaDelta(id int, delta int) error {
 		query = query.Where("remain_quota >= ?", -delta)
 	}
 	result := query.Updates(
-		map[string]interface{}{
+		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota + ?", delta),
 			"used_quota":    gorm.Expr("used_quota - ?", delta),
 			"accessed_time": common.GetTimestamp(),
@@ -213,7 +213,7 @@ func reserveUserQuotaDB(id int, quota int) (bool, error) {
 func reserveTokenQuotaDB(id int, quota int) (bool, error) {
 	result := DB.Model(&Token{}).
 		Where("id = ? AND remain_quota >= ?", id, quota).
-		Updates(map[string]interface{}{
+		Updates(map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"accessed_time": common.GetTimestamp(),

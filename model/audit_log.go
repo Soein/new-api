@@ -118,7 +118,7 @@ func RecordAuditLog(c *gin.Context, entry AuditLog) error {
 		logger.LogError(ctx, fmt.Sprintf("audit log write failed (request_id=%s): %v", entry.RequestId, err))
 		return err
 	}
-	var row interface{} = &entry
+	var row any = &entry
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		encoded, err := common.Marshal(entry.Other)
 		if err != nil {

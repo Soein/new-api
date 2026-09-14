@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { AxiosError, type AxiosAdapter } from 'axios'
 import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -43,6 +44,8 @@ import {
   pricingOptions,
   pricingRow,
 } from '../pricing'
+
+const originalAdapter = api.defaults.adapter
 
 describe('shared model pricing', () => {
   it('preserves explicit zero prices and cache-write configuration', () => {
@@ -161,6 +164,7 @@ describe('shared model pricing', () => {
   })
 
   afterEach(() => {
+    api.defaults.adapter = originalAdapter
     vi.restoreAllMocks()
     useAuthStore.getState().auth.reset('idle')
   })
@@ -221,9 +225,14 @@ describe('shared model pricing', () => {
     expect(notice).toBeVisible()
     expect(notice).toHaveTextContent(/only to this model/i)
 
-    const currentBilling = screen.getByText(/Current Billing/i)
-    expect(currentBilling).toHaveTextContent(/Input \$5/)
-    expect(currentBilling).toHaveTextContent(/Output \$15/)
+    const currentBilling = screen.getByRole('region', {
+      name: /Current Billing/i,
+    })
+    expect(within(currentBilling).getByText('Input')).toBeVisible()
+    expect(within(currentBilling).getByText('5')).toBeVisible()
+    expect(within(currentBilling).getByText('Output')).toBeVisible()
+    expect(within(currentBilling).getByText('15')).toBeVisible()
+    expect(within(currentBilling).getByText(/USD/i)).toBeVisible()
     expect(screen.getByDisplayValue('5')).toBeVisible()
 
     await user.click(
@@ -521,6 +530,142 @@ describe('shared model pricing', () => {
     ).rejects.toThrow()
   })
 
+  it('rejects save when missing entry concurrent plugin pricing changed, but allows when unchanged', async () => {
+    const key = 'billing_setting.plugin_billing_expr'
+    const snapshot: ModelPricingConfig = {
+      options: pricingOptions({}),
+      empty_version: 'v-empty',
+      entries: [],
+    }
+    const before = snapshot.options
+    // User A edits unconfigured model new-shared and adds alpha plugin pricing
+    const after = applyPricingDraft(before, {
+      name: 'new-shared',
+      pluginBillingExpr: { alpha: 'u("seconds")' },
+    })
+
+    // User B concurrently saved beta plugin pricing on server
+    vi.spyOn(api, 'get').mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          options: snapshot.options,
+          empty_version: 'v-empty',
+          entries: [
+            {
+              model_name: 'new-shared',
+              version: 'v-fresh-after-beta-save',
+              configured: {
+                [key]: { beta: 'u("credits")' },
+              },
+              effective: {},
+            },
+          ],
+        },
+      },
+    })
+
+    // User A's save resolution must reject concurrent beta addition instead of silently clobbering it
+    await expect(
+      preparePricingChanges(snapshot, before, after)
+    ).rejects.toThrow()
+
+    // When server entry has unchanged plugin pricing matching snapshot baseline, save succeeds
+    vi.spyOn(api, 'get').mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          options: snapshot.options,
+          empty_version: 'v-empty',
+          entries: [
+            {
+              model_name: 'new-shared',
+              version: 'v-fresh',
+              configured: {},
+              effective: {},
+            },
+          ],
+        },
+      },
+    })
+
+    const changes = await preparePricingChanges(snapshot, before, after)
+    expect(changes).toEqual([
+      {
+        model_name: 'new-shared',
+        expected_version: 'v-fresh',
+        pricing: {
+          'billing_setting.billing_mode': 'ratio',
+          [key]: { alpha: 'u("seconds")' },
+        },
+      },
+    ])
+
+    // Key order variations without semantic changes are safely permitted
+    const baselineWithOptions: ModelPricingConfig = {
+      options: pricingOptions({
+        [key]: JSON.stringify({
+          'alpha::new-shared': 'u("seconds")',
+          'beta::new-shared': 'u("credits")',
+        }),
+      }),
+      empty_version: 'v-empty',
+      entries: [],
+    }
+    const beforeWithPlugins = baselineWithOptions.options
+    const afterReordered = applyPricingDraft(beforeWithPlugins, {
+      name: 'new-shared',
+      pluginBillingExpr: {
+        alpha: 'u("seconds")',
+        beta: 'u("credits")',
+        gamma: '1',
+      },
+    })
+
+    vi.spyOn(api, 'get').mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          options: baselineWithOptions.options,
+          empty_version: 'v-empty',
+          entries: [
+            {
+              model_name: 'new-shared',
+              version: 'v-reordered',
+              configured: {
+                [key]: {
+                  beta: 'u("credits")',
+                  alpha: 'u("seconds")',
+                },
+              },
+              effective: {},
+            },
+          ],
+        },
+      },
+    })
+
+    const changesReordered = await preparePricingChanges(
+      baselineWithOptions,
+      beforeWithPlugins,
+      afterReordered
+    )
+    expect(changesReordered).toEqual([
+      {
+        model_name: 'new-shared',
+        expected_version: 'v-reordered',
+        pricing: {
+          'billing_setting.billing_mode': 'ratio',
+          [key]: {
+            alpha: 'u("seconds")',
+            beta: 'u("credits")',
+            gamma: '1',
+          },
+        },
+      },
+    ])
+  })
+
   it('does not refresh already-known entry versions during preparation', async () => {
     const snapshot: ModelPricingConfig = {
       options: pricingOptions({
@@ -592,16 +737,23 @@ describe('shared model pricing', () => {
   })
 
   it('propagates backend conflict rejection when saving model pricing with conflicting alias writes', async () => {
-    vi.spyOn(api, 'patch').mockRejectedValue({
-      isAxiosError: true,
-      response: {
-        status: 409,
-        data: {
-          success: false,
-          message: 'Conflicting pricing for shared alias numeric_model: gpt-4',
-        },
-      },
-    })
+    const message = 'Conflicting pricing for shared alias numeric_model: gpt-4'
+    const adapter: AxiosAdapter = async (config) => {
+      throw new AxiosError(
+        'Request failed with status code 409',
+        'ERR_BAD_REQUEST',
+        config,
+        undefined,
+        {
+          data: { success: false, message },
+          status: 409,
+          statusText: 'Conflict',
+          headers: {},
+          config,
+        }
+      )
+    }
+    api.defaults.adapter = adapter
     await expect(
       saveModelPricing([
         {
@@ -784,4 +936,96 @@ describe('shared model pricing', () => {
       expect(parsed[name]).toBe('tier("base", p * 2)')
     }
   )
+})
+
+it('tracks nested provider prices by model, preserves :: in model names, and ignores key order', () => {
+  const key = 'billing_setting.plugin_billing_expr'
+  const before = pricingOptions({
+    [key]: JSON.stringify({
+      'alpha::shared::model': 'u("seconds")',
+      'beta::shared::model': 'u("credits")',
+      'alpha::other': '1',
+    }),
+  })
+  const snapshot: ModelPricingConfig = {
+    options: before,
+    empty_version: 'empty',
+    entries: [
+      {
+        model_name: 'shared::model',
+        version: 'v1',
+        configured: { [key]: { alpha: 'u("seconds")', beta: 'u("credits")' } },
+        effective: {},
+      },
+    ],
+  }
+  const reordered = {
+    ...before,
+    [key]: JSON.stringify({
+      'alpha::other': '1',
+      'beta::shared::model': 'u("credits")',
+      'alpha::shared::model': 'u("seconds")',
+    }),
+  }
+  expect(buildPricingChanges(snapshot, before, reordered)).toEqual([])
+  const after = {
+    ...before,
+    [key]: JSON.stringify({
+      'beta::shared::model': 'u("credits") * 2',
+      'alpha::other': '1',
+    }),
+  }
+  expect(buildPricingChanges(snapshot, before, after)).toEqual([
+    {
+      model_name: 'shared::model',
+      expected_version: 'v1',
+      pricing: { [key]: { beta: 'u("credits") * 2' } },
+    },
+  ])
+  const draft = pricingRow('shared::model', snapshot.entries[0].configured)
+  expect(pricingFromDraft(draft)[key]).toEqual(
+    snapshot.entries[0].configured[key]
+  )
+  expect(
+    pricingRow('alpha::model', {
+      ModelPrice: 0.25,
+      'billing_setting.plugin_billing_expr': { beta: 'u("images")' },
+    })
+  ).toMatchObject({
+    name: 'alpha::model',
+    price: '0.25',
+    billingMode: 'per-request',
+  })
+})
+
+it('retains provider overrides during model-only price synchronization', () => {
+  const key = 'billing_setting.plugin_billing_expr'
+  const options = pricingOptions({
+    [key]: JSON.stringify({ 'alpha::example': 'u("seconds") * 2' }),
+  })
+  const after = applyPriceSyncSelections(options, {
+    example: { billing_expr: 'tier("base", u("seconds"))' },
+  })
+  expect(after[key]).toEqual(options[key])
+})
+
+it('commits source provider edits while preserving target providers during batch copy', () => {
+  const key = 'billing_setting.plugin_billing_expr'
+  const options = pricingOptions({
+    [key]: JSON.stringify({ 'alpha::source': '1', 'beta::target': '2' }),
+  })
+  const after = applyPricingDraft(
+    options,
+    {
+      name: 'source',
+      billingMode: 'tiered_expr',
+      billingExpr: 'tier("base", u("seconds"))',
+      pluginBillingExpr: { alpha: '3' },
+    },
+    ['source', 'target']
+  )
+  expect(JSON.parse(after[key])).toEqual({
+    'alpha::source': '3',
+    'beta::target': '2',
+  })
 })

@@ -17,7 +17,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { BillingUsageSchema } from '../types'
-import type { ParsedTaskTier } from './billing-expr'
+import {
+  parseTaskTiersFromExpr,
+  type ParsedTaskTier,
+  type TaskTierCondition,
+} from './billing-expr'
 import {
   getTaskEnumFields,
   taskMatrixRowLabel,
@@ -35,10 +39,45 @@ export function getTaskMatrixDisplayTiers(
   schema: BillingUsageSchema | null | undefined
 ): ParsedTaskTier[] | null {
   if (!schema) return null
-  if (getTaskEnumFields(schema).length === 0) return null
+  const enumFields = getTaskEnumFields(schema)
+  if (enumFields.length === 0) return null
+
+  const tiers = parseTaskTiersFromExpr(expression || '', schema)
+  if (tiers.length === 0) return null
 
   const matrix = tryParseTaskMatrixConfig(expression, schema)
   if (!matrix) return null
+
+  const isUniform = tiers.length === 1 && tiers[0].conditions.length === 0
+  if (!isUniform) {
+    if (tiers.length !== matrix.rows.length) return null
+    const fallbackTier = tiers.at(-1)
+    if (!fallbackTier || fallbackTier.conditions.length !== 0) return null
+
+    const seenKeys = new Set<string>()
+    for (const tier of tiers.slice(0, -1)) {
+      if (tier.conditions.length !== enumFields.length) return null
+
+      const valuesByField = new Map<string, string>()
+      for (const condition of tier.conditions) {
+        const definition = schema[condition.field]
+        if (
+          valuesByField.has(condition.field) ||
+          !definition?.enum?.includes(condition.value)
+        ) {
+          return null
+        }
+        valuesByField.set(condition.field, condition.value)
+      }
+      if (valuesByField.size !== enumFields.length) return null
+
+      const key = enumFields
+        .map(([field]) => valuesByField.get(field))
+        .join('\0')
+      if (seenKeys.has(key)) return null
+      seenKeys.add(key)
+    }
+  }
 
   return matrix.rows.map((row) => ({
     label: taskMatrixRowLabel(row.combination),
@@ -48,4 +87,50 @@ export function getTaskMatrixDisplayTiers(
     constant: row.constant,
     unitPrices: { ...row.unitPrices },
   }))
+}
+
+/** Display explicit conditions for a fallback only when its complement is unique.
+ * Unlike the editor matrix, unrelated schema fields do not expand the price table.
+ */
+export function getTaskPricingDisplayTiers(
+  expression: string | null | undefined,
+  schema: BillingUsageSchema | null | undefined
+): ParsedTaskTier[] {
+  const tiers = parseTaskTiersFromExpr(expression || '', schema, true)
+  const fallback = tiers.at(-1)
+  if (!schema || tiers.length < 2 || !fallback) return tiers
+  const previous = tiers.slice(0, -1)
+  const fields = [
+    ...new Set(
+      previous.flatMap((tier) =>
+        tier.conditions.map((condition) => condition.field)
+      )
+    ),
+  ].sort()
+  let combinations: TaskTierCondition[][] = [[]]
+  for (const field of fields) {
+    const definition = schema[field]
+    const values =
+      definition?.type === 'boolean' ? ['false', 'true'] : definition?.enum
+    // Avoid expanding large plugin schemas merely to name a fallback row.
+    if (!values?.length || combinations.length * values.length > 256) {
+      return tiers
+    }
+    combinations = combinations.flatMap((combination) =>
+      values.map((value) => [...combination, { field, value }])
+    )
+  }
+  const remaining = combinations.filter(
+    (combination) =>
+      !previous.some((tier) =>
+        tier.conditions.every((condition) =>
+          combination.some(
+            (value) =>
+              value.field === condition.field && value.value === condition.value
+          )
+        )
+      )
+  )
+  if (remaining.length !== 1) return tiers
+  return [...previous, { ...fallback, conditions: remaining[0] }]
 }

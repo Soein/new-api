@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -1962,4 +1963,283 @@ func setupTaskPluginRouteDB(t *testing.T) {
 func insertTaskPluginRouteTask(t *testing.T, task *model.Task) {
 	t.Helper()
 	require.NoError(t, model.DB.Create(task).Error)
+}
+
+func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
+	for _, tc := range []struct {
+		name, alpha, beta string
+		wantKeys          []string
+		wantError         string
+	}{
+		{name: "first decoder rejects", alpha: `throw new Error("alpha only accepts 720p")`, beta: `return {model:ctx.model,action:"beta",requestBody:{resolution:"1080p"}}`, wantKeys: []string{"decode-beta"}},
+		{name: "second decoder rejects", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `throw new Error("beta rejects")`, wantKeys: []string{"decode-alpha"}},
+		{name: "both decoders accept", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-alpha", "decode-beta"}},
+		{name: "all decoders reject", alpha: `throw new Error("alpha rejects first")`, beta: `throw new Error("beta rejects second")`, wantError: "decode-alpha: alpha rejects first; decode-beta: beta rejects second"},
+		{name: "duplicate failures are grouped", alpha: `throw new Error("unsupported resolution")`, beta: `throw new Error("unsupported resolution")`, wantError: "decode-alpha, decode-beta: unsupported resolution"},
+		{name: "invalid result is excluded", alpha: `return {kind:"query",model:ctx.model}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
+		{name: "rewritten model is excluded", alpha: `return {model:"another-model"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, spec := range []struct{ key, decode string }{{"decode-alpha", tc.alpha}, {"decode-beta", tc.beta}} {
+				_, err := registerUnpersistedTaskPlugin(taskResponsesPluginSource(spec.key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, spec.decode), jsplugin.Options{})
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(spec.key)) })
+			}
+			var gotKeys []string
+			router := gin.New()
+			router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+				pinned := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
+				for _, candidate := range pinned.Candidates {
+					gotKeys = append(gotKeys, candidate.Plugin.Meta.Key)
+				}
+				assert.Equal(t, tc.wantKeys[0], pinned.Plugin.Meta.Key)
+				assert.Equal(t, tc.wantKeys[0], c.GetString("task_plugin_key"))
+				assert.Same(t, pinned.Plugin, c.MustGet(jsplugin.ContextKeyPinnedPlugin).(jsplugin.PinnedPlugin).Plugin)
+				assert.Equal(t, tc.wantKeys, service.GetChannelConstraints(c).Filters[0].TaskPluginKeys)
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model","resolution":"1080p"}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if tc.wantError != "" {
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), tc.wantError)
+				assert.Empty(t, gotKeys)
+			} else {
+				assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+				assert.Equal(t, tc.wantKeys, gotKeys)
+			}
+		})
+	}
+}
+
+type taskPluginHookReader struct {
+	reader io.Reader
+	onRead func()
+	called bool
+}
+
+func (r *taskPluginHookReader) Read(p []byte) (int, error) {
+	if !r.called {
+		r.called = true
+		if r.onRead != nil {
+			r.onRead()
+		}
+	}
+	return r.reader.Read(p)
+}
+
+func TestPrepareTaskPluginEndpointSharedCandidateAdmission(t *testing.T) {
+	registerOverride := func(t *testing.T, key, decode string, active bool) *jsplugin.LoadedPlugin {
+		t.Helper()
+		source := taskResponsesPluginSource(key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, decode)
+		plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
+		require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
+			Key:        plugin.Meta.Key,
+			APIVersion: plugin.Meta.APIVersion,
+			Version:    plugin.Meta.Version,
+			Source:     source,
+			SourceHash: plugin.SourceHash,
+			Enabled:    true,
+		}))
+		if !active {
+			_, err = model.DeleteTaskPluginVersion(plugin.Meta.Key, plugin.Meta.Version)
+			require.NoError(t, err)
+		}
+		return plugin
+	}
+
+	t.Run("stale first candidate is bypassed for active second candidate", func(t *testing.T) {
+		setupTaskPluginRouteDB(t)
+		registerOverride(t, "decode-alpha", `throw new Error("stale alpha decoder must not execute");`, false)
+		registerOverride(t, "decode-beta", `return {model:ctx.model,action:"beta"};`, true)
+
+		var gotKey string
+		router := gin.New()
+		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			gotKey = c.GetString("task_plugin_key")
+			c.Status(http.StatusNoContent)
+		})
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		assert.Equal(t, http.StatusNoContent, recorder.Code)
+		assert.Equal(t, "decode-beta", gotKey)
+		assert.NotContains(t, recorder.Body.String(), "stale alpha decoder must not execute")
+	})
+
+	t.Run("active first candidate is selected when second candidate is stale", func(t *testing.T) {
+		setupTaskPluginRouteDB(t)
+		registerOverride(t, "decode-alpha", `return {model:ctx.model,action:"alpha"};`, true)
+		registerOverride(t, "decode-beta", `throw new Error("stale beta decoder must not execute");`, false)
+
+		var gotKey string
+		router := gin.New()
+		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			gotKey = c.GetString("task_plugin_key")
+			c.Status(http.StatusNoContent)
+		})
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		assert.Equal(t, http.StatusNoContent, recorder.Code)
+		assert.Equal(t, "decode-alpha", gotKey)
+		assert.NotContains(t, recorder.Body.String(), "stale beta decoder must not execute")
+	})
+
+	t.Run("all candidates inactive aborts with 503 before any decoder runs", func(t *testing.T) {
+		setupTaskPluginRouteDB(t)
+		registerOverride(t, "decode-alpha", `throw new Error("stale alpha decoder must not execute");`, false)
+		registerOverride(t, "decode-beta", `throw new Error("stale beta decoder must not execute");`, false)
+
+		reached := false
+		router := gin.New()
+		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			reached = true
+			c.Status(http.StatusNoContent)
+		})
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		assert.False(t, reached)
+		assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+		assert.NotContains(t, recorder.Body.String(), "stale alpha decoder must not execute")
+		assert.NotContains(t, recorder.Body.String(), "stale beta decoder must not execute")
+	})
+
+	t.Run("valid candidate rejects with 400 when first candidate is stale", func(t *testing.T) {
+		setupTaskPluginRouteDB(t)
+		registerOverride(t, "decode-alpha", `throw new Error("stale alpha decoder must not execute");`, false)
+		registerOverride(t, "decode-beta", `throw new Error("beta rejects 1080p");`, true)
+
+		reached := false
+		router := gin.New()
+		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			reached = true
+			c.Status(http.StatusNoContent)
+		})
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		assert.False(t, reached)
+		assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), "beta rejects 1080p")
+		assert.NotContains(t, recorder.Body.String(), "stale alpha decoder must not execute")
+	})
+
+	t.Run("valid candidate rejects with 400 when second candidate is stale", func(t *testing.T) {
+		setupTaskPluginRouteDB(t)
+		registerOverride(t, "decode-alpha", `throw new Error("alpha rejects 1080p");`, true)
+		registerOverride(t, "decode-beta", `throw new Error("stale beta decoder must not execute");`, false)
+
+		reached := false
+		router := gin.New()
+		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			reached = true
+			c.Status(http.StatusNoContent)
+		})
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		assert.False(t, reached)
+		assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), "alpha rejects 1080p")
+		assert.NotContains(t, recorder.Body.String(), "stale beta decoder must not execute")
+	})
+
+	t.Run("multiple valid candidates preserve error aggregation with stale candidate present", func(t *testing.T) {
+		setupTaskPluginRouteDB(t)
+		registerOverride(t, "decode-alpha", `throw new Error("stale alpha decoder must not execute");`, false)
+		registerOverride(t, "decode-beta", `throw new Error("beta rejects first");`, true)
+		registerOverride(t, "decode-gamma", `throw new Error("gamma rejects second");`, true)
+
+		reached := false
+		router := gin.New()
+		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			reached = true
+			c.Status(http.StatusNoContent)
+		})
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		assert.False(t, reached)
+		assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), "decode-beta: beta rejects first; decode-gamma: gamma rejects second")
+		assert.NotContains(t, recorder.Body.String(), "stale alpha decoder must not execute")
+	})
+
+	t.Run("all candidates invalidated after initial admission aborts with 503 before any decoder runs", func(t *testing.T) {
+		setupTaskPluginRouteDB(t)
+		pluginAlpha := registerOverride(t, "decode-alpha", `throw new Error("stale alpha decoder must not execute");`, true)
+		pluginBeta := registerOverride(t, "decode-beta", `throw new Error("stale beta decoder must not execute");`, true)
+
+		generation := jsplugin.DefaultRegistry.Generation()
+		require.NotNil(t, generation)
+		candidates := generation.LookupEndpointCandidates(http.MethodPost, "/v1/responses", "decode-shared-model")
+		require.Len(t, candidates, 2)
+
+		reached := false
+		router := gin.New()
+		router.POST("/v1/responses", func(c *gin.Context) {
+			c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{
+				Generation: generation,
+				Plugin:     candidates[0].Plugin,
+			})
+			c.Set(jsplugin.ContextKeyPinnedEndpoint, jsplugin.PinnedEndpoint{
+				Generation:  generation,
+				Plugin:      candidates[0].Plugin,
+				Protocol:    candidates[0].Protocol,
+				Operation:   candidates[0].Operation,
+				Model:       "decode-shared-model",
+				MappedModel: "",
+				Candidates:  candidates,
+			})
+			c.Next()
+		}, PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			reached = true
+			c.Status(http.StatusNoContent)
+		})
+
+		payload := `{"model":"decode-shared-model"}`
+		bodyRead := false
+		reader := &taskPluginHookReader{
+			reader: strings.NewReader(payload),
+			onRead: func() {
+				bodyRead = true
+				require.True(t, service.TaskPluginAdmittedForNewRequest(pluginAlpha))
+				require.True(t, service.TaskPluginAdmittedForNewRequest(pluginBeta))
+				_, err := model.DeleteTaskPluginVersion(pluginAlpha.Meta.Key, pluginAlpha.Meta.Version)
+				require.NoError(t, err)
+				_, err = model.DeleteTaskPluginVersion(pluginBeta.Meta.Key, pluginBeta.Meta.Version)
+				require.NoError(t, err)
+			},
+		}
+
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", reader)
+		request.Header.Set("Content-Type", "application/json")
+		request.ContentLength = int64(len(payload))
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		assert.True(t, bodyRead)
+		assert.False(t, reached)
+		assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+		assert.NotContains(t, recorder.Body.String(), "stale alpha decoder must not execute")
+		assert.NotContains(t, recorder.Body.String(), "stale beta decoder must not execute")
+	})
 }

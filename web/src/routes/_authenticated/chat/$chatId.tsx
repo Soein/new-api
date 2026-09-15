@@ -154,6 +154,7 @@ function ChatRouteComponent() {
   }
 
   return (
+    // eslint-disable-next-line react/iframe-missing-sandbox -- Administrator-configured trusted third-party chat application requiring storage, cookies, CORS, and microphone access. Sandbox restrictions would change its origin and break required APIs, while allow-scripts plus allow-same-origin does not provide effective isolation per MDN; this preserves existing trust boundaries without claiming sandboxed isolation.
     <iframe
       src={iframeSrc}
       key={iframeSrc}

@@ -27,6 +27,7 @@ interface HtmlContentProps {
   content: string
   className?: string
   variant?: HtmlContentVariant
+  typography?: boolean
 }
 
 const isolatedContentSandbox =
@@ -185,6 +186,7 @@ function IsolatedHtmlContent(props: {
 
 export function HtmlContent(props: HtmlContentProps) {
   const variant = props.variant ?? 'inline'
+  const typography = props.typography ?? true
   const html = useMemo(
     () => sanitizeHtmlContent(props.content, variant),
     [props.content, variant]
@@ -197,7 +199,7 @@ export function HtmlContent(props: HtmlContentProps) {
   return (
     <div
       className={cn(
-        'prose prose-neutral dark:prose-invert max-w-none',
+        typography && 'prose prose-neutral dark:prose-invert max-w-none',
         props.className
       )}
       // eslint-disable-next-line react/no-danger -- html is sanitized above

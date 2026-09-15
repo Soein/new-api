@@ -35,6 +35,7 @@ import {
 } from '@/features/model-pricing/pricing'
 import { api } from '@/lib/api'
 
+import { SyncPriceCell } from '../models/upstream-price-cells'
 import { UpstreamRatioSync } from '../models/upstream-ratio-sync'
 import {
   getSyncPriceLines,
@@ -101,7 +102,10 @@ function TableFixture(props: { prices: PricingSyncModels }) {
     />
   )
 }
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 describe('pricing synchronization', () => {
   it('shows every dollar price inline, including explicit zero cache and audio prices', () => {
@@ -193,6 +197,48 @@ describe('pricing synchronization', () => {
     expect(screen.getByText('$0.2')).toBeVisible()
     expect(screen.getByText('$0.4')).toBeVisible()
     expect(screen.getByText(custom)).toBeVisible()
+  })
+
+  it('renders multiple expression tiers with identical formatted conditions without duplicate keys and preserves updated prices', () => {
+    const errorSpy = vi.spyOn(console, 'error')
+    const expression =
+      'p < 99999.9999 ? tier("base", p * 1 + c * 2) : p < 100000.0001 ? tier("base", p * 3 + c * 4) : tier("default", p * 5 + c * 6)'
+    const updatedExpression =
+      'p < 99999.9999 ? tier("base", p * 10 + c * 20) : p < 100000.0001 ? tier("base", p * 30 + c * 40) : tier("default", p * 50 + c * 60)'
+
+    const { rerender } = render(
+      <SyncPriceCell
+        values={{ billing_mode: 'tiered_expr', billing_expr: expression }}
+      />
+    )
+
+    expect(screen.getAllByText('Input tokens < 100,000')).toHaveLength(2)
+    expect(screen.getByText('$1')).toBeVisible()
+    expect(screen.getByText('$2')).toBeVisible()
+    expect(screen.getByText('$3')).toBeVisible()
+    expect(screen.getByText('$4')).toBeVisible()
+    expect(screen.getByText('$5')).toBeVisible()
+    expect(screen.getByText('$6')).toBeVisible()
+
+    rerender(
+      <SyncPriceCell
+        values={{
+          billing_mode: 'tiered_expr',
+          billing_expr: updatedExpression,
+        }}
+      />
+    )
+
+    expect(screen.getAllByText('Input tokens < 100,000')).toHaveLength(2)
+    expect(screen.getByText('$10')).toBeVisible()
+    expect(screen.getByText('$20')).toBeVisible()
+    expect(screen.getByText('$30')).toBeVisible()
+    expect(screen.getByText('$40')).toBeVisible()
+    expect(screen.getByText('$50')).toBeVisible()
+    expect(screen.getByText('$60')).toBeVisible()
+    expect(screen.queryByText('$1')).not.toBeInTheDocument()
+
+    expect(errorSpy).not.toHaveBeenCalled()
   })
 
   it('shows a mobile comparison list and preserves source-wide selection', async () => {

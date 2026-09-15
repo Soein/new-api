@@ -137,7 +137,17 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	appendBillingInfo(relayInfo, other)
 	appendParamOverrideInfo(relayInfo, other)
 	appendStreamStatus(relayInfo, other)
+	appendResponsesUsageSource(relayInfo, other)
 	return other
+}
+
+func appendResponsesUsageSource(relayInfo *relaycommon.RelayInfo, other *model.LogOther) {
+	if relayInfo == nil || other == nil {
+		return
+	}
+	if relayInfo.ResponsesUsageInfo != nil && relayInfo.ResponsesUsageInfo.UsageSource != "" {
+		other.SetPublic("usage_source", relayInfo.ResponsesUsageInfo.UsageSource)
+	}
 }
 
 func appendParamOverrideInfo(relayInfo *relaycommon.RelayInfo, other *model.LogOther) {

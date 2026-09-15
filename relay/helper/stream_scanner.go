@@ -104,11 +104,18 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		})
 	}
 
-	generalSettings := operation_setting.GetGeneralSetting()
-	pingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
-	pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
-	if pingInterval <= 0 {
-		pingInterval = DefaultPingInterval
+	var pingEnabled bool
+	var pingInterval time.Duration
+	if resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		channelId := 0
+		disablePing := false
+		if info != nil {
+			if info.ChannelMeta != nil {
+				channelId = info.ChannelId
+			}
+			disablePing = info.DisablePing
+		}
+		pingEnabled, pingInterval = operation_setting.GetStreamPingPolicy(channelId, disablePing)
 	}
 
 	if pingEnabled {

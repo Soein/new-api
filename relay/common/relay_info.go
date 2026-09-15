@@ -48,6 +48,12 @@ type RerankerInfo struct {
 	ReturnDocuments bool
 }
 
+const (
+	ResponsesUsageSourceUpstream  = "upstream"
+	ResponsesUsageSourceEstimated = "estimated"
+	ResponsesUsageSourceUnknown   = "unknown"
+)
+
 type BuildInToolInfo struct {
 	ToolName               string
 	CallCount              int
@@ -58,6 +64,26 @@ type BuildInToolInfo struct {
 
 type ResponsesUsageInfo struct {
 	BuiltInTools map[string]*BuildInToolInfo
+	UsageSource  string
+}
+
+func (info *RelayInfo) SetResponsesUsageSource(source string) {
+	if info == nil {
+		return
+	}
+	if info.ResponsesUsageInfo == nil {
+		info.ResponsesUsageInfo = &ResponsesUsageInfo{
+			BuiltInTools: make(map[string]*BuildInToolInfo),
+		}
+	}
+	info.ResponsesUsageInfo.UsageSource = source
+}
+
+func (info *RelayInfo) GetResponsesUsageSource() string {
+	if info == nil || info.ResponsesUsageInfo == nil {
+		return ""
+	}
+	return info.ResponsesUsageInfo.UsageSource
 }
 
 // GetToolPrice uses the request's frozen price index and effective billing

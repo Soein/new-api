@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -287,21 +289,33 @@ func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T)
 
 func TestStreamScannerHandler_PingSentDuringSlowUpstream(t *testing.T) {
 	setting := operation_setting.GetGeneralSetting()
+	common.OptionMapRWMutex.Lock()
 	oldEnabled := setting.PingIntervalEnabled
 	oldSeconds := setting.PingIntervalSeconds
 	setting.PingIntervalEnabled = true
 	setting.PingIntervalSeconds = 1
+	common.OptionMapRWMutex.Unlock()
 	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
 		setting.PingIntervalEnabled = oldEnabled
 		setting.PingIntervalSeconds = oldSeconds
+		common.OptionMapRWMutex.Unlock()
 	})
 
 	pr, pw := io.Pipe()
+	fixtureCtx, cancel := context.WithCancel(context.Background())
+	var writerWg sync.WaitGroup
+	writerWg.Add(1)
 	go func() {
+		defer writerWg.Done()
 		defer pw.Close()
 		for i := 0; i < 4; i++ {
-			fmt.Fprintf(pw, "data: chunk_%d\n", i)
-			time.Sleep(400 * time.Millisecond)
+			select {
+			case <-time.After(400 * time.Millisecond):
+				fmt.Fprintf(pw, "data: chunk_%d\n", i)
+			case <-fixtureCtx.Done():
+				return
+			}
 		}
 		fmt.Fprint(pw, "data: [DONE]\n")
 	}()
@@ -310,23 +324,34 @@ func TestStreamScannerHandler_PingSentDuringSlowUpstream(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
-	resp := &http.Response{Body: pr}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+	}
 	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
 
 	var count atomic.Int64
 	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
 			count.Add(1)
 		})
-		close(done)
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
+		cancel()
+		_ = pr.Close()
+		_ = pw.Close()
+		<-done
+		writerWg.Wait()
 		t.Fatal("timed out waiting for stream to finish")
 	}
+
+	cancel()
+	writerWg.Wait()
 
 	assert.Equal(t, int64(4), count.Load())
 
@@ -338,20 +363,27 @@ func TestStreamScannerHandler_PingSentDuringSlowUpstream(t *testing.T) {
 
 func TestStreamScannerHandler_PingDisabledByRelayInfo(t *testing.T) {
 	setting := operation_setting.GetGeneralSetting()
+	common.OptionMapRWMutex.Lock()
 	oldEnabled := setting.PingIntervalEnabled
 	oldSeconds := setting.PingIntervalSeconds
 	setting.PingIntervalEnabled = true
 	setting.PingIntervalSeconds = 1
+	common.OptionMapRWMutex.Unlock()
 	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
 		setting.PingIntervalEnabled = oldEnabled
 		setting.PingIntervalSeconds = oldSeconds
+		common.OptionMapRWMutex.Unlock()
 	})
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
-	resp := &http.Response{Body: io.NopCloser(strings.NewReader(buildSSEBody(5)))}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(buildSSEBody(5))),
+	}
 	info := &relaycommon.RelayInfo{
 		DisablePing: true,
 		ChannelMeta: &relaycommon.ChannelMeta{},
@@ -360,10 +392,10 @@ func TestStreamScannerHandler_PingDisabledByRelayInfo(t *testing.T) {
 	var count atomic.Int64
 	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
 			count.Add(1)
 		})
-		close(done)
 	}()
 
 	select {
@@ -377,6 +409,239 @@ func TestStreamScannerHandler_PingDisabledByRelayInfo(t *testing.T) {
 	body := recorder.Body.String()
 	pingCount := strings.Count(body, ": PING")
 	assert.Equal(t, 0, pingCount, "pings should be disabled when DisablePing=true")
+}
+
+func TestStreamScannerHandler_ChannelOptInPing(t *testing.T) {
+	setting := operation_setting.GetGeneralSetting()
+	common.OptionMapRWMutex.Lock()
+	oldEnabled := setting.PingIntervalEnabled
+	oldIDs := setting.StreamPingChannelIDs
+	oldSec := setting.StreamPingIntervalSeconds
+	setting.PingIntervalEnabled = false
+	setting.StreamPingChannelIDs = []int{42}
+	setting.StreamPingIntervalSeconds = 1
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		setting.PingIntervalEnabled = oldEnabled
+		setting.StreamPingChannelIDs = oldIDs
+		setting.StreamPingIntervalSeconds = oldSec
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	tests := []struct {
+		name        string
+		channelId   int
+		statusCode  int
+		disablePing bool
+		expectPing  bool
+	}{
+		{
+			name:        "PositiveOptIn",
+			channelId:   42,
+			statusCode:  http.StatusOK,
+			disablePing: false,
+			expectPing:  true,
+		},
+		{
+			name:        "NonOptIn",
+			channelId:   99,
+			statusCode:  http.StatusOK,
+			disablePing: false,
+			expectPing:  false,
+		},
+		{
+			name:        "Non2xxNoPing",
+			channelId:   42,
+			statusCode:  http.StatusUnauthorized,
+			disablePing: false,
+			expectPing:  false,
+		},
+		{
+			name:        "DisablePingWins",
+			channelId:   42,
+			statusCode:  http.StatusOK,
+			disablePing: true,
+			expectPing:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+			pr, pw := io.Pipe()
+			resp := &http.Response{
+				StatusCode: tc.statusCode,
+				Body:       pr,
+			}
+			info := &relaycommon.RelayInfo{
+				DisablePing: tc.disablePing,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelId: tc.channelId,
+				},
+			}
+
+			fixtureCtx, cancel := context.WithCancel(context.Background())
+			var writerWg sync.WaitGroup
+			writerWg.Add(1)
+			go func() {
+				defer writerWg.Done()
+				defer pw.Close()
+
+				timer := time.NewTimer(1200 * time.Millisecond)
+				defer timer.Stop()
+
+				select {
+				case <-timer.C:
+					_, _ = fmt.Fprint(pw, "data: chunk\n\ndata: [DONE]\n\n")
+				case <-fixtureCtx.Done():
+					return
+				}
+			}()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				cancel()
+				_ = pr.Close()
+				_ = pw.Close()
+				<-done
+				writerWg.Wait()
+				t.Fatal("timed out waiting for stream handler")
+			}
+
+			cancel()
+			writerWg.Wait()
+
+			pingCount := strings.Count(recorder.Body.String(), ": PING")
+			if tc.expectPing {
+				assert.GreaterOrEqual(t, pingCount, 1, "expected at least 1 ping for opt-in channel")
+			} else {
+				assert.Equal(t, 0, pingCount, "pings should be suppressed")
+			}
+		})
+	}
+}
+
+func TestGetStreamPingPolicy_BoundsAndFallback(t *testing.T) {
+	setting := operation_setting.GetGeneralSetting()
+	common.OptionMapRWMutex.Lock()
+	oldEnabled := setting.PingIntervalEnabled
+	oldLegacySec := setting.PingIntervalSeconds
+	oldIDs := setting.StreamPingChannelIDs
+	oldSec := setting.StreamPingIntervalSeconds
+	setting.PingIntervalEnabled = false
+	setting.StreamPingChannelIDs = []int{99}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		setting.PingIntervalEnabled = oldEnabled
+		setting.PingIntervalSeconds = oldLegacySec
+		setting.StreamPingChannelIDs = oldIDs
+		setting.StreamPingIntervalSeconds = oldSec
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	common.OptionMapRWMutex.Lock()
+	setting.StreamPingIntervalSeconds = 0
+	common.OptionMapRWMutex.Unlock()
+	enabled, interval := operation_setting.GetStreamPingPolicy(99, false)
+	assert.True(t, enabled)
+	assert.Equal(t, 15*time.Second, interval)
+
+	common.OptionMapRWMutex.Lock()
+	setting.StreamPingIntervalSeconds = 999999
+	common.OptionMapRWMutex.Unlock()
+	enabled, interval = operation_setting.GetStreamPingPolicy(99, false)
+	assert.True(t, enabled)
+	assert.Equal(t, 15*time.Second, interval)
+
+	common.OptionMapRWMutex.Lock()
+	setting.StreamPingIntervalSeconds = 5
+	common.OptionMapRWMutex.Unlock()
+	enabled, interval = operation_setting.GetStreamPingPolicy(99, false)
+	assert.True(t, enabled)
+	assert.Equal(t, 5*time.Second, interval)
+
+	enabled, _ = operation_setting.GetStreamPingPolicy(100, false)
+	assert.False(t, enabled)
+
+	// Legacy PingIntervalSeconds: preserve positive intervals (> 86400) on unselected channels.
+	common.OptionMapRWMutex.Lock()
+	setting.PingIntervalEnabled = true
+	setting.PingIntervalSeconds = 86401
+	common.OptionMapRWMutex.Unlock()
+	enabled, interval = operation_setting.GetStreamPingPolicy(100, false)
+	assert.True(t, enabled)
+	assert.Equal(t, 86401*time.Second, interval)
+
+	preEnabled, preInterval := operation_setting.GetPreHeaderPingPolicy(false)
+	assert.True(t, preEnabled)
+	assert.Equal(t, 86401*time.Second, preInterval)
+
+	// Overflow-safe legacy values: values exceeding time.Duration fallback to 10s.
+	common.OptionMapRWMutex.Lock()
+	setting.PingIntervalSeconds = math.MaxInt
+	common.OptionMapRWMutex.Unlock()
+	enabled, interval = operation_setting.GetStreamPingPolicy(100, false)
+	assert.True(t, enabled)
+	if int64(math.MaxInt) > int64(math.MaxInt64/time.Second) {
+		assert.Equal(t, 10*time.Second, interval)
+	}
+	preEnabled, preInterval = operation_setting.GetPreHeaderPingPolicy(false)
+	assert.True(t, preEnabled)
+	if int64(math.MaxInt) > int64(math.MaxInt64/time.Second) {
+		assert.Equal(t, 10*time.Second, preInterval)
+	}
+
+	// Invalid / nonpositive legacy values fallback to 10s.
+	common.OptionMapRWMutex.Lock()
+	setting.PingIntervalSeconds = 0
+	common.OptionMapRWMutex.Unlock()
+	enabled, interval = operation_setting.GetStreamPingPolicy(100, false)
+	assert.True(t, enabled)
+	assert.Equal(t, 10*time.Second, interval)
+	preEnabled, preInterval = operation_setting.GetPreHeaderPingPolicy(false)
+	assert.True(t, preEnabled)
+	assert.Equal(t, 10*time.Second, preInterval)
+
+	common.OptionMapRWMutex.Lock()
+	setting.PingIntervalSeconds = -10
+	common.OptionMapRWMutex.Unlock()
+	enabled, interval = operation_setting.GetStreamPingPolicy(100, false)
+	assert.True(t, enabled)
+	assert.Equal(t, 10*time.Second, interval)
+	preEnabled, preInterval = operation_setting.GetPreHeaderPingPolicy(false)
+	assert.True(t, preEnabled)
+	assert.Equal(t, 10*time.Second, preInterval)
+}
+
+func TestGetPreHeaderPingPolicy_IgnoresChannelOptIn(t *testing.T) {
+	setting := operation_setting.GetGeneralSetting()
+	common.OptionMapRWMutex.Lock()
+	oldEnabled := setting.PingIntervalEnabled
+	oldIDs := setting.StreamPingChannelIDs
+	setting.PingIntervalEnabled = false
+	setting.StreamPingChannelIDs = []int{42}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		setting.PingIntervalEnabled = oldEnabled
+		setting.StreamPingChannelIDs = oldIDs
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	enabled, _ := operation_setting.GetPreHeaderPingPolicy(false)
+	assert.False(t, enabled, "pre-header ping must not enable from channel opt-in")
 }
 
 // ---------- StreamStatus integration ----------

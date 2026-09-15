@@ -407,6 +407,11 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
 	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
 
+	isUnknownResponses := relayInfo != nil && relayInfo.ResponsesUsageInfo != nil && relayInfo.ResponsesUsageInfo.UsageSource == relaycommon.ResponsesUsageSourceUnknown
+	if isUnknownResponses {
+		extraContent = append(extraContent, "未获取到可靠计费信息，实际消耗未知")
+	}
+
 	var tieredResult *billingexpr.TieredResult
 	tieredBillingApplied := false
 	if originUsage != nil {
@@ -441,8 +446,14 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	}
 
 	if !summary.hasBillableUsage() {
-		extraContent = append(extraContent, "上游没有返回计费信息，无法扣费（可能是上游超时）")
-		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
+		isTrustworthyZeroResponses := relayInfo != nil && relayInfo.ResponsesUsageInfo != nil &&
+			relayInfo.ResponsesUsageInfo.UsageSource == relaycommon.ResponsesUsageSourceUpstream
+		if !isUnknownResponses && !isTrustworthyZeroResponses {
+			extraContent = append(extraContent, "上游没有返回计费信息，无法扣费（可能是上游超时）")
+		}
+		if !isTrustworthyZeroResponses {
+			logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
+		}
 	} else {
 		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, summary.Quota)
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
@@ -476,7 +487,12 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	} else {
 		other = GenerateTextOtherInfo(ctx, relayInfo, summary.ModelRatio, summary.GroupRatio, summary.CompletionRatio, summary.CacheTokens, summary.CacheRatio, summary.ModelPrice, relayInfo.PriceData.GroupRatioInfo.GroupSpecialRatio)
 	}
-	appendUsageBillingPathForLog(other, common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens), originUsage)
+	if !isUnknownResponses {
+		isEstimatedResponses := relayInfo != nil && relayInfo.ResponsesUsageInfo != nil &&
+			relayInfo.ResponsesUsageInfo.UsageSource == relaycommon.ResponsesUsageSourceEstimated
+		isLocalCount := common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens) || isEstimatedResponses
+		appendUsageBillingPathForLog(other, isLocalCount, originUsage)
+	}
 	if adminRejectReason != "" {
 		other.SetAdmin("reject_reason", adminRejectReason)
 	}

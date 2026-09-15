@@ -1290,3 +1290,64 @@ func TestAppendToolSurchargeLogInfoWritesOnlyStructuredFields(t *testing.T) {
 	assert.NotContains(t, fields, "image_generation_call")
 	assert.NotContains(t, fields, "image_generation_call_price")
 }
+
+func TestGenerateTextOtherInfoResponsesUsageSource(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	tests := []struct {
+		name        string
+		source      string
+		expectKey   bool
+		expectedVal string
+	}{
+		{"records usage_source when upstream", relaycommon.ResponsesUsageSourceUpstream, true, relaycommon.ResponsesUsageSourceUpstream},
+		{"records usage_source when estimated", relaycommon.ResponsesUsageSourceEstimated, true, relaycommon.ResponsesUsageSourceEstimated},
+		{"records usage_source when unknown", relaycommon.ResponsesUsageSourceUnknown, true, relaycommon.ResponsesUsageSourceUnknown},
+		{"omits usage_source when not set", "", false, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Set("channel_test", true)
+			info := &relaycommon.RelayInfo{
+				ChannelMeta: &relaycommon.ChannelMeta{},
+			}
+			if tt.source != "" {
+				info.SetResponsesUsageSource(tt.source)
+			}
+			other := GenerateTextOtherInfo(c, info, 1, 1, 1, 0, 0, 0, 1)
+			require.NotNil(t, other)
+			fields := other.Snapshot()
+			if tt.expectKey {
+				assert.Equal(t, tt.expectedVal, fields["usage_source"])
+			} else {
+				assert.NotContains(t, fields, "usage_source")
+			}
+		})
+	}
+}
+
+func TestLegacyClaudeDerivedOpenAIUsagePreservesSemantics(t *testing.T) {
+	relayInfo := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gpt-5.1",
+		},
+	}
+
+	usage := &dto.Usage{
+		ClaudeCacheCreation5mTokens: 10,
+	}
+	assert.True(t, isLegacyClaudeDerivedOpenAIUsage(relayInfo, usage))
+
+	// If UsageSource or UsageSemantic was mistakenly assigned public source classification,
+	// legacy Claude detection would be closed:
+	usageWithSource := &dto.Usage{
+		UsageSource:                 relaycommon.ResponsesUsageSourceUpstream,
+		ClaudeCacheCreation5mTokens: 10,
+	}
+	assert.False(t, isLegacyClaudeDerivedOpenAIUsage(relayInfo, usageWithSource))
+}

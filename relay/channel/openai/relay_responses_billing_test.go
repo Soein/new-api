@@ -265,3 +265,27 @@ func TestOaiResponsesStreamHandlerDoesNotCountPartialImageEvent(t *testing.T) {
 
 	assert.Equal(t, 0, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
 }
+
+func TestOaiResponsesStreamHandlerFailedTerminalDoesNotBillImagesEvenWithValidUsage(t *testing.T) {
+	item := `{"type":"image_generation_call","id":"img_1","status":"completed","result":"base64-a"}`
+	info := runResponsesImageBillingStream(
+		t,
+		`{"type":"response.output_item.done","output_index":0,"item":`+item+`}`,
+		`{"type":"response.failed","response":{"status":"failed","usage":{"input_tokens":10,"output_tokens":0,"total_tokens":10}}}`,
+	)
+
+	require.NotNil(t, info.ResponsesUsageInfo)
+	assert.Equal(t, 0, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
+}
+
+func TestOaiResponsesStreamHandlerFailedTerminalResetsImagesEvenWithInvalidUsage(t *testing.T) {
+	item := `{"type":"image_generation_call","id":"img_1","status":"completed","result":"base64-a"}`
+	info := runResponsesImageBillingStream(
+		t,
+		`{"type":"response.output_item.done","output_index":0,"item":`+item+`}`,
+		`{"type":"response.failed","response":{"status":"failed","usage":{"input_tokens":-10,"output_tokens":0,"total_tokens":-10}}}`,
+	)
+
+	require.NotNil(t, info.ResponsesUsageInfo)
+	assert.Equal(t, 0, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
+}

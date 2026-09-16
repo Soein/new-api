@@ -14,11 +14,13 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -752,6 +754,19 @@ func validateAndParseResponsesUsage(rawUsage json.RawMessage) (*dto.Usage, bool)
 	return nil, false
 }
 
+func isEligibleForResponsesDrain(info *relaycommon.RelayInfo) bool {
+	if info == nil {
+		return false
+	}
+	if info.RelayMode != relayconstant.RelayModeResponses {
+		return false
+	}
+	if info.GetOriginalRequestRelayFormat() != types.RelayFormatOpenAIResponses {
+		return false
+	}
+	return true
+}
+
 func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		logger.LogError(c, "invalid response or response body")
@@ -759,6 +774,22 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	defer service.CloseResponseBodyGracefully(resp)
+
+	var drainCtrl *helper.StreamDrainController
+	if isEligibleForResponsesDrain(info) {
+		channelId := info.GetChannelID()
+		policy := operation_setting.GetResponsesDrainPolicy(channelId)
+		if policy.Enabled {
+			drainCtrl = helper.NewStreamDrainController(policy, channelId)
+			if resp.Header != nil {
+				if rawID := resp.Header.Get("X-Client-Request-ID"); rawID != "" {
+					if relaycommon.ValidateSupplierClientRequestID(rawID) {
+						info.SupplierClientRequestID = rawID
+					}
+				}
+			}
+		}
+	}
 
 	var terminalUsage *dto.Usage
 	hasTerminalUsage := false
@@ -825,17 +856,25 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				sr.Done()
 			}
 
-			streamResponse := dto.ResponsesStreamResponse{Type: envelope.Type}
-			if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
-				logger.LogWarn(c, "send responses stream data failed: "+err.Error())
-				sr.Stop(err)
+			if hasTerminalUsage {
+				sr.MarkDrainRecovered()
+			}
+
+			if !sr.IsDownstreamClosed() {
+				streamResponse := dto.ResponsesStreamResponse{Type: envelope.Type}
+				if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+					logger.LogWarn(c, "send responses stream data failed: "+err.Error())
+					sr.DownstreamWriteError(err)
+				}
 			}
 			return
 		}
 
 		switch envelope.Type {
 		case "response.output_text.delta":
-			responseTextBuilder.WriteString(envelope.Delta)
+			if !sr.IsDownstreamClosed() {
+				responseTextBuilder.WriteString(envelope.Delta)
+			}
 		case dto.ResponsesOutputTypeItemDone:
 			if envelope.Item != nil {
 				switch envelope.Item.Type {
@@ -853,12 +892,14 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		}
 
-		streamResponse := dto.ResponsesStreamResponse{Type: envelope.Type}
-		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
-			logger.LogWarn(c, "send responses stream data failed: "+err.Error())
-			sr.Stop(err)
+		if !sr.IsDownstreamClosed() {
+			streamResponse := dto.ResponsesStreamResponse{Type: envelope.Type}
+			if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+				logger.LogWarn(c, "send responses stream data failed: "+err.Error())
+				sr.DownstreamWriteError(err)
+			}
 		}
-	})
+	}, helper.WithDrainController(drainCtrl))
 
 	var usage *dto.Usage
 	var source string

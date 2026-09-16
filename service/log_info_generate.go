@@ -91,6 +91,9 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
 	if common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens) {
 		other.SetAdmin("local_count_tokens", true)
 	}
+	if relayInfo != nil && relayInfo.SupplierClientRequestID != "" {
+		other.SetAdmin("x_client_request_id", relayInfo.SupplierClientRequestID)
+	}
 
 	AppendChannelAffinityAdminInfo(ctx, other)
 }
@@ -180,6 +183,9 @@ func appendStreamStatus(relayInfo *relaycommon.RelayInfo, other *model.LogOther)
 			messages = append(messages, e.Message)
 		}
 		streamInfo["errors"] = messages
+	}
+	if relayInfo.DrainResult != "" {
+		streamInfo["drain_result"] = relayInfo.DrainResult
 	}
 	other.SetPublic("stream_status", streamInfo)
 }

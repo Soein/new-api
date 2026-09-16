@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -8,12 +9,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -554,4 +560,885 @@ func TestOaiResponsesStreamHandlerDownstreamWriteFailureRecordsError(t *testing.
 	assert.Equal(t, 20, usage.CompletionTokens)
 	require.NotNil(t, info.StreamStatus)
 	assert.True(t, info.StreamStatus.HasErrors())
+}
+
+type delayedTerminalBody struct {
+	mu           sync.Mutex
+	chunk1       []byte
+	chunk2       []byte
+	chunk1Sent   bool
+	chunk2Sent   bool
+	cancelSignal <-chan struct{}
+	closed       chan struct{}
+}
+
+func newDelayedTerminalBody(chunk1, chunk2 []byte, cancelSignal <-chan struct{}) *delayedTerminalBody {
+	return &delayedTerminalBody{
+		chunk1:       chunk1,
+		chunk2:       chunk2,
+		cancelSignal: cancelSignal,
+		closed:       make(chan struct{}),
+	}
+}
+
+func (b *delayedTerminalBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	if !b.chunk1Sent {
+		b.chunk1Sent = true
+		n := copy(p, b.chunk1)
+		b.mu.Unlock()
+		return n, nil
+	}
+	b.mu.Unlock()
+
+	select {
+	case <-b.cancelSignal:
+	case <-b.closed:
+		return 0, io.EOF
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case <-b.closed:
+		return 0, io.EOF
+	default:
+	}
+	if !b.chunk2Sent {
+		b.chunk2Sent = true
+		n := copy(p, b.chunk2)
+		return n, nil
+	}
+	return 0, io.EOF
+}
+
+func (b *delayedTerminalBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case <-b.closed:
+	default:
+		close(b.closed)
+	}
+	return nil
+}
+
+var testSettingMutex sync.Mutex
+
+func setupDrainTest(t *testing.T, channelIDs ...int) {
+	t.Helper()
+	testSettingMutex.Lock()
+	t.Cleanup(testSettingMutex.Unlock)
+
+	initTokenEncodersOnce.Do(service.InitTokenEncoders)
+
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	setting := operation_setting.GetGeneralSetting()
+	oldIDs := setting.ResponsesDrainChannelIDs
+	if len(channelIDs) == 0 {
+		channelIDs = []int{42}
+	}
+	setting.ResponsesDrainChannelIDs = channelIDs
+	t.Cleanup(func() {
+		setting.ResponsesDrainChannelIDs = oldIDs
+	})
+}
+
+func TestOaiResponsesStreamHandlerDelayedTerminalAfterCancellation(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "first delta",
+		cancel:         cancel,
+	}
+
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"first delta\"}\n\n"),
+		[]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":15,\"output_tokens\":25,\"total_tokens\":40}}}\n\ndata: [DONE]\n\n"),
+		requestContext.Done(),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         42,
+			UpstreamModelName: "gpt-5.1",
+		},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 15, usage.PromptTokens)
+	assert.Equal(t, 25, usage.CompletionTokens)
+	assert.Equal(t, 40, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUpstream, info.GetResponsesUsageSource())
+	require.NotNil(t, info.StreamStatus)
+	// StreamStatus is first-writer-wins by design. When requestContext is canceled,
+	// delayedTerminalBody releases the completed terminal and [DONE]. Either the scanner
+	// marks done or the cancellation branch marks client_gone first; both are legal.
+	assert.Contains(t,
+		[]relaycommon.StreamEndReason{relaycommon.StreamEndReasonClientGone, relaycommon.StreamEndReasonDone},
+		info.StreamStatus.EndReason,
+	)
+	assert.Equal(t, "recovered", info.DrainResult)
+}
+
+func TestOaiResponsesStreamHandlerNoDownstreamWritesAfterDisconnect(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "delta-1",
+		cancel:         cancel,
+	}
+
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"delta-1\"}\n\n"),
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"delta-2\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30}}}\n\ndata: [DONE]\n\n"),
+		requestContext.Done(),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 30, usage.TotalTokens)
+
+	// Verify that delta-1 was written, but delta-2 and terminal were NOT forwarded downstream after disconnect
+	recorded := recorder.Body.String()
+	assert.Contains(t, recorded, "delta-1")
+	assert.NotContains(t, recorded, "delta-2")
+	assert.NotContains(t, recorded, "response.completed")
+}
+
+func TestOaiResponsesStreamHandlerWriteFailureRecoversTerminalUsage(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Writer = &failingStreamWriter{
+		ResponseWriter: c.Writer,
+		failAfterBytes: 15,
+	}
+
+	body := strings.Join([]string{
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"early chunk\"}",
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"second chunk fails write\"}",
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":20,\"output_tokens\":30,\"total_tokens\":50}}}",
+		"data: [DONE]",
+	}, "\n\n") + "\n\n"
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 20, usage.PromptTokens)
+	assert.Equal(t, 30, usage.CompletionTokens)
+	assert.Equal(t, 50, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUpstream, info.GetResponsesUsageSource())
+	assert.Equal(t, "recovered", info.DrainResult)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasErrors())
+}
+
+func TestOaiResponsesStreamHandlerDuplicateTerminalDoesNotDuplicate(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	body := strings.Join([]string{
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30}}}",
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":60,\"total_tokens\":110}}}",
+		"data: [DONE]",
+	}, "\n\n") + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 10, usage.PromptTokens)
+	assert.Equal(t, 20, usage.CompletionTokens)
+	assert.Equal(t, 30, usage.TotalTokens)
+}
+
+func TestOaiResponsesStreamHandlerExplicitZeroDuringDrain(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "hello",
+		cancel:         cancel,
+	}
+
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"),
+		[]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\ndata: [DONE]\n\n"),
+		requestContext.Done(),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 0, usage.PromptTokens)
+	assert.Equal(t, 0, usage.CompletionTokens)
+	assert.Equal(t, 0, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUpstream, info.GetResponsesUsageSource())
+	assert.Equal(t, "recovered", info.DrainResult)
+}
+
+func TestOaiResponsesStreamHandlerMissingUsageNoPreDisconnectTextUnknown(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "response.created",
+		cancel:         cancel,
+	}
+
+	// First event has no text delta, then disconnect, then terminal has no usage
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.created\"}\n\n"),
+		[]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n"),
+		requestContext.Done(),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 0, usage.PromptTokens)
+	assert.Equal(t, 0, usage.CompletionTokens)
+	assert.Equal(t, 0, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUnknown, info.GetResponsesUsageSource())
+}
+
+func TestOaiResponsesStreamHandlerDrainOnlyDeltasDoNotGenerateEstimatedCharges(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "response.created",
+		cancel:         cancel,
+	}
+
+	// Disconnect immediately after response.created. Then deltas arrive during drain, but no terminal usage.
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.created\"}\n\n"),
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"unseen text delta during drain\"}\n\ndata: [DONE]\n\n"),
+		requestContext.Done(),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	// Must not estimate from unseen deltas arriving during drain
+	assert.Equal(t, 0, usage.PromptTokens)
+	assert.Equal(t, 0, usage.CompletionTokens)
+	assert.Equal(t, 0, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUnknown, info.GetResponsesUsageSource())
+}
+
+func TestOaiResponsesStreamHandlerOffChannelPreservesImmediateAbort(t *testing.T) {
+	// Channel 999 is NOT in ResponsesDrainChannelIDs
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "delta-1",
+		cancel:         cancel,
+	}
+
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"delta-1\"}\n\n"),
+		[]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":60,\"total_tokens\":110}}}\n\ndata: [DONE]\n\n"),
+		make(chan struct{}),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 999, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	// Because drain is disabled for channel 999, body was closed immediately on disconnect.
+	// Delayed terminal (50/60/110) was NOT read.
+	assert.NotEqual(t, 110, usage.TotalTokens)
+	assert.Empty(t, info.DrainResult)
+	select {
+	case <-body.closed:
+	default:
+		assert.Fail(t, "expected body.closed to be closed")
+	}
+}
+
+func TestOaiResponsesStreamHandlerConvertedChatPreservesImmediateAbort(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "delta-1",
+		cancel:         cancel,
+	}
+
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"delta-1\"}\n\n"),
+		[]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":60,\"total_tokens\":110}}}\n\ndata: [DONE]\n\n"),
+		make(chan struct{}),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:              relayconstant.RelayModeResponses,
+		RelayFormat:            types.RelayFormatOpenAIResponses,
+		RequestConversionChain: []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses},
+		IsStream:               true,
+		DisablePing:            true,
+		ChannelMeta:            &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	// Converted chat must not enter drain policy
+	assert.NotEqual(t, 110, usage.TotalTokens)
+	assert.Empty(t, info.DrainResult)
+	select {
+	case <-body.closed:
+	default:
+		assert.Fail(t, "expected body.closed to be closed")
+	}
+}
+
+func TestOaiResponsesStreamHandlerSupplierClientRequestID(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("X-Client-Request-ID", "malicious-downstream-header")
+
+	body := "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30}}}\n\ndata: [DONE]\n\n"
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+	}
+	resp.Header.Set("Content-Type", "text/event-stream")
+	resp.Header.Set("X-Client-Request-ID", "uuid-from-supplier-4567")
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		RequestId:   "newapi-request-id-111",
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+
+	// Preserved supplier response ID faithfully
+	assert.Equal(t, "uuid-from-supplier-4567", info.SupplierClientRequestID)
+	// Preserved existing internal request ID
+	assert.Equal(t, "newapi-request-id-111", info.RequestId)
+
+	other := service.GenerateTextOtherInfo(c, info, 1, 1, 1, 0, 0, 0, 1)
+	require.NotNil(t, other)
+	snap := other.Snapshot()
+	adminInfo, ok := snap["admin_info"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "uuid-from-supplier-4567", adminInfo["x_client_request_id"])
+	_, publicHasID := snap["x_client_request_id"]
+	assert.False(t, publicHasID)
+
+	// Check validation rules
+	assert.True(t, relaycommon.ValidateSupplierClientRequestID("valid-id_123:ABC.def"))
+	assert.False(t, relaycommon.ValidateSupplierClientRequestID(""))
+	assert.False(t, relaycommon.ValidateSupplierClientRequestID("id with space"))
+	assert.False(t, relaycommon.ValidateSupplierClientRequestID("id;with;semi"))
+	assert.False(t, relaycommon.ValidateSupplierClientRequestID(strings.Repeat("a", 129)))
+}
+
+type failOnNeedleWriter struct {
+	gin.ResponseWriter
+	needle string
+}
+
+func (w *failOnNeedleWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), w.needle) {
+		return 0, io.ErrClosedPipe
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *failOnNeedleWriter) WriteString(s string) (int, error) {
+	if strings.Contains(s, w.needle) {
+		return 0, io.ErrClosedPipe
+	}
+	return io.WriteString(w.ResponseWriter, s)
+}
+
+func TestOaiResponsesStreamHandlerCancelBeforeNewDeltaNoTerminalUsagePreservesPreDisconnectEstimate(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Writer = &cancelAfterWriter{
+		ResponseWriter: c.Writer,
+		needle:         "pre-disconnect text",
+		cancel:         cancel,
+	}
+
+	body := newDelayedTerminalBody(
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pre-disconnect text\"}\n\n"),
+		[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"post-disconnect text\"}\n\ndata: [DONE]\n\n"),
+		requestContext.Done(),
+	)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+
+	// Estimate must be based only on pre-disconnect text
+	preTokens := service.CountTextToken("pre-disconnect text", "gpt-5.1")
+	assert.Equal(t, preTokens, usage.CompletionTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceEstimated, info.GetResponsesUsageSource())
+
+	// Downstream writer must NOT receive post-disconnect delta
+	recorded := recorder.Body.String()
+	assert.Contains(t, recorded, "pre-disconnect text")
+	assert.NotContains(t, recorded, "post-disconnect text")
+}
+
+func TestOaiResponsesStreamHandlerCancelBeforeAnyDeltaNoTerminalUsageUnknown(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel() // Canceled before any delta arrives
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+
+	body := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"arrived after cancel\"}\n\ndata: [DONE]\n\n"
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+
+	assert.Equal(t, 0, usage.PromptTokens)
+	assert.Equal(t, 0, usage.CompletionTokens)
+	assert.Equal(t, 0, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUnknown, info.GetResponsesUsageSource())
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestOaiResponsesStreamHandlerTerminalSavedBeforeFailingTerminalWrite(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Writer = &failOnNeedleWriter{
+		ResponseWriter: c.Writer,
+		needle:         "response.completed",
+	}
+
+	body := strings.Join([]string{
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"chunk-1\"}",
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":15,\"output_tokens\":25,\"total_tokens\":40}}}",
+		"data: [DONE]",
+	}, "\n\n") + "\n\n"
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 15, usage.PromptTokens)
+	assert.Equal(t, 25, usage.CompletionTokens)
+	assert.Equal(t, 40, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUpstream, info.GetResponsesUsageSource())
+	assert.Equal(t, "recovered", info.DrainResult)
+}
+
+func TestOaiResponsesStreamHandlerNativeHTTPClientCancellation(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	var upstreamRequestCount atomic.Int32
+	serverDownstreamCanceled := make(chan struct{})
+	testDone := make(chan struct{})
+	var testDoneOnce sync.Once
+	closeTestDone := func() {
+		testDoneOnce.Do(func() {
+			close(testDone)
+		})
+	}
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequestCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"initial\"}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Wait for server-side downstream request context cancellation before allowing upstream final response
+		select {
+		case <-serverDownstreamCanceled:
+		case <-r.Context().Done():
+			return
+		case <-testDone:
+			return
+		}
+
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n")
+		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer upstreamServer.Close()
+
+	type handlerResult struct {
+		usage  *dto.Usage
+		apiErr *types.NewAPIError
+		info   *relaycommon.RelayInfo
+	}
+	resultChan := make(chan handlerResult, 1)
+
+	router := gin.New()
+	router.POST("/v1/responses", func(c *gin.Context) {
+		requestCtx := c.Request.Context()
+		var cancelSignaled atomic.Bool
+		go func() {
+			select {
+			case <-requestCtx.Done():
+				if cancelSignaled.CompareAndSwap(false, true) {
+					close(serverDownstreamCanceled)
+				}
+			case <-testDone:
+			}
+		}()
+
+		req, err := http.NewRequest(http.MethodPost, upstreamServer.URL, nil)
+		if err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		upstreamResp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			c.AbortWithStatus(http.StatusBadGateway)
+			return
+		}
+		info := &relaycommon.RelayInfo{
+			RelayMode:   relayconstant.RelayModeResponses,
+			RelayFormat: types.RelayFormatOpenAIResponses,
+			IsStream:    true,
+			DisablePing: true,
+			ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+		}
+		info.InitRequestConversionChain()
+
+		usage, apiErr := OaiResponsesStreamHandler(c, info, upstreamResp)
+		resultChan <- handlerResult{
+			usage:  usage,
+			apiErr: apiErr,
+			info:   info,
+		}
+	})
+
+	downstreamServer := httptest.NewServer(router)
+	defer downstreamServer.Close()
+
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	var clientResp *http.Response
+	defer func() {
+		clientCancel()
+		if clientResp != nil && clientResp.Body != nil {
+			_ = clientResp.Body.Close()
+		}
+		closeTestDone()
+	}()
+
+	clientReq, err := http.NewRequestWithContext(clientCtx, http.MethodPost, downstreamServer.URL+"/v1/responses", nil)
+	require.NoError(t, err)
+
+	clientResp, err = http.DefaultClient.Do(clientReq)
+	require.NoError(t, err)
+
+	reader := bufio.NewReader(clientResp.Body)
+	var foundInitial bool
+	for i := 0; i < 10; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if strings.Contains(line, "initial") {
+			foundInitial = true
+			break
+		}
+	}
+	require.True(t, foundInitial, "downstream client must observe initial delta before cancellation")
+
+	clientCancel()
+	_ = clientResp.Body.Close()
+
+	select {
+	case res := <-resultChan:
+		require.Nil(t, res.apiErr)
+		require.NotNil(t, res.usage)
+		assert.Equal(t, 10, res.usage.PromptTokens)
+		assert.Equal(t, 20, res.usage.CompletionTokens)
+		assert.Equal(t, 30, res.usage.TotalTokens)
+		assert.Equal(t, 5, res.usage.PromptTokensDetails.CachedTokens)
+		assert.Equal(t, relaycommon.ResponsesUsageSourceUpstream, res.info.GetResponsesUsageSource())
+		assert.Equal(t, "recovered", res.info.DrainResult)
+	case <-time.After(5 * time.Second):
+		t.Fatal("native HTTP cancellation did not complete in time")
+	}
+
+	assert.Equal(t, int32(1), upstreamRequestCount.Load(), "upstream request count must remain exactly one")
+}
+
+func TestOaiResponsesStreamHandlerOrdinaryOptInSuccessNoDrainResult(t *testing.T) {
+	setupDrainTest(t, 42)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	body := strings.Join([]string{
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"normal flow\"}",
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30}}}",
+		"data: [DONE]",
+	}, "\n\n") + "\n\n"
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	info := &relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeResponses,
+		RelayFormat: types.RelayFormatOpenAIResponses,
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "gpt-5.1"},
+	}
+	info.InitRequestConversionChain()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 10, usage.PromptTokens)
+	assert.Equal(t, 20, usage.CompletionTokens)
+	assert.Equal(t, 30, usage.TotalTokens)
+	assert.Equal(t, relaycommon.ResponsesUsageSourceUpstream, info.GetResponsesUsageSource())
+	// Normal opt-in request with no downstream closure must have empty DrainResult
+	assert.Empty(t, info.DrainResult)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.IsNormalEnd())
 }

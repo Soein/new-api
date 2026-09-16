@@ -100,10 +100,16 @@ func (tr *drainTrackingReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	toRead := len(p)
-	if tr.counting && tr.maxBytes > 0 {
-		remaining := int(tr.maxBytes - tr.byteCount)
-		if remaining < toRead {
-			toRead = remaining
+	if tr.maxBytes > 0 {
+		limit := tr.maxBytes
+		if tr.counting {
+			limit -= tr.byteCount
+		}
+		if limit < 0 {
+			limit = 0
+		}
+		if limit < int64(toRead) {
+			toRead = int(limit)
 		}
 	}
 	tr.mu.Unlock()

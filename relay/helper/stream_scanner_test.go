@@ -1171,3 +1171,96 @@ func TestStreamScannerHandler_DrainEOFWithoutTerminalUpstreamEnd(t *testing.T) {
 	require.True(t, dcReuse.TriggerDownstreamTransition(statusReuse, relaycommon.StreamEndReasonClientGone, nil))
 	dcReuse.Cleanup()
 }
+
+type drainTrackingTestReader struct {
+	r          *strings.Reader
+	consumed   int
+	beforeRead func()
+}
+
+func (r *drainTrackingTestReader) Read(p []byte) (int, error) {
+	if r.beforeRead != nil {
+		r.beforeRead()
+	}
+	n, err := r.r.Read(p)
+	r.consumed += n
+	return n, err
+}
+
+func TestDrainTrackingReader(t *testing.T) {
+	t.Run("in_flight_transition_bounds_underlying_read", func(t *testing.T) {
+		const budget = int64(16)
+		data := "0123456789abcdef_extra_unbounded_bytes"
+		callerBuf := make([]byte, 64)
+
+		var tr *drainTrackingReader
+		underlying := &drainTrackingTestReader{
+			r: strings.NewReader(data),
+			beforeRead: func() {
+				tr.startCounting()
+			},
+		}
+		tr = newDrainTrackingReader(underlying, budget)
+
+		// First read: starts before counting, transitions to counting inside underlying Read
+		n1, err1 := tr.Read(callerBuf)
+		require.Equal(t, int(budget), n1)
+		require.Equal(t, io.EOF, err1)
+		assert.Equal(t, data[:budget], string(callerBuf[:n1]))
+
+		// The underlying reader must not have consumed more than the budget.
+		// On the unfixed implementation, toRead is len(callerBuf) (64), so all 38 bytes
+		// are consumed from the underlying reader before truncation occurs.
+		assert.LessOrEqual(t, int64(underlying.consumed), budget, "underlying reader must not consume more bytes than budget")
+
+		// Budget is exhausted; second read must return 0, io.EOF without consuming underlying reader
+		consumedAfterFirst := underlying.consumed
+		n2, err2 := tr.Read(callerBuf)
+		assert.Equal(t, 0, n2)
+		assert.Equal(t, io.EOF, err2)
+		assert.Equal(t, consumedAfterFirst, underlying.consumed, "second read must not consume additional underlying bytes")
+
+		assert.True(t, tr.isExceeded())
+	})
+
+	t.Run("normal_streaming_without_drain_preserves_full_data", func(t *testing.T) {
+		const budget = int64(16)
+		data := strings.Repeat("hello_world_", 4) // 48 bytes (> budget 16)
+
+		underlying := &drainTrackingTestReader{
+			r: strings.NewReader(data),
+		}
+		tr := newDrainTrackingReader(underlying, budget)
+
+		readAll, err := io.ReadAll(tr)
+		require.NoError(t, err)
+
+		assert.Equal(t, data, string(readAll), "normal streaming must deliver full data without truncation")
+		assert.Equal(t, len(data), underlying.consumed)
+		assert.False(t, tr.isExceeded())
+	})
+
+	t.Run("unlimited_budget_when_max_bytes_non_positive", func(t *testing.T) {
+		data := "unlimited_payload_without_byte_cap"
+
+		for _, maxBytes := range []int64{0, -1} {
+			t.Run(fmt.Sprintf("max_bytes_%d", maxBytes), func(t *testing.T) {
+				var tr *drainTrackingReader
+				underlying := &drainTrackingTestReader{
+					r: strings.NewReader(data),
+					beforeRead: func() {
+						tr.startCounting()
+					},
+				}
+				tr = newDrainTrackingReader(underlying, maxBytes)
+
+				readAll, err := io.ReadAll(tr)
+				require.NoError(t, err)
+
+				assert.Equal(t, data, string(readAll), "maxBytes <= 0 must not truncate stream")
+				assert.Equal(t, len(data), underlying.consumed)
+				assert.False(t, tr.isExceeded())
+			})
+		}
+	})
+}

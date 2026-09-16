@@ -48,6 +48,12 @@ type RerankerInfo struct {
 	ReturnDocuments bool
 }
 
+const (
+	ResponsesUsageSourceUpstream  = "upstream"
+	ResponsesUsageSourceEstimated = "estimated"
+	ResponsesUsageSourceUnknown   = "unknown"
+)
+
 type BuildInToolInfo struct {
 	ToolName               string
 	CallCount              int
@@ -58,6 +64,26 @@ type BuildInToolInfo struct {
 
 type ResponsesUsageInfo struct {
 	BuiltInTools map[string]*BuildInToolInfo
+	UsageSource  string
+}
+
+func (info *RelayInfo) SetResponsesUsageSource(source string) {
+	if info == nil {
+		return
+	}
+	if info.ResponsesUsageInfo == nil {
+		info.ResponsesUsageInfo = &ResponsesUsageInfo{
+			BuiltInTools: make(map[string]*BuildInToolInfo),
+		}
+	}
+	info.ResponsesUsageInfo.UsageSource = source
+}
+
+func (info *RelayInfo) GetResponsesUsageSource() string {
+	if info == nil || info.ResponsesUsageInfo == nil {
+		return ""
+	}
+	return info.ResponsesUsageInfo.UsageSource
 }
 
 // GetToolPrice uses the request's frozen price index and effective billing
@@ -214,6 +240,14 @@ type RelayInfo struct {
 	FinalRequestRelayFormat types.RelayFormat
 
 	StreamStatus *StreamStatus
+
+	// DrainResult records the outcome of post-disconnect drain
+	// (e.g. "recovered", "timeout", "byte_limit", "capacity", "upstream_end").
+	DrainResult string
+
+	// SupplierClientRequestID is the validated X-Client-Request-ID captured from
+	// the upstream supplier's HTTP response headers on opted-in native Responses requests.
+	SupplierClientRequestID string
 
 	// convOptions caches the converter settings snapshot (see ConvOptions).
 	convOptions *convmeta.Options
@@ -846,6 +880,33 @@ func (info *RelayInfo) GetFinalRequestRelayFormat() types.RelayFormat {
 		return info.RequestConversionChain[n-1]
 	}
 	return info.RelayFormat
+}
+
+func (info *RelayInfo) GetOriginalRequestRelayFormat() types.RelayFormat {
+	if info == nil {
+		return ""
+	}
+	if len(info.RequestConversionChain) > 0 {
+		return info.RequestConversionChain[0]
+	}
+	return info.RelayFormat
+}
+
+// ValidateSupplierClientRequestID validates that the raw X-Client-Request-ID header value
+// is nonempty, does not exceed 128 ASCII characters, and contains only characters from [A-Za-z0-9._:-].
+func ValidateSupplierClientRequestID(id string) bool {
+	if len(id) == 0 || len(id) > 128 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		b := id[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+			b == '.' || b == '_' || b == ':' || b == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func GenRelayInfoResponsesCompaction(c *gin.Context, request *dto.OpenAIResponsesCompactionRequest) *RelayInfo {

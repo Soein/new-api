@@ -3,7 +3,9 @@ package helper
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -85,12 +87,33 @@ func ClaudeChunkData(c *gin.Context, resp dto.ClaudeResponse, data string) {
 }
 
 func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data string) error {
+	if c == nil || c.Writer == nil {
+		return errors.New("context or writer is nil")
+	}
 	if requestContextDone(c) {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("data: %s", data)})
+	common.CustomEvent{}.WriteContentType(c.Writer)
+
+	eventPayload := []byte(fmt.Sprintf("event: %s\n", strings.ReplaceAll(resp.Type, "\r", "\\r")))
+	n, err := c.Writer.Write(eventPayload)
+	if err != nil {
+		return fmt.Errorf("write response event failed: %w", err)
+	}
+	if n < len(eventPayload) {
+		return fmt.Errorf("write response event failed: %w", io.ErrShortWrite)
+	}
+
+	dataPayload := []byte(fmt.Sprintf("data: %s\n\n", strings.ReplaceAll(data, "\r", "\\r")))
+	n, err = c.Writer.Write(dataPayload)
+	if err != nil {
+		return fmt.Errorf("write response data failed: %w", err)
+	}
+	if n < len(dataPayload) {
+		return fmt.Errorf("write response data failed: %w", io.ErrShortWrite)
+	}
+
 	return FlushWriter(c)
 }
 

@@ -80,10 +80,35 @@ func ExtendWriteDeadline(c *gin.Context) {
 	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
 }
 
-func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+type StreamScannerConfig struct {
+	DrainCtrl *StreamDrainController
+}
+
+type StreamScannerOption func(*StreamScannerConfig)
+
+func WithDrainController(dc *StreamDrainController) StreamScannerOption {
+	return func(cfg *StreamScannerConfig) {
+		cfg.DrainCtrl = dc
+	}
+}
+
+func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult), opts ...StreamScannerOption) {
 
 	if resp == nil || dataHandler == nil {
 		return
+	}
+
+	var cfg StreamScannerConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	drainCtrl := cfg.DrainCtrl
+
+	var clientCtx context.Context
+	if c != nil && c.Request != nil && c.Request.Context() != nil {
+		clientCtx = c.Request.Context()
 	}
 
 	// 无条件新建 StreamStatus
@@ -93,9 +118,18 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
 
+	var bodyReader io.Reader
+	if resp.Body != nil {
+		if drainCtrl != nil {
+			bodyReader = drainCtrl.WrapReader(resp.Body)
+		} else {
+			bodyReader = resp.Body
+		}
+	}
+
 	var (
 		stopChan    = make(chan bool, 3) // 增加缓冲区避免阻塞
-		scanner     = NewStreamScanner(resp.Body)
+		scanner     = NewStreamScanner(bodyReader)
 		ticker      = time.NewTicker(streamingTimeout)
 		pingTicker  *time.Ticker
 		writeMutex  sync.Mutex     // Mutex to protect concurrent writes
@@ -109,12 +143,22 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			close(stopChan)
 		})
 	}
+	if drainCtrl != nil {
+		drainCtrl.SetStopFunc(stop)
+	}
 
-	generalSettings := operation_setting.GetGeneralSetting()
-	pingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
-	pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
-	if pingInterval <= 0 {
-		pingInterval = DefaultPingInterval
+	var pingEnabled bool
+	var pingInterval time.Duration
+	if resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		channelId := 0
+		disablePing := false
+		if info != nil {
+			if info.ChannelMeta != nil {
+				channelId = info.ChannelId
+			}
+			disablePing = info.DisablePing
+		}
+		pingEnabled, pingInterval = operation_setting.GetStreamPingPolicy(channelId, disablePing)
 	}
 
 	if pingEnabled {
@@ -141,6 +185,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 
 			wg.Wait()
+
+			if drainCtrl != nil {
+				outcome := drainCtrl.FinalizeOutcome()
+				if info != nil && outcome != "" {
+					info.DrainResult = outcome
+				}
+				drainCtrl.Cleanup()
+			}
 		})
 	}
 	// Ensure gin.Context is not returned to Gin's pool while any stream goroutine can still use it.
@@ -178,11 +230,29 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					func() {
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
+						if clientCtx != nil {
+							select {
+							case <-clientCtx.Done():
+								if drainCtrl != nil {
+									drainCtrl.TriggerDownstreamTransition(info.StreamStatus, relaycommon.StreamEndReasonClientGone, clientCtx.Err())
+								}
+							default:
+							}
+						}
+						if drainCtrl != nil && drainCtrl.IsDownstreamClosed() {
+							return
+						}
 						ExtendWriteDeadline(c)
 						err = PingData(c)
 					}()
 					if err != nil {
 						logger.LogError(c, "ping data error: "+err.Error())
+						if drainCtrl != nil {
+							granted := drainCtrl.TriggerDownstreamTransition(info.StreamStatus, relaycommon.StreamEndReasonPingFail, err)
+							if granted {
+								return
+							}
+						}
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPingFail, err)
 						return
 					}
@@ -214,13 +284,24 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			stop()
 			wg.Done()
 		}()
-		sr := newStreamResult(info.StreamStatus)
+		sr := newStreamResult(info.StreamStatus, drainCtrl, clientCtx)
 		for data := range dataChan {
 			sr.reset()
 			func() {
 				writeMutex.Lock()
 				defer writeMutex.Unlock()
-				ExtendWriteDeadline(c)
+				if clientCtx != nil {
+					select {
+					case <-clientCtx.Done():
+						if drainCtrl != nil {
+							drainCtrl.TriggerDownstreamTransition(info.StreamStatus, relaycommon.StreamEndReasonClientGone, clientCtx.Err())
+						}
+					default:
+					}
+				}
+				if !sr.IsDownstreamClosed() {
+					ExtendWriteDeadline(c)
+				}
 				dataHandler(data, sr)
 			}()
 			if sr.IsStopped() {
@@ -295,6 +376,23 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	})
 
+	waitForDrain := func() {
+		select {
+		case <-drainCtrl.drainTimerChan:
+			drainCtrl.setStopCause("timeout")
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+		case <-stopChan:
+		case <-ticker.C:
+			drainCtrl.setStopCause("timeout")
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+		}
+	}
+
+	var drainStarted <-chan struct{}
+	if drainCtrl != nil {
+		drainStarted = drainCtrl.DrainStarted()
+	}
+
 	// 主循环等待完成或超时
 	select {
 	case <-ticker.C:
@@ -302,9 +400,15 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	case <-stopChan:
 		// EndReason already set by the goroutine that triggered stopChan
 	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+		if drainCtrl != nil && drainCtrl.TriggerDownstreamTransition(info.StreamStatus, relaycommon.StreamEndReasonClientGone, c.Request.Context().Err()) {
+			waitForDrain()
+		} else {
+			// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
+			// 避免为已放弃的请求继续消费上游 token。
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+		}
+	case <-drainStarted:
+		waitForDrain()
 	}
 
 	cleanup()

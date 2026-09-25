@@ -172,7 +172,7 @@ describe('browser plugin source fetch', () => {
     )
   })
 
-  test('rejects a declared content-length above the 1 MiB backend limit before reading the body', async () => {
+  test('rejects a declared content-length above the 8 MiB backend limit before reading the body', async () => {
     let bodyRead = false
     await assert.rejects(
       fetchPluginSourceText('https://example.com/huge.js', async () => {
@@ -226,9 +226,9 @@ describe('browser plugin source fetch', () => {
   test('aborts and cancels chunked stream as soon as byte limit is exceeded', async () => {
     let canceled = false
     let chunksSent = 0
-    const chunk1 = new Uint8Array(500 * 1024).fill(120) // 500 KB
-    const chunk2 = new Uint8Array(600 * 1024).fill(120) // 600 KB (total > 1 MB)
-    const chunk3 = new Uint8Array(500 * 1024).fill(120) // should never be pulled
+    const chunk1 = new Uint8Array(5 * 1024 * 1024).fill(120) // 5 MB
+    const chunk2 = new Uint8Array(4 * 1024 * 1024).fill(120) // 4 MB (total 9 MB > 8 MB)
+    const chunk3 = new Uint8Array(1024 * 1024).fill(120) // should never be pulled
 
     const stream = new ReadableStream<Uint8Array>(
       {

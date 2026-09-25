@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
@@ -354,9 +356,24 @@ func (s *BillingSession) shouldTrust(c *gin.Context, quota int) bool {
 		return false
 	}
 
+	trustQuota := operation_setting.GetQuotaSetting().TrustQuotaUSD * common.QuotaPerUnit
+	if trustQuota <= 0 || math.IsNaN(trustQuota) || math.IsInf(trustQuota, 0) {
+		return false
+	}
+
+	// 检查令牌是否充足
+	tokenTrusted := s.relayInfo.TokenUnlimited
+	if !tokenTrusted {
+		tokenQuota := c.GetInt("token_quota")
+		tokenTrusted = float64(tokenQuota) > trustQuota
+	}
+	if !tokenTrusted {
+		return false
+	}
+
 	switch s.funding.Source() {
 	case BillingSourceWallet:
-		return walletTrustBypassAllowed(c, s.relayInfo, quota)
+		return float64(s.relayInfo.UserQuota) > trustQuota && walletTrustBypassAllowed(c, s.relayInfo, quota)
 	case BillingSourceSubscription:
 		// 订阅不能启用信任旁路。原因：
 		// 1. PreConsumeUserSubscription 要求 amount>0 来创建预扣记录并锁定订阅

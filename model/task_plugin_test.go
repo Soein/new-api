@@ -52,7 +52,7 @@ func TestConcurrentFirstTaskPluginUploadsCreateSingleActiveVersion(t *testing.T)
 			<-start
 			errorsByVersion <- SaveTaskPlugin(&TaskPlugin{
 				Key: "first-upload", APIVersion: 1, Version: version,
-				Source: version, SourceHash: "hash-" + version, Enabled: true,
+				Source: LongText(version), SourceHash: "hash-" + version, Enabled: true,
 			})
 		}()
 	}
@@ -141,7 +141,7 @@ func TestRestoreTaskPluginActivationDoesNotOverwriteNewerActivation(t *testing.T
 	for _, version := range []string{"1.0.0", "2.0.0", "3.0.0"} {
 		require.NoError(t, SaveTaskPlugin(&TaskPlugin{
 			Key: "cas-plugin", APIVersion: 1, Version: version,
-			Source: version, SourceHash: "hash-" + version, Enabled: true,
+			Source: LongText(version), SourceHash: "hash-" + version, Enabled: true,
 		}))
 	}
 
@@ -168,7 +168,7 @@ func TestRestoreTaskPluginActivationDoesNotOverwriteConcurrentDisable(t *testing
 	for _, version := range []string{"1.0.0", "2.0.0"} {
 		require.NoError(t, SaveTaskPlugin(&TaskPlugin{
 			Key: "disable-wins", APIVersion: 1, Version: version,
-			Source: version, SourceHash: "hash-" + version, Enabled: true,
+			Source: LongText(version), SourceHash: "hash-" + version, Enabled: true,
 		}))
 	}
 
@@ -204,7 +204,7 @@ func TestRestoreTaskPluginActivationRejectsABAReactivation(t *testing.T) {
 	for _, version := range []string{"1.0.0", "2.0.0", "3.0.0"} {
 		require.NoError(t, SaveTaskPlugin(&TaskPlugin{
 			Key: "aba-plugin", APIVersion: 1, Version: version,
-			Source: version, SourceHash: "hash-" + version, Enabled: true,
+			Source: LongText(version), SourceHash: "hash-" + version, Enabled: true,
 		}))
 	}
 
@@ -277,7 +277,7 @@ func TestDeleteTaskPluginVersionRetainsHistoricalSourceAsTombstone(t *testing.T)
 
 	historical, err := GetTaskPluginVersionForExecution("tombstone", "1.0.0")
 	require.NoError(t, err)
-	assert.Equal(t, "v1", historical.Source)
+	assert.Equal(t, "v1", string(historical.Source))
 	assert.Equal(t, "hash-v1", historical.SourceHash)
 	assert.NotNil(t, historical.DeletedAt)
 	assert.True(t, historical.Enabled)
@@ -427,7 +427,7 @@ func TestTaskPluginActivationRestoreDatabaseMatrix(t *testing.T) {
 					<-start
 					saveErrors <- SaveTaskPlugin(&TaskPlugin{
 						Key: "matrix-first-upload", APIVersion: 1, Version: version,
-						Source: version, SourceHash: "first-" + version, Enabled: true,
+						Source: LongText(version), SourceHash: "first-" + version, Enabled: true,
 					})
 				}()
 			}
@@ -513,7 +513,7 @@ func TestTaskPluginActivationRestoreDatabaseMatrix(t *testing.T) {
 			require.NoError(t, lookupErr)
 			assert.Equal(t, int64(0), legacy.Revision)
 			assert.Nil(t, legacy.DeletedAt)
-			assert.Equal(t, "legacy", legacy.Source)
+			assert.Equal(t, "legacy", string(legacy.Source))
 			require.NoError(t, SetTaskPluginEnabled("legacy-plugin", false))
 			var state TaskPluginState
 			require.NoError(t, database.Where(&TaskPluginState{Key: "legacy-plugin"}).First(&state).Error)

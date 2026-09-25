@@ -37,7 +37,7 @@ import type {
 interface SecureVerificationDialogProps {
   state: SecureVerificationState
   passkeyDomains?: PasskeyDomains | null
-  onVerify: () => void | Promise<void>
+  onVerify: (input?: VerificationInput) => void | Promise<void>
   onCancel: () => void
   onRetry: () => void
   onInputChange: (input: VerificationInput) => void
@@ -78,6 +78,8 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
     const trimmed = input.code.trim()
     canVerify = canVerify && trimmed.length > 0 && trimmed.length <= 128
   }
+  // Linked-account verification starts from the provider button itself.
+  const showSubmit = state.phase !== 'error' && input?.method !== 'oauth'
   const error = 'error' in state ? state.error : undefined
   const formId = `${inputId}-form`
 
@@ -131,11 +133,12 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
           <Button type='button' variant='outline' onClick={props.onCancel}>
             {t('Cancel')}
           </Button>
-          {state.phase === 'error' ? (
+          {state.phase === 'error' && (
             <Button type='button' onClick={props.onRetry}>
               {t('Retry')}
             </Button>
-          ) : (
+          )}
+          {showSubmit && (
             <Button type='submit' form={formId} disabled={!canVerify}>
               {verifying && <Loader2 className='size-4 animate-spin' />}
               {t('Verify')}
@@ -261,25 +264,20 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
                     <Button
                       key={provider.slug}
                       type='button'
-                      variant={
-                        input.method === 'oauth' &&
-                        input.provider === provider.slug
-                          ? 'default'
-                          : 'outline'
-                      }
-                      aria-pressed={
-                        input.method === 'oauth' &&
-                        input.provider === provider.slug
-                      }
                       disabled={verifying}
                       onClick={() =>
-                        props.onInputChange({
+                        void props.onVerify({
                           method: 'oauth',
                           provider: provider.slug,
                         })
                       }
                     >
-                      {provider.name}
+                      {verifying &&
+                        input.method === 'oauth' &&
+                        input.provider === provider.slug && (
+                          <Loader2 className='size-4 animate-spin' />
+                        )}
+                      {t('Continue with {{name}}', { name: provider.name })}
                     </Button>
                   ))}
                 </div>

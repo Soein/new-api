@@ -29,7 +29,6 @@ import {
   BILLING_PRICING_VARS,
   PER_IMAGE_BILLING_VAR,
   getCurrentTimePricingTiers,
-  parseTaskTiersFromExpr,
   parseTiersFromExpr,
   splitBillingExprAndRequestRules,
   tryParseRequestRuleExpr,
@@ -45,6 +44,7 @@ import {
   getTaskNumberFields,
   tryParseTaskVisualConfig,
 } from './task-expr'
+import { getTaskPricingDisplayTiers } from './task-matrix-display'
 
 export type DynamicPriceOptions = {
   tokenUnit: TokenUnit
@@ -273,7 +273,7 @@ export function getDynamicPricingTiers(
     model.billing_expr || ''
   )
   if (isTaskUsagePricingModel(model)) {
-    return parseTaskTiersFromExpr(billingExpr, model.billing_usage_schema, true)
+    return getTaskPricingDisplayTiers(billingExpr, model.billing_usage_schema)
   }
   return parseTiersFromExpr(billingExpr)
 }

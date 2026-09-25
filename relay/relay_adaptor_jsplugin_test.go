@@ -64,7 +64,7 @@ export function parseTaskResult(ctx, body) { return {taskId: body.id, status: "S
 	require.NoError(t, err)
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
 		Key: loaded.Meta.Key, APIVersion: loaded.Meta.APIVersion, Version: loaded.Meta.Version,
-		Source: source, SourceHash: loaded.SourceHash, Enabled: true,
+		Source: model.LongText(source), SourceHash: loaded.SourceHash, Enabled: true,
 	}))
 
 	adaptor := GetTaskAdaptor(constant.TaskPlatform("registry-fallback"))
@@ -103,10 +103,10 @@ export const protocols = {openai_video: {decodeRequest: function(ctx) { return c
 	v1Hash := fmt.Sprintf("%x", sha256.Sum256([]byte(v1Source)))
 	v2Hash := fmt.Sprintf("%x", sha256.Sum256([]byte(v2Source)))
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
-		Key: key, APIVersion: 1, Version: "1.0.0", Source: v1Source, SourceHash: v1Hash, Enabled: true,
+		Key: key, APIVersion: 1, Version: "1.0.0", Source: model.LongText(v1Source), SourceHash: v1Hash, Enabled: true,
 	}))
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
-		Key: key, APIVersion: 1, Version: "2.0.0", Source: v2Source, SourceHash: v2Hash, Enabled: true,
+		Key: key, APIVersion: 1, Version: "2.0.0", Source: model.LongText(v2Source), SourceHash: v2Hash, Enabled: true,
 	}))
 	require.NoError(t, model.ActivateTaskPlugin(key, "2.0.0"))
 	_, err = pluginruntime.DefaultRegistry.Register(v2Source, pluginruntime.Options{Key: key, Version: "2.0.0"})
@@ -160,10 +160,10 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	v1Hash := fmt.Sprintf("%x", sha256.Sum256([]byte(v1Source)))
 	v2Hash := fmt.Sprintf("%x", sha256.Sum256([]byte(v2Source)))
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
-		Key: key, APIVersion: 1, Version: "1.0.0", Source: v1Source, SourceHash: v1Hash, Enabled: true,
+		Key: key, APIVersion: 1, Version: "1.0.0", Source: model.LongText(v1Source), SourceHash: v1Hash, Enabled: true,
 	}))
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
-		Key: key, APIVersion: 1, Version: "2.0.0", Source: v2Source, SourceHash: v2Hash, Enabled: true,
+		Key: key, APIVersion: 1, Version: "2.0.0", Source: model.LongText(v2Source), SourceHash: v2Hash, Enabled: true,
 	}))
 	require.NoError(t, model.ActivateTaskPlugin(key, "2.0.0"))
 	require.NoError(t, model.SetTaskPluginEnabled(key, false))
@@ -207,7 +207,7 @@ export function buildQueryRequest() { return {}; }
 export function parseTaskResult() { return {status: "SUCCESS"}; }
 `
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
-		Key: key, APIVersion: 1, Version: factoryVersion, Source: overrideSource,
+		Key: key, APIVersion: 1, Version: factoryVersion, Source: model.LongText(overrideSource),
 		SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(overrideSource))), Enabled: true,
 	}))
 
@@ -251,7 +251,7 @@ export function buildQueryRequest() { return {}; }
 export function parseTaskResult() { return {status: "SUCCESS"}; }
 `
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
-		Key: key, APIVersion: 1, Version: "999.0.0", Source: overrideSource,
+		Key: key, APIVersion: 1, Version: "999.0.0", Source: model.LongText(overrideSource),
 		SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(overrideSource))), Enabled: true,
 	}))
 
@@ -343,7 +343,7 @@ export function buildQueryRequest() { return {}; }
 export function parseTaskResult() { return {status: "SUCCESS"}; }`
 			require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
 				Key: test.key, Version: "1.0.1", APIVersion: 1, Enabled: true,
-				Source: source, SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source))),
+				Source: model.LongText(source), SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source))),
 			}))
 			assert.Nil(t, GetTaskAdaptorForTask(task), "legacy factory/override ambiguity must include archived versions")
 			snapshot.Layer, snapshot.SourceHash = pluginruntime.PluginLayerFactory, test.hash
@@ -370,7 +370,7 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	t.Cleanup(func() { model.DB = originalDB })
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
 		Key: pinned.Meta.Key, APIVersion: pinned.Meta.APIVersion, Version: pinned.Meta.Version,
-		Source: source, SourceHash: pinned.SourceHash, Enabled: true,
+		Source: model.LongText(source), SourceHash: pinned.SourceHash, Enabled: true,
 	}))
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/vendor/submit", nil)
@@ -400,7 +400,7 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	t.Cleanup(func() { model.DB = originalDB })
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
 		Key: pinned.Meta.Key, APIVersion: pinned.Meta.APIVersion, Version: pinned.Meta.Version,
-		Source: source, SourceHash: pinned.SourceHash, Enabled: true,
+		Source: model.LongText(source), SourceHash: pinned.SourceHash, Enabled: true,
 	}))
 	generation := &pluginruntime.RoutingGeneration{Number: 77}
 

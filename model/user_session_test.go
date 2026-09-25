@@ -117,7 +117,7 @@ func TestCreateUserSessionFromLoginFlowUsesTransactionConnection(t *testing.T) {
 	t.Cleanup(func() { DB = previousDB })
 	session := newTestUserSession("login-flow-transaction", 1997, time.Now().Unix())
 	session.UserGeneration = ""
-	require.NoError(t, CreateUserSessionFromLoginFlow(flowToken, session, func(*AuthFlow, *UserVerificationState) error {
+	require.NoError(t, CreateUserSessionFromLoginFlow(flowToken, session, func(*gorm.DB, *AuthFlow, *UserVerificationState) error {
 		return nil
 	}))
 	var stored UserSession

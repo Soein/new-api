@@ -110,7 +110,7 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	require.NoError(t, model.DB.AutoMigrate(&model.TaskPlugin{}))
 	historical := &model.TaskPlugin{
 		Key: "historical-switches", APIVersion: 1, Version: "1.0.0",
-		Source: source, SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source))), Enabled: true,
+		Source: model.LongText(source), SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source))), Enabled: true,
 	}
 	active := &model.TaskPlugin{
 		Key: historical.Key, APIVersion: 1, Version: "2.0.0",

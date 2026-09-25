@@ -93,7 +93,7 @@ func restoreHistoricalOverrideTaskPlugin(snapshot *model.TaskPluginSnapshot, ove
 		}
 		return nil
 	}
-	plugin, compileErr := pluginruntime.CompilePlugin(override.Source, pluginruntime.Options{
+	plugin, compileErr := pluginruntime.CompilePlugin(string(override.Source), pluginruntime.Options{
 		Key: snapshot.Key, Version: snapshot.Version,
 	})
 	if compileErr != nil || plugin.SourceHash != override.SourceHash || !taskPluginSnapshotMatches(plugin, snapshot, requireSourceHash) {

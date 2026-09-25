@@ -138,6 +138,9 @@ var FrtBreakerHalfOpenWindowSec = GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_WINDOW_
 var FrtBreakerHalfOpenStrikes = GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_STRIKES", 1)
 var FrtBreakerHalfOpenSweepSec = GetEnvOrDefault("FRT_BREAKER_HALF_OPEN_SWEEP_SEC", 30)
 var QuotaRemindThreshold = 1000
+
+// PreConsumedQuota is retained for old option clients; token reservations now
+// use quota_setting.pre_consume_multiplier and the estimated input cost.
 var PreConsumedQuota = 500
 
 var RetryTimes = 0

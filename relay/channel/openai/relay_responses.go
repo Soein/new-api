@@ -44,6 +44,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
+	info.ObserveResponseModel(responsesResponse.Model)
 	responseBody = rewriteSGLangResponsesCreatedAt(info, responseBody, "created_at", nil)
 
 	// 写入新的 response body
@@ -841,6 +842,13 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			return
 		}
 
+		var observed dto.ResponsesStreamResponse
+		if err := common.UnmarshalJsonStr(data, &observed); err == nil {
+			service.ObserveResponsesOutcome(info, &observed)
+			if observed.Response != nil {
+				info.ObserveResponseModel(observed.Response.Model)
+			}
+		}
 		var respEnv rawResponsesResponsePayload
 		if len(envelope.Response) > 0 && string(envelope.Response) != "null" {
 			_ = common.Unmarshal(envelope.Response, &respEnv)
@@ -874,7 +882,21 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					imageCounter.Commit(info)
 					imageCommitted = true
 				}
-				sr.Stop(fmt.Errorf("stream terminal status: %s", envelope.Type))
+				// Output-limit incompletes are a normal, billable terminal outcome.
+				// Keep the protocol status and terminal usage while avoiding a false
+				// stream error for the channel health and consume log.
+				limitReached := false
+				if observed.Response != nil && observed.Response.IncompleteDetails != nil {
+					switch observed.Response.IncompleteDetails.Reason {
+					case "max_output_tokens", "max_tokens":
+						limitReached = true
+					}
+				}
+				if envelope.Type == "response.incomplete" && limitReached {
+					sr.Done()
+				} else {
+					sr.Stop(fmt.Errorf("stream terminal status: %s", envelope.Type))
+				}
 			} else {
 				if !imageCommitted {
 					for i := range respEnv.Output {
@@ -902,7 +924,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 
 		switch envelope.Type {
-		case "response.output_text.delta":
+		case "response.output_text.delta", "response.function_call_arguments.delta",
+			"response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta":
 			if !sr.IsDownstreamClosed() {
 				responseTextBuilder.WriteString(envelope.Delta)
 			}
@@ -970,6 +993,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	info.SetResponsesUsageSource(source)
+	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
+	info.StreamStatus.RequireTerminal()
 
 	return usage, nil
 }

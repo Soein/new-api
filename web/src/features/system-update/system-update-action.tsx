@@ -36,8 +36,7 @@ import { SystemUpdateDialog } from './system-update-dialog'
 import { useSystemUpdate } from './use-system-update'
 
 type SystemUpdateActionProps = {
-  /** Version labels expand when the header's system-brand container has room. */
-  presentation?: 'action' | 'version'
+  presentation?: 'action' | 'icon'
   compact?: boolean
 }
 
@@ -54,7 +53,7 @@ function AdminSystemUpdateAction(props: SystemUpdateActionProps) {
   const update = useSystemUpdate()
   const [open, setOpen] = useState(false)
   const compact = props.compact ?? true
-  const versionPresentation = props.presentation === 'version'
+  const isIcon = props.presentation === 'icon'
   const version = update.currentVersion?.trim() || t('Unknown version')
   const label = update.shouldNotify
     ? t('Update available')
@@ -68,7 +67,7 @@ function AdminSystemUpdateAction(props: SystemUpdateActionProps) {
     description = t('Failed to check for updates')
   }
   const updateAnnouncement = update.shouldNotify ? description : ''
-  if (versionPresentation) {
+  if (isIcon) {
     const versionDescription = t(
       'System updates, current version: {{version}}',
       { version }
@@ -93,29 +92,13 @@ function AdminSystemUpdateAction(props: SystemUpdateActionProps) {
       <span className={cn(compact && 'hidden lg:inline')}>{label}</span>
     </>
   )
-  if (versionPresentation) {
+  if (isIcon) {
     triggerContent = (
-      <>
-        <HugeiconsIcon
-          icon={update.shouldNotify ? ArrowUp01Icon : InformationCircleIcon}
-          className={cn(
-            '@min-[22rem]/system-brand:hidden',
-            update.shouldNotify && 'text-primary'
-          )}
-          aria-hidden='true'
-        />
-        <span className='hidden max-w-32 truncate font-mono text-xs @min-[22rem]/system-brand:inline'>
-          {version}
-        </span>
-        {update.shouldNotify && (
-          <Badge
-            variant='secondary'
-            className='bg-primary/10 text-primary hidden h-5 px-1.5 text-[10px] @min-[22rem]/system-brand:inline-flex'
-          >
-            {t('Update available')}
-          </Badge>
-        )}
-      </>
+      <HugeiconsIcon
+        icon={update.shouldNotify ? ArrowUp01Icon : InformationCircleIcon}
+        className={cn(update.shouldNotify && 'text-primary')}
+        aria-hidden='true'
+      />
     )
   }
 
@@ -127,33 +110,26 @@ function AdminSystemUpdateAction(props: SystemUpdateActionProps) {
       trigger={
         <Button
           type='button'
-          variant={
-            !versionPresentation && update.shouldNotify ? 'outline' : 'ghost'
-          }
+          variant={!isIcon && update.shouldNotify ? 'outline' : 'ghost'}
           aria-label={description}
           title={description}
           aria-busy={update.checking}
           className={cn(
             'relative',
-            versionPresentation &&
-              'text-muted-foreground size-8 px-0 @min-[22rem]/system-brand:h-7 @min-[22rem]/system-brand:w-auto @min-[22rem]/system-brand:gap-1.5 @min-[22rem]/system-brand:px-1.5',
-            !versionPresentation &&
-              compact &&
-              'size-8 px-0 lg:w-auto lg:gap-1.5 lg:px-2.5',
-            !versionPresentation &&
+            isIcon && 'text-muted-foreground size-8 px-0',
+            !isIcon && compact && 'size-8 px-0 lg:w-auto lg:gap-1.5 lg:px-2.5',
+            !isIcon &&
               update.shouldNotify &&
               'border-primary/40 bg-primary/10 text-primary'
           )}
         >
           {triggerContent}
-          {update.shouldNotify && (versionPresentation || compact) && (
+          {update.shouldNotify && (isIcon || compact) && (
             <Badge
               aria-hidden='true'
               className={cn(
                 'absolute -end-0.5 -top-0.5 size-1.5 min-w-0 p-0',
-                versionPresentation
-                  ? '@min-[22rem]/system-brand:hidden'
-                  : 'lg:hidden'
+                !isIcon && 'lg:hidden'
               )}
             />
           )}

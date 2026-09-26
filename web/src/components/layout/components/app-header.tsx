@@ -115,7 +115,7 @@ export function AppHeader({
     <Header>
       <div className='@container/system-brand flex min-w-0 flex-1 items-center gap-1'>
         <SystemBrand variant='inline' />
-        <SystemUpdateAction presentation='version' />
+        <SystemUpdateAction presentation='icon' />
       </div>
 
       {leftContent ? (

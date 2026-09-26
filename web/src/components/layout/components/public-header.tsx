@@ -234,7 +234,7 @@ export function PublicHeader(props: PublicHeaderProps) {
                   )}
                 </span>
               </Link>
-              <SystemUpdateAction presentation='version' />
+              <SystemUpdateAction presentation='icon' />
             </div>
 
             {/* Desktop nav */}

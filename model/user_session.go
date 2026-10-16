@@ -184,7 +184,7 @@ func publishCreatedUserSession(session *UserSession, cacheDeadline time.Time) er
 		if errors.Is(err, ErrUserSessionInactive) {
 			return err
 		}
-		common.SysLog("failed to populate newly created user session cache: " + err.Error())
+		common.SysLog(common.LogText("failed to populate newly created user session cache: %s", err.Error()))
 	}
 	return nil
 }
@@ -270,7 +270,7 @@ func GetUserSessionCached(sid string) (*UserSession, error) {
 			if errors.Is(err, ErrUserSessionInactive) {
 				return nil, err
 			}
-			common.SysLog("failed to synchronously populate user session cache: " + err.Error())
+			common.SysLog(common.LogText("failed to synchronously populate user session cache: %s", err.Error()))
 		}
 	}
 	return session, nil
@@ -521,7 +521,7 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 				} else if errors.Is(err, ErrUserSessionInactive) {
 					return nil, err
 				} else {
-					common.SysLog("failed to update rotated user session cache: " + err.Error())
+					common.SysLog(common.LogText("failed to update rotated user session cache: %s", err.Error()))
 				}
 			}
 			return &session, nil
@@ -558,7 +558,7 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 		session.RevokedAt = now
 		session.RevokedReason = "refresh_reuse"
 		if err := writeUserSessionCache(session.cacheEntry(), time.Time{}); err != nil {
-			common.SysLog("failed to cache refresh-reuse session revoke: " + err.Error())
+			common.SysLog(common.LogText("failed to cache refresh-reuse session revoke: %s", err.Error()))
 		}
 		return nil, ErrUserSessionRefreshReuse
 	}
@@ -612,7 +612,7 @@ func RevokeUserSession(userID int, sid, reason string) (bool, error) {
 		candidate.RevokedAt = now
 		candidate.RevokedReason = reason
 		if err := writeUserSessionCache(candidate.cacheEntry(), time.Time{}); err != nil {
-			common.SysLog("failed to finalize user session revoke tombstone: " + err.Error())
+			common.SysLog(common.LogText("failed to finalize user session revoke tombstone: %s", err.Error()))
 		}
 	}
 	return revoked, nil
@@ -668,7 +668,7 @@ func RevokeUserSessionByRefreshHash(sid, presentedHash, reason string) (bool, er
 	}
 	if revoked {
 		if err := writeUserSessionCache(session.cacheEntry(), time.Time{}); err != nil {
-			common.SysLog("failed to finalize refresh-authenticated session revoke tombstone: " + err.Error())
+			common.SysLog(common.LogText("failed to finalize refresh-authenticated session revoke tombstone: %s", err.Error()))
 		}
 	}
 	return revoked, nil
@@ -791,7 +791,7 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 			revoked[i].RevokedAt = now
 			revoked[i].RevokedReason = reason
 			if err := writeUserSessionCache(revoked[i].cacheEntry(), time.Time{}); err != nil {
-				common.SysLog("failed to finalize bulk user session revoke tombstone: " + err.Error())
+				common.SysLog(common.LogText("failed to finalize bulk user session revoke tombstone: %s", err.Error()))
 			}
 		}
 	}

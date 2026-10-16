@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,6 +26,7 @@ func setupUserAdminControllerTestDB(t *testing.T) *gorm.DB {
 		&model.User{},
 		&model.UserQuotaDebt{},
 		&model.Token{},
+		&model.UserAccessToken{},
 		&model.UserOAuthBinding{},
 		&model.ExternalIdentityClaim{},
 		&model.UserSession{},
@@ -57,6 +59,19 @@ func seedUserAdminControllerTestUser(
 	}
 	require.NoError(t, db.Create(user).Error)
 	return user
+}
+
+// authorizeUserAdminDeletion gives a direct-handler fixture a session-bound proof.
+func authorizeUserAdminDeletion(t *testing.T, ctx *gin.Context, actor *model.User, scope string, context any) {
+	t.Helper()
+	identity, _ := createAccessTokenTestSession(t, actor.Id, common.GetUUID())
+	payload, err := common.Marshal(context)
+	require.NoError(t, err)
+	proof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: scope, Context: payload}, service.VerificationMethodPassword)
+	ctx.Set("session_id", identity.SessionID)
+	ctx.Set("auth_version", identity.UserAuthVersion)
+	ctx.Set("session_version", identity.SessionVersion)
+	ctx.Request.Header.Set("X-Security-Proof", proof)
 }
 
 func TestSearchUsersFiltersQuotaLessThanZero(t *testing.T) {
@@ -121,6 +136,7 @@ func TestDeleteUsersBatchDeletesAuthorizedTargets(t *testing.T) {
 	ctx.Set("role", common.RoleRootUser)
 	ctx.Set("username", actor.Username)
 	common.SetContextKey(ctx, constant.ContextKeyUserSessionGeneration, actor.SessionGeneration)
+	authorizeUserAdminDeletion(t, ctx, actor, service.VerificationScopeAdminUserDeleteBatch, service.AdminUserDeleteBatchContext{Users: []model.UserDeletionTarget{{Id: first.Id, IdentityGeneration: first.SessionGeneration}, {Id: second.Id, IdentityGeneration: second.SessionGeneration}}})
 	DeleteUsersBatch(ctx)
 
 	response := decodeAPIResponse(t, recorder)
@@ -154,6 +170,7 @@ func TestDeleteUsersBatchRejectsUnauthorizedTargetAtomically(t *testing.T) {
 	ctx.Set("role", common.RoleAdminUser)
 	ctx.Set("username", actor.Username)
 	common.SetContextKey(ctx, constant.ContextKeyUserSessionGeneration, actor.SessionGeneration)
+	authorizeUserAdminDeletion(t, ctx, actor, service.VerificationScopeAdminUserDeleteBatch, service.AdminUserDeleteBatchContext{Users: []model.UserDeletionTarget{{Id: commonUser.Id, IdentityGeneration: commonUser.SessionGeneration}, {Id: peerAdmin.Id, IdentityGeneration: peerAdmin.SessionGeneration}}})
 	DeleteUsersBatch(ctx)
 
 	response := decodeAPIResponse(t, recorder)
@@ -208,11 +225,12 @@ func TestDeleteUsersBatchDoesNotDeleteWhenAuditIsUnavailable(t *testing.T) {
 	ctx.Set("role", common.RoleRootUser)
 	ctx.Set("username", actor.Username)
 	common.SetContextKey(ctx, constant.ContextKeyUserSessionGeneration, actor.SessionGeneration)
+	authorizeUserAdminDeletion(t, ctx, actor, service.VerificationScopeAdminUserDeleteBatch, service.AdminUserDeleteBatchContext{Users: []model.UserDeletionTarget{{Id: target.Id, IdentityGeneration: target.SessionGeneration}}})
 	DeleteUsersBatch(ctx)
 
 	response := decodeAPIResponse(t, recorder)
 	assert.False(t, response.Success)
-	assert.Equal(t, i18n.T(ctx, i18n.MsgDatabaseError), response.Message)
+	assert.Equal(t, "Database error, please contact the administrator", response.Message)
 
 	var remaining int64
 	require.NoError(t, db.Model(&model.User{}).Count(&remaining).Error)
@@ -314,6 +332,7 @@ func TestDeleteUserRevalidatesActorInTransaction(t *testing.T) {
 	ctx.Set("username", actor.Username)
 	common.SetContextKey(ctx, constant.ContextKeyUserSessionGeneration, actor.SessionGeneration)
 
+	authorizeUserAdminDeletion(t, ctx, actor, service.VerificationScopeAdminUserDelete, service.AdminUserContext{UserID: target.Id})
 	DeleteUser(ctx)
 
 	response := decodeAPIResponse(t, recorder)

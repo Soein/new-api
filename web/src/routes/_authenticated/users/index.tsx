@@ -36,7 +36,14 @@ const usersSearchSchema = z.object({
     .array(z.enum(['1', '10', '100']))
     .optional()
     .catch([]),
-  group: z.string().optional().catch(''),
+  group: z
+    .preprocess((val) => {
+      if (Array.isArray(val)) return val
+      if (typeof val === 'string' && val.length > 0) return [val]
+      return []
+    }, z.array(z.string()))
+    .optional()
+    .catch([]),
   quotaOperator: quotaComparisonOperatorSchema.optional().catch(undefined),
   quotaAmount: z.number().finite().optional().catch(undefined),
 })

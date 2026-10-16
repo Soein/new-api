@@ -191,7 +191,7 @@ func reconcileMidjourneyCharge(ctx context.Context, task *model.Midjourney) bool
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
 		UserId:    task.UserId,
 		LogType:   model.LogTypeConsume,
-		Content:   "Midjourney 计费状态恢复",
+		Content:   []*common.Message{common.NewMessage("Midjourney billing state recovered")},
 		ChannelId: task.GetBillingChannelId(),
 		ModelName: CovertMjpActionToModelName(task.Action),
 		Quota:     task.Quota,
@@ -225,7 +225,6 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
 		UserId:    task.UserId,
 		LogType:   model.LogTypeRefund,
-		Content:   "",
 		ChannelId: result.BillingChannelId,
 		ModelName: CovertMjpActionToModelName(task.Action),
 		Quota:     result.Quota,
@@ -450,7 +449,7 @@ func DoPreparedMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, req 
 	defer cancel()
 	resp, err := GetHttpClient().Do(req.WithContext(ctx))
 	if err != nil {
-		common.SysLog("do request failed: " + err.Error())
+		common.SysLog(common.LogText("do request failed: %s", err.Error()))
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "do_request_failed", http.StatusInternalServerError), nullBytes, fmt.Errorf("%w: %v", ErrMidjourneySubmissionUnknown, err)
 	}
 	statusCode := resp.StatusCode

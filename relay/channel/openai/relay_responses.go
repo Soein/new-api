@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -64,13 +65,11 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			info.CountBillableToolCall(dto.BuildInCallFunctionCall, output.Name)
 		}
 	}
+	info.ApplyVendorToolUsage(responseBody)
 
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
-	if !relaycommon.IsNonBillableResponsesStatus(responsesResponse.Status) {
-		for i := range responsesResponse.Output {
-			idx := i
-			imageCounter.Observe(&responsesResponse.Output[i], &idx)
-		}
+	for i := range responsesResponse.Output {
+		imageCounter.Observe(&responsesResponse.Output[i], &i)
 	}
 	imageCounter.Commit(info)
 
@@ -800,7 +799,7 @@ func isEligibleForResponsesDrain(info *relaycommon.RelayInfo) bool {
 
 func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
-		logger.LogError(c, "invalid response or response body")
+		logger.LogError(c, common.LogText("invalid response or response body"))
 		return nil, types.NewError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse)
 	}
 
@@ -837,7 +836,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 		var envelope rawResponsesStreamEnvelope
 		if err := common.UnmarshalJsonStr(data, &envelope); err != nil {
-			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
+			logger.LogError(c, common.LogText("failed to unmarshal stream response: %s", err.Error()))
 			sr.Error(err)
 			return
 		}
@@ -859,6 +858,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 		if isTerminal {
 			terminalSeen = true
+			info.ApplyVendorToolUsage(common.StringToByteSlice(data))
 
 			if len(respEnv.Usage) > 0 && string(respEnv.Usage) != "null" {
 				incomingUsage, valid := validateAndParseResponsesUsage(respEnv.Usage)
@@ -870,18 +870,26 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				}
 			}
 
+			if !imageCommitted {
+				for i := range respEnv.Output {
+					imageCounter.Observe(&respEnv.Output[i], &i)
+				}
+				imageCounter.Commit(info)
+				imageCommitted = true
+			}
+
+			var responseStatus string
+			_ = common.Unmarshal(respEnv.Status, &responseStatus)
 			isExceptional := envelope.Type == "response.failed" ||
 				envelope.Type == "response.incomplete" ||
 				envelope.Type == "response.cancelled" ||
-				envelope.Type == "response.canceled" ||
-				relaycommon.IsNonBillableResponsesStatus(respEnv.Status)
+				envelope.Type == "response.canceled"
+			switch strings.ToLower(strings.TrimSpace(responseStatus)) {
+			case "failed", "incomplete", "cancelled", "canceled":
+				isExceptional = true
+			}
 
 			if isExceptional {
-				if !imageCommitted {
-					imageCounter.Reset()
-					imageCounter.Commit(info)
-					imageCommitted = true
-				}
 				// Output-limit incompletes are a normal, billable terminal outcome.
 				// Keep the protocol status and terminal usage while avoiding a false
 				// stream error for the channel health and consume log.
@@ -898,14 +906,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					sr.Stop(fmt.Errorf("stream terminal status: %s", envelope.Type))
 				}
 			} else {
-				if !imageCommitted {
-					for i := range respEnv.Output {
-						idx := i
-						imageCounter.Observe(&respEnv.Output[i], &idx)
-					}
-					imageCounter.Commit(info)
-					imageCommitted = true
-				}
 				sr.Done()
 			}
 
@@ -973,7 +973,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	} else {
 		tempStr := responseTextBuilder.String()
 		if len(tempStr) > 0 {
-			completionTokens := service.CountTextToken(tempStr, info.UpstreamModelName)
+			completionTokens := tokenkit.Count(info.UpstreamModelName, tempStr)
 			promptTokens := info.GetEstimatePromptTokens()
 			usage = &dto.Usage{
 				PromptTokens:     promptTokens,

@@ -80,7 +80,11 @@ export function MarketplacePanel() {
       if (!selectedSource) {
         throw new Error(t('Marketplace source is not selected'))
       }
-      return fetchMarketplaceIndex(selectedSource.index_url)
+      // Revalidate so the hashes checked at install time are the host's
+      // current ones rather than a copy cached before a republish.
+      return fetchMarketplaceIndex(selectedSource.index_url, (input, init) =>
+        fetch(input, { ...init, cache: 'no-cache' })
+      )
     },
   })
 

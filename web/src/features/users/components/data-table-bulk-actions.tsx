@@ -31,6 +31,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { handleServerError } from '@/lib/handle-server-error'
+import { AuthOperationError } from '@/lib/secure-verification'
 
 import { batchDeleteUsers } from '../api'
 import type { User, UserDeletionTarget } from '../types'
@@ -46,7 +48,7 @@ export function DataTableBulkActions({
   isUnavailable,
 }: DataTableBulkActionsProps) {
   const { t } = useTranslation()
-  const { triggerRefresh } = useUsers()
+  const { triggerRefresh, requestVerification, verificationActive } = useUsers()
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [pendingUsers, setPendingUsers] = useState<UserDeletionTarget[]>([])
   const [isDeleting, setIsDeleting] = useState(false)
@@ -60,23 +62,44 @@ export function DataTableBulkActions({
 
     setIsDeleting(true)
     try {
-      const result = await batchDeleteUsers(pendingUsers)
-      if (!result.success) {
-        toast.error(result.message || t('Failed to delete selected users'))
+      const proof = await requestVerification({
+        scope: 'admin.user.delete_batch',
+        context: {
+          users: pendingUsers.map((u) => ({
+            id: u.id,
+            identity_generation: u.identity_generation,
+          })),
+        },
+        title: t('Verify to delete users'),
+        description: t(
+          'Confirm your identity before permanently deleting {{count}} selected user(s).',
+          { count: pendingUsers.length }
+        ),
+      })
+      if (!proof) {
+        setIsDeleting(false)
         return
       }
 
-      toast.success(
-        t('{{count}} user(s) deleted', {
-          count: result.data ?? pendingUsers.length,
-        })
+      const result = await batchDeleteUsers(pendingUsers, proof.proof_token)
+      if (result.success) {
+        toast.success(
+          t('{{count}} user(s) deleted', {
+            count: result.data ?? pendingUsers.length,
+          })
+        )
+        table.resetRowSelection()
+        triggerRefresh()
+        setShowDeleteConfirm(false)
+        setPendingUsers([])
+      } else {
+        handleServerError(result, t('Failed to delete selected users'))
+      }
+    } catch (error) {
+      handleServerError(
+        AuthOperationError.from(error),
+        t('Failed to delete selected users')
       )
-      table.resetRowSelection()
-      triggerRefresh()
-      setShowDeleteConfirm(false)
-      setPendingUsers([])
-    } catch {
-      toast.error(t('Failed to delete selected users'))
     } finally {
       setIsDeleting(false)
     }
@@ -112,7 +135,7 @@ export function DataTableBulkActions({
       </BulkActionsToolbar>
 
       <ConfirmDialog
-        open={showDeleteConfirm}
+        open={showDeleteConfirm && !verificationActive}
         onOpenChange={(open) => {
           if (isDeleting) return
           setShowDeleteConfirm(open)

@@ -81,11 +81,11 @@ if redis.call('EXISTS', KEYS[2]) == 1 then
   return 0
 end
 local quotaFence = redis.call('GET', KEYS[3])
-if quotaFence and quotaFence ~= ARGV[18] then
+if quotaFence and quotaFence ~= ARGV[19] then
   return 0
 end
 if redis.call('EXISTS', KEYS[1]) == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[17])
+  redis.call('EXPIRE', KEYS[1], ARGV[18])
   return 2
 end
 redis.call('HSET', KEYS[1],
@@ -93,15 +93,16 @@ redis.call('HSET', KEYS[1],
   'CreatedTime', ARGV[5], 'AccessedTime', ARGV[6], 'ExpiredTime', ARGV[7],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
-  'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16])
-if ARGV[18] ~= '' then
-  if ARGV[19] == '1' then
+  'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16],
+  'AllowUserQuotaQuery', ARGV[17])
+if ARGV[19] ~= '' then
+  if ARGV[20] == '1' then
     redis.call('SET', KEYS[4], 1)
   else
     redis.call('DEL', KEYS[4])
   end
 end
-redis.call('EXPIRE', KEYS[1], ARGV[17])
+redis.call('EXPIRE', KEYS[1], ARGV[18])
 return 1`
 	databaseMutationAppliedArg := "0"
 	if databaseMutationApplied {
@@ -116,7 +117,8 @@ return 1`
 		token.CreatedTime, token.AccessedTime, token.ExpiredTime,
 		strconv.FormatBool(token.UnlimitedQuota), strconv.FormatBool(token.ModelLimitsEnabled),
 		token.ModelLimits, allowIps, token.Group, strconv.FormatBool(token.CrossGroupRetry),
-		token.AutoGroups, token.RemainQuota, token.UsedQuota, tokenCacheTTLSeconds(),
+		token.AutoGroups, token.RemainQuota, token.UsedQuota,
+		strconv.FormatBool(token.AllowUserQuotaQuery), tokenCacheTTLSeconds(),
 		quotaFenceOwner, databaseMutationAppliedArg,
 	).Int()
 }

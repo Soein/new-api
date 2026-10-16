@@ -161,7 +161,9 @@ export async function readBoundedResponseText(
 /**
  * Fetches plugin source in the browser. Every marketplace and URL-import fetch
  * goes through here: the gateway never makes the outbound request, so there is
- * no server-side SSRF surface.
+ * no server-side SSRF surface. The request always revalidates with the host:
+ * versioned sources are often served as immutable, and a file republished in
+ * place would otherwise be read from a stale cache and fail the index sha256.
  */
 export async function fetchPluginSourceText(
   url: string,
@@ -169,7 +171,7 @@ export async function fetchPluginSourceText(
 ): Promise<string> {
   let response: Response
   try {
-    response = await fetchImpl(url)
+    response = await fetchImpl(url, { cache: 'no-cache' })
   } catch {
     throw new PluginSourceFetchError('unreachable')
   }

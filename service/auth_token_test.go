@@ -2,10 +2,12 @@ package service
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -159,4 +161,50 @@ func TestSecurityProofBindsIdentityAndOperation(t *testing.T) {
 	require.NoError(t, err)
 	_, err = ConsumeOperationProof(expired, identity, operation)
 	assert.ErrorIs(t, err, ErrAuthTokenExpired)
+}
+
+func TestSecurityProofBindsAccessTokenSession(t *testing.T) {
+	setupAuthSessionTestDB(t)
+	useTestSessionSecret(t)
+	identity := AuthIdentity{UserID: 42, SessionID: model.AccessTokenSessionID(7), UserAuthVersion: 3, SessionVersion: model.AccessTokenSessionVersion}
+	binding, err := BindVerificationOperation(VerificationOperation{Scope: VerificationScopeTwoFADisable})
+	require.NoError(t, err)
+	proof, _, err := IssueSecurityProof(identity, "password", binding)
+	require.NoError(t, err)
+
+	claims, err := verifySecurityProof(proof, identity, binding)
+	require.NoError(t, err)
+	assert.Equal(t, identity.SessionID, claims.SessionID)
+
+	for _, sessionID := range []string{model.AccessTokenSessionID(8), "session-1"} {
+		other := identity
+		other.SessionID = sessionID
+		_, err = verifySecurityProof(proof, other, binding)
+		assert.ErrorIs(t, err, ErrAuthTokenInvalid, sessionID)
+	}
+}
+
+func TestAdminUserBatchDeletionContextBindsAccountGenerations(t *testing.T) {
+	operation := VerificationOperation{Scope: VerificationScopeAdminUserDeleteBatch, Context: []byte(`{"users":[{"id":2,"identity_generation":"second"},{"id":1,"identity_generation":"first"},{"id":2,"identity_generation":"second"}]}`)}
+	binding, err := BindVerificationOperation(operation)
+	require.NoError(t, err)
+	canonical, err := BindVerificationOperation(VerificationOperation{Scope: operation.Scope, Context: []byte(`{"users":[{"id":1,"identity_generation":"first"},{"id":2,"identity_generation":"second"}]}`)})
+	require.NoError(t, err)
+	assert.Equal(t, canonical, binding)
+	changed, err := BindVerificationOperation(VerificationOperation{Scope: operation.Scope, Context: []byte(`{"users":[{"id":1,"identity_generation":"replacement"},{"id":2,"identity_generation":"second"}]}`)})
+	require.NoError(t, err)
+	assert.NotEqual(t, canonical.ContextHash, changed.ContextHash)
+	for _, context := range []string{
+		`{}`, `{"users":[]}`, `{"users":null}`, `{"users":[{"id":0,"identity_generation":"first"}]}`,
+		`{"users":[{"id":1.5,"identity_generation":"first"}]}`,
+		`{"users":[{"id":1,"identity_generation":""}]}`,
+		`{"users":[{"id":1,"identity_generation":"first","unexpected":true}]}`,
+		`{"users":[{"id":1,"identity_generation":"first"}],"unexpected":true}`,
+		`{"users":[{"id":1,"identity_generation":"first"},{"id":1,"identity_generation":"replacement"}]}`,
+		`{"users":[{"id":1,"identity_generation":"` + strings.Repeat("a", 33) + `"}]}`,
+		`{"users":[` + strings.Repeat(`{"id":1,"identity_generation":"first"},`, MaxAdminUserDeleteBatch) + `{"id":2,"identity_generation":"second"}]}`,
+	} {
+		_, err := BindVerificationOperation(VerificationOperation{Scope: operation.Scope, Context: []byte(context)})
+		assert.ErrorIs(t, err, ErrVerificationContextInvalid, context)
+	}
 }

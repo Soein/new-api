@@ -41,7 +41,7 @@ func (user *UserBase) GetSetting() dto.UserSetting {
 	if user.Setting != "" {
 		err := common.Unmarshal([]byte(user.Setting), &setting)
 		if err != nil {
-			common.SysLog("failed to unmarshal setting: " + err.Error())
+			common.SysLog(common.LogText("failed to unmarshal setting: %s", err.Error()))
 		}
 	}
 	return setting
@@ -170,7 +170,7 @@ func syncCreditUserQuotaCache(userId int, quota int, operation string) {
 		return
 	}
 	if err := cacheIncrUserQuota(userId, int64(quota)); err != nil {
-		common.SysLog(fmt.Sprintf("failed to sync %s credit to user quota cache: %s", operation, err.Error()))
+		common.SysLog(common.LogText("failed to sync %s credit to user quota cache: %s", operation, err.Error()))
 	}
 }
 

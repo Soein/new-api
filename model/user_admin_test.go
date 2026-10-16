@@ -96,13 +96,19 @@ func TestHardDeleteUsersByIdsDeletesTargetsAndBindings(t *testing.T) {
 		CodeHash: "deleted-user-backup-code",
 	}).Error)
 
-	deleted, err := HardDeleteUsersByIds(
+	createTestUserAccessToken(t, first.Id, "deleted-first-scoped", 0)
+	createTestUserAccessToken(t, second.Id, "deleted-second-scoped", 0)
+	deleted, revokedAccessTokens, err := HardDeleteUsersByIds(
 		[]UserDeletionTarget{deletionTarget(first), deletionTarget(second)},
 		actor.Id,
 		actor.SessionGeneration,
 	)
 	require.NoError(t, err)
 	require.Len(t, deleted, 2)
+	assert.EqualValues(t, 2, revokedAccessTokens)
+	var remainingScopedTokens int64
+	require.NoError(t, DB.Model(&UserAccessToken{}).Count(&remainingScopedTokens).Error)
+	assert.Zero(t, remainingScopedTokens)
 
 	var remainingUsers int64
 	require.NoError(t, DB.Model(&User{}).Count(&remainingUsers).Error)
@@ -223,9 +229,14 @@ func TestAccessTokenUpdateRejectsReusedUserID(t *testing.T) {
 	}
 	require.NoError(t, DB.Create(replacement).Error)
 
-	err := UpdateUserAccessToken(user.Id, user.SessionGeneration, "stale-access-token")
+	err := UpdateLegacyUserAccessToken(user.Id, user.SessionGeneration, "stale-access-token")
 
 	require.ErrorIs(t, err, ErrUserNotFound)
+	scoped := &UserAccessToken{TokenHash: AccessTokenFingerprint("stale-scoped-token"), Name: "stale"}
+	require.Error(t, CreateUserAccessToken(user.Id, user.SessionGeneration, scoped, 20))
+	var scopedCount int64
+	require.NoError(t, DB.Model(&UserAccessToken{}).Where("user_id = ?", replacement.Id).Count(&scopedCount).Error)
+	assert.Zero(t, scopedCount)
 	var stored User
 	require.NoError(t, DB.First(&stored, replacement.Id).Error)
 	assert.Empty(t, stored.GetAccessToken())
@@ -300,7 +311,7 @@ func TestHardDeleteUsersByIdsRejectsUnauthorizedBatchAtomically(t *testing.T) {
 	commonUser := seedAdminTestUser(t, "common", common.RoleCommonUser, -1)
 	adminUser := seedAdminTestUser(t, "admin", common.RoleAdminUser, -1)
 
-	deleted, err := HardDeleteUsersByIds(
+	deleted, _, err := HardDeleteUsersByIds(
 		[]UserDeletionTarget{deletionTarget(commonUser), deletionTarget(adminUser)},
 		actor.Id,
 		actor.SessionGeneration,
@@ -318,7 +329,7 @@ func TestHardDeleteUsersByIdsRejectsMissingTargetAtomically(t *testing.T) {
 	actor := seedAdminTestUser(t, "missing-root", common.RoleRootUser, 0)
 	user := seedAdminTestUser(t, "existing", common.RoleCommonUser, -1)
 
-	deleted, err := HardDeleteUsersByIds(
+	deleted, _, err := HardDeleteUsersByIds(
 		[]UserDeletionTarget{
 			deletionTarget(user),
 			{Id: user.Id + 999, IdentityGeneration: common.GetUUID()},
@@ -369,7 +380,7 @@ func TestHardDeleteUsersByIdsRevalidatesActorInTransaction(t *testing.T) {
 				require.NoError(t, DB.Unscoped().Delete(&User{}, actor.Id).Error)
 			}
 
-			deleted, err := HardDeleteUsersByIds(
+			deleted, _, err := HardDeleteUsersByIds(
 				[]UserDeletionTarget{deletionTarget(target)},
 				actor.Id,
 				actor.SessionGeneration,
@@ -401,7 +412,7 @@ func TestHardDeleteUsersByIdsRejectsReusedActorID(t *testing.T) {
 	}
 	require.NoError(t, DB.Create(replacement).Error)
 
-	deleted, err := HardDeleteUsersByIds(
+	deleted, _, err := HardDeleteUsersByIds(
 		[]UserDeletionTarget{deletionTarget(target)},
 		actor.Id,
 		originalActorGeneration,
@@ -431,7 +442,7 @@ func TestHardDeleteUsersByIdsRejectsReusedTargetID(t *testing.T) {
 	}
 	require.NoError(t, DB.Create(replacement).Error)
 
-	deleted, err := HardDeleteUsersByIds(
+	deleted, _, err := HardDeleteUsersByIds(
 		[]UserDeletionTarget{originalTarget},
 		actor.Id,
 		actor.SessionGeneration,

@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -72,11 +73,8 @@ func TestOaiResponsesStreamHandlerCompletedEventWinsClientDisconnect(t *testing.
 	assert.Contains(t, recorder.Body.String(), `"type":"response.completed"`)
 }
 
-var initTokenEncodersOnce sync.Once
-
 func runTestResponsesStream(t *testing.T, chunks ...string) (*dto.Usage, *relaycommon.RelayInfo, string) {
 	t.Helper()
-	initTokenEncodersOnce.Do(service.InitTokenEncoders)
 
 	oldMode := gin.Mode()
 	gin.SetMode(gin.TestMode)
@@ -686,8 +684,6 @@ func setupDrainTest(t *testing.T, channelIDs ...int) {
 	testSettingMutex.Lock()
 	t.Cleanup(testSettingMutex.Unlock)
 
-	initTokenEncodersOnce.Do(service.InitTokenEncoders)
-
 	oldMode := gin.Mode()
 	gin.SetMode(gin.TestMode)
 	t.Cleanup(func() { gin.SetMode(oldMode) })
@@ -1228,7 +1224,7 @@ func TestOaiResponsesStreamHandlerCancelBeforeNewDeltaNoTerminalUsagePreservesPr
 	require.NotNil(t, usage)
 
 	// Estimate must be based only on pre-disconnect text
-	preTokens := service.CountTextToken("pre-disconnect text", "gpt-5.1")
+	preTokens := tokenkit.Count("gpt-5.1", "pre-disconnect text")
 	assert.Equal(t, preTokens, usage.CompletionTokens)
 	assert.Equal(t, relaycommon.ResponsesUsageSourceEstimated, info.GetResponsesUsageSource())
 
@@ -1547,7 +1543,7 @@ func TestOaiResponsesStreamHandlerMalformedCreatedAtPreservesAccountingAndStatus
 		assert.Contains(t, recorder.Body.String(), `"created_at":"bad_timestamp"`)
 	})
 
-	t.Run("malformed created_at before failed status still clears prior image call", func(t *testing.T) {
+	t.Run("malformed created_at before failed status preserves completed image billing and failed stream status", func(t *testing.T) {
 		item := `{"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"img_1","status":"completed","result":"base64-a"}}`
 		terminal := `{"type":"response.completed","response":{"created_at":true,"status":"failed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`
 
@@ -1557,7 +1553,10 @@ func TestOaiResponsesStreamHandlerMalformedCreatedAtPreservesAccountingAndStatus
 		assert.Equal(t, 5, usage.CompletionTokens)
 		assert.Equal(t, 15, usage.TotalTokens)
 		require.NotNil(t, info.ResponsesUsageInfo)
-		assert.Equal(t, 0, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
+		assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
+		assert.Equal(t, relaycommon.ResponsesUsageSourceUpstream, info.ResponsesUsageInfo.UsageSource)
+		require.NotNil(t, info.StreamStatus)
+		assert.True(t, info.StreamStatus.HasErrors(), "failed response status must survive a malformed timestamp")
 		assert.Contains(t, body, `"created_at":true`)
 	})
 

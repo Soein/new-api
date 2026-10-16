@@ -18,39 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
 
-import { Window } from 'happy-dom'
+import { createInstance } from 'i18next'
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
+import { I18nextProvider, initReactI18next } from 'react-i18next'
 import { afterAll, describe, test } from 'vitest'
 
-const domWindow = new Window()
-const domGlobals = [
-  'window',
-  'document',
-  'navigator',
-  'HTMLElement',
-  'SVGElement',
-  'Node',
-  'Element',
-  'Event',
-  'CustomEvent',
-  'MutationObserver',
-  'ResizeObserver',
-  'requestAnimationFrame',
-  'cancelAnimationFrame',
-  'getComputedStyle',
-] as const
+import { DynamicPricingBreakdown } from '../dynamic-pricing-breakdown'
 
-for (const key of domGlobals) {
-  Object.defineProperty(globalThis, key, {
-    configurable: true,
-    value: domWindow[key],
-  })
-}
-
-const { act } = await import('react')
-const { createRoot } = await import('react-dom/client')
-const { createInstance } = await import('i18next')
-const { I18nextProvider, initReactI18next } = await import('react-i18next')
-const { DynamicPricingBreakdown } = await import('../dynamic-pricing-breakdown')
 const reactTestGlobals = globalThis as typeof globalThis & {
   IS_REACT_ACT_ENVIRONMENT?: boolean
 }
@@ -70,7 +45,6 @@ const root = createRoot(container)
 afterAll(() => {
   act(() => root.unmount())
   container.remove()
-  domWindow.close()
 })
 
 describe('image pricing rule trace', () => {

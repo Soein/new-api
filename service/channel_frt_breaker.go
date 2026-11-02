@@ -258,8 +258,9 @@ func frtBreakerHalfOpenSweep(now int64) {
 		common.SysLog(msg)
 		channelId, channelName := channel.Id, channel.Name
 		gopoolGo(func() {
-			NotifyRootUser(fmt.Sprintf("%s_%d_half_open", dto.NotifyTypeChannelUpdate, channelId),
-				fmt.Sprintf("通道「%s」（#%d）已半开启用", channelName, channelId), msg)
+			NotifyChannelWatchers(fmt.Sprintf("%s_%d_half_open", dto.NotifyTypeChannelUpdate, channelId), func(string) (string, string) {
+				return fmt.Sprintf("通道「%s」（#%d）已半开启用", channelName, channelId), msg
+			})
 		})
 	}
 }

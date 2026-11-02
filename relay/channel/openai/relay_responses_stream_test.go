@@ -26,7 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOaiResponsesStreamHandlerCompletedEventWinsClientDisconnect(t *testing.T) {
+func TestOaiResponsesStreamHandlerTerminalUsageSurvivesCancellationBeforeFlush(t *testing.T) {
 	oldMode := gin.Mode()
 	gin.SetMode(gin.TestMode)
 	t.Cleanup(func() { gin.SetMode(oldMode) })
@@ -68,8 +68,8 @@ func TestOaiResponsesStreamHandlerCompletedEventWinsClientDisconnect(t *testing.
 	assert.Equal(t, 20, usage.CompletionTokens)
 	assert.Equal(t, 30, usage.TotalTokens)
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
-	assert.True(t, info.StreamStatus.IsNormalEnd())
+	assert.Contains(t, []relaycommon.StreamEndReason{relaycommon.StreamEndReasonClientGone, relaycommon.StreamEndReasonHandlerStop}, info.StreamStatus.EndReason)
+	assert.True(t, info.StreamStatus.HasErrors())
 	assert.Contains(t, recorder.Body.String(), `"type":"response.completed"`)
 }
 

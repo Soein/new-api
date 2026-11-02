@@ -208,6 +208,10 @@ export function ModelPricingPanel(props: {
               className='space-y-3 border-b pb-3'
             >
               <h3 className='text-muted-foreground text-xs'>
+                {!effectivePricing.billing_usage_schema &&
+                entry.plugin_variants?.length ? (
+                  <>{t('Ordinary OpenAI')} · </>
+                ) : null}
                 {t('Current Billing')}
               </h3>
               <div className='max-w-xs'>
@@ -221,7 +225,7 @@ export function ModelPricingPanel(props: {
                 <DynamicPricingBreakdown
                   compact
                   billingExpr={effectivePricing.billing_expr}
-                  usageSchema={entry.usage_schema}
+                  usageSchema={effectivePricing.billing_usage_schema}
                 />
               ) : (
                 effectivePricing.quota_type === 0 &&

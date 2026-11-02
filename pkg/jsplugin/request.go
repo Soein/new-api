@@ -38,30 +38,6 @@ func ValidateRequestURL(requestURL, baseURL string, allowedHosts []string) error
 	return fmt.Errorf("plugin request host %q is not allowed", request.Host)
 }
 
-// ValidateCredentialedRedirectURL ensures an HTTP redirect cannot move plugin
-// credentials to another origin. Redirect targets are also checked against the
-// same administrator-approved host policy as direct plugin requests.
-func ValidateCredentialedRedirectURL(requestURL, initialURL, baseURL string, allowedHosts []string) error {
-	if err := ValidateRequestURL(requestURL, baseURL, allowedHosts); err != nil {
-		return err
-	}
-	request, err := url.Parse(requestURL)
-	if err != nil {
-		return fmt.Errorf("plugin redirect URL is invalid")
-	}
-	initial, err := url.Parse(initialURL)
-	if err != nil || initial.Host == "" || initial.Scheme != "http" && initial.Scheme != "https" {
-		return fmt.Errorf("plugin initial request URL is invalid")
-	}
-	if initial.Scheme == "https" && request.Scheme == "http" {
-		return fmt.Errorf("plugin redirect must not downgrade HTTPS to HTTP")
-	}
-	if initial.Scheme != request.Scheme || canonicalHost(initial) != canonicalHost(request) {
-		return fmt.Errorf("credentialed plugin request cannot follow a cross-origin redirect")
-	}
-	return nil
-}
-
 // ValidateRequestHeaders rejects plugin-chosen headers that the host
 // transport owns or that change how a request is framed or proxied, and
 // bounds their number and size.

@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { BILLING_CACHE_VAR_MAP } from './billing-expr'
+import {
+  BILLING_CACHE_VAR_MAP,
+  CLAUDE_CACHE_CREATION_1H_MULTIPLIER,
+  OPENAI_CACHE_CREATION_12H_MULTIPLIER,
+} from './billing-expr'
 import { compileBillingExpression } from './billing-expression/parser'
 import { evaluateBillingExpression } from './billing-expression/runtime'
 import type {
@@ -45,6 +49,7 @@ export type VisualTier = {
   cache_read_unit_cost?: number
   cache_create_unit_cost?: number
   cache_create_1h_unit_cost?: number
+  cache_create_12h_unit_cost?: number
   image_unit_cost?: number
   image_output_unit_cost?: number
   audio_input_unit_cost?: number
@@ -77,6 +82,7 @@ function normalizeVisualTier(tier: Partial<VisualTier> = {}): VisualTier {
     cache_read_unit_cost: Number(tier.cache_read_unit_cost) || 0,
     cache_create_unit_cost: Number(tier.cache_create_unit_cost) || 0,
     cache_create_1h_unit_cost: Number(tier.cache_create_1h_unit_cost) || 0,
+    cache_create_12h_unit_cost: Number(tier.cache_create_12h_unit_cost) || 0,
     image_unit_cost: Number(tier.image_unit_cost) || 0,
     image_output_unit_cost: Number(tier.image_output_unit_cost) || 0,
     audio_input_unit_cost: Number(tier.audio_input_unit_cost) || 0,
@@ -258,6 +264,7 @@ const ESTIMATOR_VARS = [
   { var: 'cr', stateKey: 'cacheReadTokens' },
   { var: 'cc', stateKey: 'cacheCreateTokens' },
   { var: 'cc1h', stateKey: 'cacheCreate1hTokens' },
+  { var: 'cc12h', stateKey: 'cacheCreate12hTokens' },
   { var: 'img', stateKey: 'imageTokens' },
   { var: 'img_cr', stateKey: 'imageCacheTokens' },
   { var: 'img_o', stateKey: 'imageOutputTokens' },
@@ -266,9 +273,9 @@ const ESTIMATOR_VARS = [
 ] as const
 
 export type ExtraTokenValues = Record<
-  (typeof ESTIMATOR_VARS)[number]['stateKey'],
+  Exclude<(typeof ESTIMATOR_VARS)[number]['stateKey'], 'cacheCreate12hTokens'>,
   number
-> & { imageCount: number }
+> & { cacheCreate12hTokens?: number; imageCount: number }
 
 export type EvalResult = {
   cost: number
@@ -289,7 +296,12 @@ export function evalExprLocally(
     ...context,
     imageCount: extraTokenValues.imageCount ?? context?.imageCount,
     tokens: {
-      ...buildEstimatorTokens(promptTokens, completionTokens, extraTokenValues),
+      ...buildEstimatorTokens(
+        promptTokens,
+        completionTokens,
+        extraTokenValues,
+        exprStr
+      ),
       ...context?.tokens,
     },
   })
@@ -309,8 +321,24 @@ export function evalExprLocally(
 export function buildEstimatorTokens(
   promptTokens: number,
   completionTokens: number,
-  extraTokenValues: ExtraTokenValues
+  extraTokenValues: ExtraTokenValues,
+  exprStr: string
 ): Partial<Record<TokenVariable, number>> {
+  // Like backend token normalization, a long-lived cache write without its
+  // own price joins cc at a fixed multiple. With cc unpriced it stays free.
+  const compiled = compileBillingExpression(exprStr)
+  const usedVars: ReadonlySet<string> =
+    compiled.status === 'ready' ? compiled.variables : new Set()
+  let cacheCreateTokens = extraTokenValues.cacheCreateTokens
+  if (usedVars.has('cc') && !usedVars.has('cc1h')) {
+    cacheCreateTokens +=
+      extraTokenValues.cacheCreate1hTokens * CLAUDE_CACHE_CREATION_1H_MULTIPLIER
+  }
+  if (usedVars.has('cc') && !usedVars.has('cc12h')) {
+    cacheCreateTokens +=
+      (extraTokenValues.cacheCreate12hTokens || 0) *
+      OPENAI_CACHE_CREATION_12H_MULTIPLIER
+  }
   return {
     p: promptTokens,
     c: completionTokens,
@@ -321,13 +349,15 @@ export function buildEstimatorTokens(
       (extraTokenValues.imageTokens || 0) +
       (extraTokenValues.audioInputTokens || 0) +
       (extraTokenValues.cacheCreateTokens || 0) +
-      (extraTokenValues.cacheCreate1hTokens || 0),
+      (extraTokenValues.cacheCreate1hTokens || 0) +
+      (extraTokenValues.cacheCreate12hTokens || 0),
     ...Object.fromEntries(
       ESTIMATOR_VARS.map((field) => [
         field.var,
         extraTokenValues[field.stateKey] ?? 0,
       ])
     ),
+    cc: cacheCreateTokens,
   }
 }
 

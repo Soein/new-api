@@ -23,9 +23,8 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/tokenkit"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -889,6 +888,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				isExceptional = true
 			}
 
+			var terminalErr error
 			if isExceptional {
 				// Output-limit incompletes are a normal, billable terminal outcome.
 				// Keep the protocol status and terminal usage while avoiding a false
@@ -900,13 +900,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 						limitReached = true
 					}
 				}
-				if envelope.Type == "response.incomplete" && limitReached {
-					sr.Done()
-				} else {
-					sr.Stop(fmt.Errorf("stream terminal status: %s", envelope.Type))
+				if envelope.Type != "response.incomplete" || !limitReached {
+					terminalErr = fmt.Errorf("stream terminal status: %s", envelope.Type)
 				}
-			} else {
-				sr.Done()
 			}
 
 			if hasTerminalUsage {
@@ -918,7 +914,16 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
 					logger.LogWarn(c, "send responses stream data failed: "+err.Error())
 					sr.DownstreamWriteError(err)
+					sr.Stop(nil)
+					return
 				}
+			}
+			if terminalErr != nil {
+				sr.Stop(terminalErr)
+			} else if sr.IsDownstreamClosed() {
+				sr.Stop(nil)
+			} else {
+				sr.Done()
 			}
 			return
 		}
@@ -1004,7 +1009,7 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
 		return payload
 	}
 	if len(rawCreatedAt) == 0 {
-		res := gjson.GetBytes(payload, path)
+		res := ojson.GetBytes(payload, path)
 		if !res.Exists() {
 			return payload
 		}
@@ -1017,7 +1022,7 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
 	if err := common.Unmarshal(rawCreatedAt, &parsedCreatedAt); err != nil {
 		return payload
 	}
-	patched, err := sjson.SetBytes(payload, path, int(parsedCreatedAt))
+	patched, err := ojson.SetBytes(payload, path, int(parsedCreatedAt))
 	if err != nil {
 		return payload
 	}

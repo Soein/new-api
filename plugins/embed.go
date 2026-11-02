@@ -2,11 +2,11 @@ package plugins
 
 import (
 	"embed"
-	"encoding/base64"
 	"fmt"
 	"io/fs"
 	"strings"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 )
 
@@ -84,5 +84,5 @@ func IconDataURI(key string) string {
 	if !ok {
 		return ""
 	}
-	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return base64.EncodeDataURL(mediaType, data)
 }

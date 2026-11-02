@@ -8,16 +8,16 @@ import (
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
-	"github.com/tidwall/gjson"
 )
 
 // RunExpr compiles (with cache) and executes an expression string.
 // The environment exposes:
 //   - p, c             — prompt / completion tokens (auto-excluding separately-priced sub-categories)
 //   - len              — total input context length for tier conditions (never reduced by sub-category exclusion)
-//   - cr, cc, cc1h     — cache read / creation / creation-1h tokens
+//   - cr, cc, cc1h, cc12h — cache read / creation / creation-1h / creation-12h tokens
 //   - tier(name, value) — trace callback that records which tier matched
 //   - max, min, abs, ceil, floor — standard math helpers
 //
@@ -102,6 +102,7 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 		"cr":          params.CR,
 		"cc":          params.CC,
 		"cc1h":        params.CC1h,
+		"cc12h":       params.CC12h,
 		"img":         params.Img,
 		"img_cr":      params.ImgCR,
 		"img_o":       params.ImgO,
@@ -177,13 +178,13 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 				return nil
 			}
 			if len(request.StructuredBody) > 0 {
-				result := gjson.GetBytes(request.StructuredBody, path)
+				result := ojson.GetBytes(request.StructuredBody, path)
 				if result.Exists() {
 					return result.Value()
 				}
 			}
 			if len(request.Body) > 0 {
-				result := gjson.GetBytes(request.Body, path)
+				result := ojson.GetBytes(request.Body, path)
 				if result.Exists() {
 					return result.Value()
 				}

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -14,7 +15,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
-	"github.com/tidwall/gjson"
 )
 
 func TestResolveIncomingBillingExprRequestInput(t *testing.T) {
@@ -59,9 +59,9 @@ func TestBuildBillingExprRequestInputFromRequest(t *testing.T) {
 	require.Equal(t, "application/json", input.Headers["Content-Type"])
 	require.Equal(t, "1", input.Headers["X-Test"])
 	require.Empty(t, input.Body)
-	require.True(t, gjson.GetBytes(input.StructuredBody, "stream").Bool())
-	require.Equal(t, "user", gjson.GetBytes(input.StructuredBody, "messages.0.role").String())
-	require.Equal(t, float64(3000), gjson.GetBytes(input.StructuredBody, "max_tokens").Float())
+	require.True(t, ojson.GetBytes(input.StructuredBody, "stream").Bool())
+	require.Equal(t, "user", ojson.GetBytes(input.StructuredBody, "messages.0.role").String())
+	require.Equal(t, float64(3000), ojson.GetBytes(input.StructuredBody, "max_tokens").Float())
 }
 
 func TestResolveImageBillingExprRequestInputUsesNormalizedFieldsAndRawFallback(t *testing.T) {
@@ -87,8 +87,8 @@ func TestResolveImageBillingExprRequestInputUsesNormalizedFieldsAndRawFallback(t
 	input, err := ResolveIncomingBillingExprRequestInput(ctx, info)
 	require.NoError(t, err)
 	require.Equal(t, rawBody, input.Body)
-	require.Equal(t, "1024x1536", gjson.GetBytes(input.StructuredBody, "size").String())
-	require.Equal(t, float64(3), gjson.GetBytes(input.StructuredBody, "n").Float())
+	require.Equal(t, "1024x1536", ojson.GetBytes(input.StructuredBody, "size").String())
+	require.Equal(t, float64(3), ojson.GetBytes(input.StructuredBody, "n").Float())
 
 	cost, _, err := billingexpr.RunExprWithRequest(
 		`v2:rule("normalized", param("size") == "1024x1536", 2) * rule("raw-extra", param("vendor_mode") == "fast", 3)`,
@@ -120,6 +120,6 @@ func TestResolveMultipartImageBillingExprRequestInputUsesStructuredDTO(t *testin
 
 	require.NoError(t, err)
 	require.Empty(t, input.Body)
-	require.Equal(t, "transparent", gjson.GetBytes(input.StructuredBody, "background").String())
-	require.Equal(t, float64(2), gjson.GetBytes(input.StructuredBody, "n").Float())
+	require.Equal(t, "transparent", ojson.GetBytes(input.StructuredBody, "background").String())
+	require.Equal(t, float64(2), ojson.GetBytes(input.StructuredBody, "n").Float())
 }

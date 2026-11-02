@@ -21,7 +21,10 @@ import { t } from 'i18next'
 import { combineBillingExpr } from '@/features/pricing/lib/billing-expr'
 import { splitPluginBillingExprKey } from '@/features/pricing/lib/plugin-pricing'
 import type { PricingModel } from '@/features/pricing/types'
-import type { ModelRatioData } from '@/features/system-settings/models/model-pricing-core'
+import {
+  usesTaskModelPricing,
+  type ModelRatioData,
+} from '@/features/system-settings/models/model-pricing-core'
 import {
   buildModelSnapshots,
   type ModelPricingSnapshot,
@@ -101,7 +104,7 @@ export function pricingDisplayOptions(
   ) as PricingOptions
 }
 
-export type CacheWriteMode = 'none' | 'standard' | 'claude_ttl'
+export type CacheWriteMode = 'none' | 'standard' | 'claude_ttl' | 'openai_ttl'
 
 export type LegacyBillingDetails = {
   audio_input_price?: number
@@ -113,7 +116,12 @@ export type LegacyBillingDetails = {
 
 export function modelPricingDisplay(
   entry: Pick<ModelPricingEntry, 'model_name' | 'effective' | 'usage_schema'> &
-    Partial<Pick<ModelPricingEntry, 'configured' | 'cache_write_mode'>>
+    Partial<
+      Pick<
+        ModelPricingEntry,
+        'configured' | 'cache_write_mode' | 'plugin_variants'
+      >
+    >
 ): PricingModel {
   const values = entry.effective
   return {
@@ -138,6 +146,7 @@ export function modelPricingDisplay(
       !(
         entry.cache_write_mode === 'standard' ||
         entry.cache_write_mode === 'claude_ttl' ||
+        entry.cache_write_mode === 'openai_ttl' ||
         entry.configured?.CreateCacheRatio !== undefined
       )
         ? undefined
@@ -160,7 +169,13 @@ export function modelPricingDisplay(
       typeof values['billing_setting.billing_expr'] === 'string'
         ? values['billing_setting.billing_expr']
         : undefined,
-    billing_usage_schema: entry.usage_schema,
+    billing_usage_schema: usesTaskModelPricing(
+      pricingRow(entry.model_name, values),
+      entry.usage_schema,
+      entry.plugin_variants
+    )
+      ? entry.usage_schema
+      : undefined,
   }
 }
 

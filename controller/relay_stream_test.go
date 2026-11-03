@@ -272,6 +272,52 @@ func TestRelayKeepAliveHonorsStreamSettings(t *testing.T) {
 	}
 }
 
+func TestRelayKeepAliveConcurrentSettingsUpdate(t *testing.T) {
+	settings := operation_setting.GetGeneralSetting()
+	common.OptionMapRWMutex.RLock()
+	previousEnabled, previousInterval := settings.PingIntervalEnabled, settings.PingIntervalSeconds
+	common.OptionMapRWMutex.RUnlock()
+	previousCount, previousMedia := constant.CountToken, constant.GetMediaToken
+	constant.CountToken, constant.GetMediaToken = true, true
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		settings.PingIntervalEnabled, settings.PingIntervalSeconds = previousEnabled, previousInterval
+		common.OptionMapRWMutex.Unlock()
+		constant.CountToken, constant.GetMediaToken = previousCount, previousMedia
+	})
+	started, stop, stopped := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		common.OptionMapRWMutex.Lock()
+		settings.PingIntervalSeconds = 60
+		common.OptionMapRWMutex.Unlock()
+		close(started)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				common.OptionMapRWMutex.Lock()
+				settings.PingIntervalEnabled = !settings.PingIntervalEnabled
+				settings.PingIntervalSeconds = 60
+				common.OptionMapRWMutex.Unlock()
+			}
+		}
+	}()
+	defer func() { close(stop); <-stopped }()
+	<-started
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	body := `{"model":"claude-sonnet-4-20250514","max_tokens":16,"stream":true,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"!"}}]}]}`
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "claude-sonnet-4-20250514")
+	Relay(c, types.RelayFormatClaude)
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Contains(t, recorder.Header().Get("Content-Type"), "application/json")
+	assert.NotContains(t, recorder.Body.String(), ": PING")
+}
+
 func TestRelayStreamErrorAfterKeepAlive(t *testing.T) {
 	for _, format := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatOpenAI} {
 		t.Run(string(format), func(t *testing.T) {

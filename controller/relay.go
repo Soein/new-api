@@ -151,10 +151,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
-	generalSettings := operation_setting.GetGeneralSetting()
-	if relayFormat == types.RelayFormatClaude && relayInfo.IsStream && generalSettings.PingIntervalEnabled {
-		stopKeepAlive := helper.StartStreamKeepAlive(c, time.Duration(generalSettings.PingIntervalSeconds)*time.Second)
-		defer stopKeepAlive()
+	if relayFormat == types.RelayFormatClaude && relayInfo.IsStream {
+		if pingEnabled, pingInterval := operation_setting.GetPreHeaderPingPolicy(false); pingEnabled {
+			stopKeepAlive := helper.StartStreamKeepAlive(c, pingInterval)
+			defer stopKeepAlive()
+		}
 	}
 
 	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {

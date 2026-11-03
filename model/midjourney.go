@@ -26,10 +26,11 @@ type Midjourney struct {
 	Buttons     string `json:"buttons"`
 	Properties  string `json:"properties"`
 
-	TokenId           int    `json:"-" gorm:"default:0;index:idx_midjourney_token_billing,priority:1"`
-	BillingChannelId  int    `json:"-" gorm:"default:0"`
-	BillingStatus     string `json:"-" gorm:"type:varchar(16);index:idx_midjourney_user_billing,priority:2;index:idx_midjourney_token_billing,priority:2"`
-	BillingQuotaDelta int    `json:"-" gorm:"default:0"`
+	TokenId              int    `json:"-" gorm:"default:0;index:idx_midjourney_token_billing,priority:1"`
+	BillingChannelId     int    `json:"-" gorm:"default:0"`
+	BillingStatus        string `json:"-" gorm:"type:varchar(16);index:idx_midjourney_user_billing,priority:2;index:idx_midjourney_token_billing,priority:2"`
+	BillingQuotaDelta    int    `json:"-" gorm:"default:0"`
+	BillingQuotaReserved int    `json:"-" gorm:"->;column:billing_quota_reserved;type:bigint;not null;default:0"`
 }
 
 // TaskQueryParams 用于包含所有搜索条件的结构体，可以根据需求添加更多字段
@@ -127,8 +128,9 @@ func unfinishedMidjourneyTasksQuery(query *gorm.DB) *gorm.DB {
 		MidjourneyBillingStatusRefundPending,
 	}
 	return query.Where(
-		"progress != ? OR billing_status IN ? OR (status = ? AND quota > 0 AND (billing_status = ? OR billing_status = ? OR billing_status IS NULL))",
-		"100%", pendingBillingStatuses, "FAILURE", MidjourneyBillingStatusCharged, "",
+		"progress != ? OR (billing_quota_reserved > 0 AND (status IN ? OR billing_status = ?)) OR billing_status IN ? OR (status = ? AND quota > 0 AND (billing_status = ? OR billing_status = ? OR billing_status IS NULL))",
+		"100%", []string{"", "NOT_START", "SUBMITTED", "IN_PROGRESS", "SUCCESS", "FAILURE"}, MidjourneyBillingStatusRefunded,
+		pendingBillingStatuses, "FAILURE", MidjourneyBillingStatusCharged, "",
 	)
 }
 
@@ -183,7 +185,7 @@ func (midjourney *Midjourney) Insert() error {
 }
 
 func (midjourney *Midjourney) Update() error {
-	return DB.Omit("quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta").Save(midjourney).Error
+	return DB.Omit("quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta", "billing_quota_reserved").Save(midjourney).Error
 }
 
 func (midjourney *Midjourney) GetBillingChannelId() int {
@@ -202,7 +204,7 @@ func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) 
 	result := DB.Model(midjourney).
 		Where("status = ?", fromStatus).
 		Select("*").
-		Omit("quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta").
+		Omit("quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta", "billing_quota_reserved").
 		Updates(midjourney)
 	if result.Error != nil {
 		return false, result.Error

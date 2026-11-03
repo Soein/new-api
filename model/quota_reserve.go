@@ -3,9 +3,11 @@ package model
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type cacheQuotaResult int
@@ -147,7 +149,11 @@ func hasPendingMidjourneyBilling(column string, id int) (bool, error) {
 // caller may send an upstream request. Balance deltas are never kept only in
 // the in-process batch queue because Redis loss must be recoverable from DB.
 func persistUserQuotaDelta(id int, delta int) error {
-	query := DB.Model(&User{}).Where("id = ?", id)
+	return persistUserQuotaDeltaTx(DB, id, delta)
+}
+
+func persistUserQuotaDeltaTx(tx *gorm.DB, id int, delta int) error {
+	query := tx.Model(&User{}).Where("id = ?", id)
 	if delta < 0 {
 		query = query.Where("quota >= ?", -delta)
 	}
@@ -158,7 +164,7 @@ func persistUserQuotaDelta(id int, delta int) error {
 	if result.RowsAffected != 1 {
 		if delta < 0 {
 			var count int64
-			if countErr := DB.Model(&User{}).Where("id = ?", id).Count(&count).Error; countErr != nil {
+			if countErr := tx.Model(&User{}).Where("id = ?", id).Count(&count).Error; countErr != nil {
 				return countErr
 			}
 			if count == 0 {
@@ -169,6 +175,46 @@ func persistUserQuotaDelta(id int, delta int) error {
 		return gorm.ErrRecordNotFound
 	}
 	return nil
+}
+
+// debitUserQuotaWithBalance reads the balance after the conditional update in
+// the same transaction, while its write lock still excludes other mutations.
+func debitUserQuotaWithBalance(id int, quota int, change *common.WalletQuotaChange, reservation *WalletQuotaReservation) error {
+	if change == nil && reservation == nil {
+		return persistUserQuotaDelta(id, -quota)
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := persistUserQuotaDeltaTx(tx, id, -quota); err != nil {
+			if reservation != nil && errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrUserQuotaInsufficient
+			}
+			return err
+		}
+		if reservation != nil {
+			var current WalletQuotaReservation
+			result := tx.Where("request_id = ?", reservation.RequestID).Limit(1).Find(&current)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected > 0 && current.UserID != id {
+				return errors.New("wallet reservation owner mismatch")
+			}
+			amount := quota
+			if current.ExpiresAt > time.Now().UnixMilli() {
+				amount += current.Amount
+			}
+			return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "request_id"}}, DoUpdates: clause.Assignments(map[string]any{"amount": amount, "expires_at": reservation.ExpiresAt})}).
+				Create(&WalletQuotaReservation{RequestID: reservation.RequestID, UserID: id, Amount: amount, ExpiresAt: reservation.ExpiresAt}).Error
+		}
+		if change != nil {
+			balance, err := walletSettledBalanceTx(tx, id)
+			if err != nil {
+				return err
+			}
+			*change = common.WalletQuotaChange{Before: balance + quota, After: balance}
+		}
+		return nil
+	})
 }
 
 func persistTokenQuotaDelta(id int, delta int) error {
@@ -202,7 +248,14 @@ func persistTokenQuotaDelta(id int, delta int) error {
 	return nil
 }
 
-func reserveUserQuotaDB(id int, quota int) (bool, error) {
+func reserveUserQuotaDB(id int, quota int, reservation *WalletQuotaReservation) (bool, error) {
+	if reservation != nil {
+		err := debitUserQuotaWithBalance(id, quota, nil, reservation)
+		if errors.Is(err, ErrUserQuotaInsufficient) || errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return err == nil, err
+	}
 	result := DB.Model(&User{}).
 		Where("id = ? AND quota >= ?", id, quota).
 		Update("quota", gorm.Expr("quota - ?", quota))
@@ -226,6 +279,25 @@ func reserveTokenQuotaDB(id int, quota int) (bool, error) {
 // Redis failures fall back to the same conditional database update unless a
 // durable Midjourney billing mutation requires fail-closed reconciliation.
 func TryReserveUserQuota(id int, quota int) (bool, error) {
+	return tryReserveUserQuota(id, quota, nil)
+}
+
+// TryReserveWalletQuota reserves spendable money and creates or increases the
+// request's temporary reminder marker atomically. requestID must be globally
+// unique; expiresAt is a future Unix millisecond timestamp. Markers never admit
+// additional spending and may expire without changing real money.
+func TryReserveWalletQuota(id int, quota int, requestID string, expiresAt int64) (bool, error) {
+	if requestID == "" || expiresAt <= time.Now().UnixMilli() {
+		return false, errors.New("wallet reservation lease is invalid")
+	}
+	reserved, err := tryReserveUserQuota(id, quota, &WalletQuotaReservation{RequestID: requestID, UserID: id, Amount: quota, ExpiresAt: expiresAt})
+	if err == nil && reserved {
+		maybeCleanupWalletQuotaReservations(time.Now().UnixMilli())
+	}
+	return reserved, err
+}
+
+func tryReserveUserQuota(id int, quota int, reservation *WalletQuotaReservation) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota cannot be negative")
 	}
@@ -233,7 +305,7 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 		return true, nil
 	}
 	if !common.RedisEnabled {
-		return reserveUserQuotaDB(id, quota)
+		return reserveUserQuotaDB(id, quota, reservation)
 	}
 
 	result, err := cacheTryReserveUserQuota(id, int64(quota))
@@ -255,7 +327,7 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 		if err != nil {
 			common.SysLog(common.LogText("user quota cache reserve unavailable, falling back to database: %s", err.Error()))
 		}
-		return reserveUserQuotaDB(id, quota)
+		return reserveUserQuotaDB(id, quota, reservation)
 	}
 	if result == cacheQuotaInsufficient {
 		return false, nil
@@ -263,7 +335,7 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 	if result == cacheQuotaFenced {
 		return false, ErrQuotaCacheMutationPending
 	}
-	if err = persistUserQuotaDelta(id, -quota); err != nil {
+	if err = debitUserQuotaWithBalance(id, quota, nil, reservation); err != nil {
 		compensated, compensateErr := cacheApplyUserQuotaDelta(id, int64(quota))
 		if compensateErr != nil || compensated != cacheQuotaOK {
 			common.SysError(common.LogText("failed to compensate reserved user quota: result=%d error=%v", compensated, compensateErr))

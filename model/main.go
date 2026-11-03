@@ -351,6 +351,7 @@ func migrateDB() error {
 		&Token{},
 		&User{},
 		&UserQuotaDebt{},
+		&WalletQuotaReservation{},
 		&UserSession{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},

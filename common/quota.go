@@ -12,6 +12,9 @@ var UserQuotaRedisLockEnabled = true
 var UserQuotaLockWaitTimeout = time.Minute
 var UserQuotaLockLease = 2 * time.Minute
 
+// WalletQuotaReservationLease is loaded at startup and governs reminder markers only.
+var WalletQuotaReservationLease = 2 * time.Minute
+
 // UserQuotaMaxDebtUsd bounds the negative value kept on users.quota. Charges
 // beyond this floor remain payable and are recorded in user_quota_debts.
 var UserQuotaMaxDebtUsd = 0.0
@@ -33,4 +36,13 @@ func GetUserQuotaMaxDebtQuota() int {
 		return 0
 	}
 	return QuotaFromFloat(UserQuotaMaxDebtUsd * QuotaPerUnit)
+}
+
+// GetWalletQuotaReservationLease controls only temporary reminder accounting;
+// expiration never refunds or settles real wallet money.
+func GetWalletQuotaReservationLease() time.Duration {
+	if WalletQuotaReservationLease <= 0 {
+		return 2 * time.Minute
+	}
+	return WalletQuotaReservationLease
 }

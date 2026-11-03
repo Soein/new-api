@@ -145,6 +145,9 @@ func StartSystemTaskRunner() {
 					if err := model.ExpireStaleSystemTaskLocks(common.GetTimestamp()); err != nil {
 						logger.LogWarn(context.Background(), common.LogText("system task stale lock cleanup failed: %v", err))
 					}
+					if _, err := model.CleanupExpiredWalletQuotaReservations(now.UnixMilli(), 1000); err != nil {
+						logger.LogWarn(context.Background(), common.LogText("wallet reminder reservation cleanup failed: %v", err))
+					}
 				}
 				if now.Sub(lastScheduler) >= systemTaskSchedulerInterval {
 					lastScheduler = now

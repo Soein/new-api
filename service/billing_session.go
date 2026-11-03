@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -49,11 +50,11 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.releaseTrustInflightLocked()
-	if s.settled {
+	if s.settled || s.refunded {
 		return nil
 	}
 	delta := actualQuota - s.preConsumedQuota
-	if delta == 0 {
+	if delta == 0 && s.funding.Source() != BillingSourceWallet {
 		s.settled = true
 		return nil
 	}
@@ -66,7 +67,7 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	}
 	// 2) 调整令牌额度
 	var tokenErr error
-	if !s.relayInfo.IsPlayground {
+	if !s.relayInfo.IsPlayground && delta != 0 {
 		if delta > 0 {
 			tokenErr = model.DecreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta)
 		} else {
@@ -153,6 +154,9 @@ func (s *BillingSession) needsRefundLocked() bool {
 		return false
 	}
 	if s.tokenConsumed > 0 {
+		return true
+	}
+	if wallet, ok := s.funding.(*WalletFunding); ok && wallet.consumed > 0 {
 		return true
 	}
 	if s.trustInflight > 0 {
@@ -296,12 +300,11 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 			}
 			return nil
 		}
-		// 与结算补扣（SettleBilling 正差额 → WalletFunding.Settle）语义一致：
-		// 全额无条件扣减，余额不足的部分记为欠费（余额可为负），不中断请求，
-		// 保证日志记录的预扣额度与用户余额的实际变动始终对账一致。
-		// DecreaseUserQuota 仅在数据库错误时失败。
-		if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
-			if errors.Is(err, model.ErrUserQuotaInsufficient) {
+		// Extra reservations still require available wallet quota. Only final
+		// settlement may record already-incurred usage as debt.
+		err := funding.PreConsume(delta)
+		if err != nil {
+			if errors.Is(err, model.ErrUserQuotaInsufficient) || errors.Is(err, ErrInsufficientWalletQuota) {
 				return types.NewErrorWithStatusCode(
 					fmt.Errorf("用户额度不足, 需要补扣费额度: %s", logger.FormatQuota(delta)),
 					types.ErrorCodeInsufficientUserQuota,
@@ -312,7 +315,6 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 			}
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 		}
-		funding.consumed += delta
 		return nil
 	case *SubscriptionFunding:
 		if err := model.PostConsumeUserSubscriptionDelta(funding.subscriptionId, int64(delta)); err != nil {
@@ -333,7 +335,7 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 func (s *BillingSession) rollbackFundingReserve(delta int) {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if err := model.IncreaseUserQuota(funding.userId, delta, false); err != nil {
+		if err := model.RollbackWalletQuotaReservation(funding.userId, delta, funding.reservationID); err != nil {
 			common.SysLog(common.LogText("error rolling back wallet funding reserve: %s", err.Error()))
 		} else {
 			funding.consumed -= delta
@@ -479,10 +481,14 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 				types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
 		relayInfo.UserQuota = userQuota
+		leaseContext := context.Background()
+		if c.Request != nil {
+			leaseContext = c.Request.Context()
+		}
 
 		session := &BillingSession{
 			relayInfo: relayInfo,
-			funding:   &WalletFunding{userId: relayInfo.UserId},
+			funding:   &WalletFunding{userId: relayInfo.UserId, captureBalance: quotaReminderEnabled(relayInfo.UserSetting), leaseContext: leaseContext},
 			lang:      i18n.StatedLang(c),
 		}
 		if apiErr := session.preConsume(c, preConsumedQuota); apiErr != nil {

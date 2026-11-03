@@ -114,6 +114,11 @@ func InitEnv() {
 	UserQuotaRedisLockEnabled = GetEnvOrDefaultBool("USER_QUOTA_REDIS_LOCK_ENABLED", true)
 	UserQuotaLockWaitTimeout = time.Duration(GetEnvOrDefault("USER_QUOTA_LOCK_WAIT_TIMEOUT_MS", 60_000)) * time.Millisecond
 	UserQuotaLockLease = time.Duration(GetEnvOrDefault("USER_QUOTA_LOCK_LEASE_MS", 120_000)) * time.Millisecond
+	walletLeaseMS := GetEnvOrDefault("WALLET_QUOTA_RESERVATION_LEASE_MS", 120_000)
+	if walletLeaseMS <= 0 || int64(walletLeaseMS) > int64((1<<63-1)/time.Millisecond) {
+		walletLeaseMS = 120_000
+	}
+	WalletQuotaReservationLease = time.Duration(walletLeaseMS) * time.Millisecond
 	UserQuotaMaxDebtUsd = GetEnvOrDefaultFloat64("USER_QUOTA_MAX_DEBT_USD", 0)
 	if UserQuotaMaxDebtUsd < 0 {
 		SysLog("USER_QUOTA_MAX_DEBT_USD cannot be negative; using 0")

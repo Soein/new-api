@@ -267,7 +267,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 		service.MarkRequestPolicySuccess(c, nil)
 	}
 	if billingApplied && shouldBill {
-		service.NotifyMidjourneyQuota(info, midjourneyTask.Quota)
+		service.NotifyMidjourneyQuota(info, midjourneyTask)
 		billingChannelId := midjourneyTask.GetBillingChannelId()
 		tokenName := c.GetString("token_name")
 		logContent := []*common.Message{common.NewMessage("Model fixed price {{model_price}}, group ratio {{group_ratio}}, action {{action}}", map[string]any{
@@ -668,7 +668,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		service.MarkRequestPolicySuccess(c, nil)
 	}
 	if billingApplied {
-		service.NotifyMidjourneyQuota(relayInfo, midjourneyTask.Quota)
+		service.NotifyMidjourneyQuota(relayInfo, midjourneyTask)
 		billingChannelId := midjourneyTask.GetBillingChannelId()
 		tokenName := c.GetString("token_name")
 		logContent := []*common.Message{common.NewMessage("Model fixed price {{model_price}}, group ratio {{group_ratio}}, action {{action}}, ID {{id}}", map[string]any{

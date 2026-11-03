@@ -94,8 +94,9 @@ type User struct {
 	AccessToken          *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // Deprecated: legacy dashboard token retained during the scoped-token transition
 	AccessTokenCreatedAt *int64                     `json:"-" gorm:"type:bigint;column:access_token_created_at"`
 	Quota                int                        `json:"quota" gorm:"type:bigint;default:0"`
-	UsedQuota            int                        `json:"used_quota" gorm:"type:bigint;default:0;column:used_quota"` // used quota
-	RequestCount         int                        `json:"request_count" gorm:"type:int;default:0;"`                  // request number
+	QuotaReserved        int                        `json:"-" gorm:"->;column:quota_reserved;type:bigint;not null;default:0"` // Durable Midjourney reservations; ordinary requests use leased markers.
+	UsedQuota            int                        `json:"used_quota" gorm:"type:bigint;default:0;column:used_quota"`        // used quota
+	RequestCount         int                        `json:"request_count" gorm:"type:int;default:0;"`                         // request number
 	Group                string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
 	AffCode              string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
 	AffCount             int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
@@ -1640,10 +1641,33 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	})
 }
 
+// DecreaseUserQuotaWithBalance returns the committed balances for a debit that
+// must be covered by available wallet quota. It keeps the usual cache update.
+func DecreaseUserQuotaWithBalance(id int, quota int) (common.WalletQuotaChange, error) {
+	var change common.WalletQuotaChange
+	if quota < 0 {
+		return change, errors.New("quota cannot be negative")
+	}
+	if quota == 0 {
+		return change, nil
+	}
+	err := withUserQuotaMutation(id, func() error {
+		if err := debitUserQuotaWithBalance(id, quota, &change, nil); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrUserQuotaInsufficient
+			}
+			return err
+		}
+		updateUserQuotaCacheDelta(id, -quota)
+		return nil
+	})
+	return change, err
+}
+
 // DecreaseUserQuotaForSettlement records costs that have already happened
 // upstream. Pre-consume paths must use DecreaseUserQuota instead so they cannot
 // overdraw and release new requests without enough balance.
-func DecreaseUserQuotaForSettlement(id int, quota int) (err error) {
+func DecreaseUserQuotaForSettlement(id int, quota int) error {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}

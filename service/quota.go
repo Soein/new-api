@@ -442,7 +442,15 @@ func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQu
 	} else {
 		// Wallet
 		if quota > 0 {
-			err = model.DecreaseUserQuota(relayInfo.UserId, quota, false)
+			if sendEmail && quotaReminderEnabled(relayInfo.UserSetting) {
+				var change common.WalletQuotaChange
+				change, err = model.DecreaseUserQuotaWithBalance(relayInfo.UserId, quota)
+				if err == nil {
+					relayInfo.WalletQuotaChanges = append(relayInfo.WalletQuotaChanges, change)
+				}
+			} else {
+				err = model.DecreaseUserQuota(relayInfo.UserId, quota, false)
+			}
 		} else {
 			err = model.IncreaseUserQuota(relayInfo.UserId, -quota, false)
 		}
@@ -464,22 +472,67 @@ func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQu
 
 	if sendEmail {
 		if (quota + preConsumedQuota) != 0 {
-			checkAndSendQuotaNotify(relayInfo, quota, preConsumedQuota)
+			if relayInfo.BillingSource == BillingSourceSubscription {
+				checkAndSendSubscriptionQuotaNotify(relayInfo)
+			} else {
+				checkAndSendQuotaNotify(relayInfo, quota, preConsumedQuota)
+			}
 		}
 	}
 
 	return nil
 }
 
-func checkAndSendQuotaNotify(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int) {
-	gopool.Go(func() {
-		userSetting := relayInfo.UserSetting
-		// UserQuota is the balance before this request; quota plus
-		// preConsumedQuota is what the request finally cost.
-		balanceAfter := relayInfo.UserQuota - (quota + preConsumedQuota)
-		if !quotaReminderDue(userSetting, int64(relayInfo.UserQuota), int64(balanceAfter)) {
-			return
+// claimWalletQuotaReminder consumes confirmed settlement snapshots once. Other
+// requests' pending reservations do not count as spending or create a crossing.
+func claimWalletQuotaReminder(relayInfo *relaycommon.RelayInfo, actualQuota int) (int, bool) {
+	if relayInfo == nil || actualQuota <= 0 {
+		return 0, false
+	}
+	var changes []common.WalletQuotaChange
+	if session, ok := relayInfo.Billing.(*BillingSession); ok {
+		session.mu.Lock()
+		if funding, wallet := session.funding.(*WalletFunding); wallet && session.settled && !session.refunded {
+			changes = append(changes, funding.quotaChanges...)
+			funding.quotaChanges = nil
 		}
+		session.mu.Unlock()
+	} else {
+		changes = relayInfo.WalletQuotaChanges
+		relayInfo.WalletQuotaChanges = nil
+	}
+	userSetting := relayInfo.UserSetting
+	crossed := false
+	var balanceBefore int
+	for _, change := range changes {
+		if quotaReminderDue(userSetting, int64(change.Before), int64(change.After)) {
+			crossed = true
+			balanceBefore = change.Before
+			break
+		}
+	}
+	if !crossed {
+		return 0, false
+	}
+	// A top-up may have restored the confirmed balance before notification.
+	balanceAfter, err := model.GetWalletSettledQuota(relayInfo.UserId)
+	if err != nil {
+		common.SysError(common.LogText("failed to get user quota: %s", err.Error()))
+		return 0, false
+	}
+	if !quotaReminderDue(userSetting, int64(balanceBefore), int64(balanceAfter)) {
+		return 0, false
+	}
+	return balanceAfter, true
+}
+
+func checkAndSendQuotaNotify(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int) {
+	balanceAfter, due := claimWalletQuotaReminder(relayInfo, quota+preConsumedQuota)
+	if !due {
+		return
+	}
+	userSetting := relayInfo.UserSetting
+	gopool.Go(func() {
 		lang := userSetting.Language
 		prompt := i18n.Translate(lang, i18n.MsgNotifyQuotaLowTitle)
 		content, values := quotaNotifyContent(lang, userSetting.NotifyType, prompt, logger.FormatQuota(balanceAfter))
@@ -523,17 +576,29 @@ func checkAndSendSubscriptionQuotaNotify(relayInfo *relaycommon.RelayInfo) {
 // already below the threshold earns nothing more until a top-up lifts it back
 // above, so a user gets one reminder per drop.
 func quotaReminderDue(userSetting dto.UserSetting, before int64, after int64) bool {
-	if !common.QuotaRemindEnabled {
+	enabled, threshold := quotaReminderConfig(userSetting)
+	if !enabled {
 		return false
 	}
+	return float64(before) >= threshold && float64(after) < threshold
+}
+
+func quotaReminderEnabled(userSetting dto.UserSetting) bool {
+	enabled, _ := quotaReminderConfig(userSetting)
+	return enabled
+}
+
+func quotaReminderConfig(userSetting dto.UserSetting) (bool, float64) {
+	common.OptionMapRWMutex.RLock()
+	enabled, threshold := common.QuotaRemindEnabled, float64(common.QuotaRemindThreshold)
+	common.OptionMapRWMutex.RUnlock()
 	if userSetting.QuotaWarningEnabled != nil && !*userSetting.QuotaWarningEnabled {
-		return false
+		enabled = false
 	}
-	threshold := float64(common.QuotaRemindThreshold)
 	if userSetting.QuotaWarningThreshold != 0 {
 		threshold = userSetting.QuotaWarningThreshold
 	}
-	return float64(before) >= threshold && float64(after) < threshold
+	return enabled, threshold
 }
 
 // quotaNotifyContent renders a low-quota notice in the user's saved language.

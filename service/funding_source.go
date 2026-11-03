@@ -1,9 +1,11 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 )
 
@@ -33,8 +35,14 @@ type FundingSource interface {
 var ErrInsufficientWalletQuota = errors.New("wallet quota insufficient")
 
 type WalletFunding struct {
-	userId   int
-	consumed int // 实际预扣的用户额度
+	userId         int
+	consumed       int // 实际预扣的用户额度
+	captureBalance bool
+	quotaChanges   []common.WalletQuotaChange
+	reservationID  string
+	leaseContext   context.Context
+	leaseDuration  time.Duration
+	stopLease      func()
 }
 
 func (w *WalletFunding) Source() string { return BillingSourceWallet }
@@ -43,7 +51,13 @@ func (w *WalletFunding) PreConsume(amount int) error {
 	if amount <= 0 {
 		return nil
 	}
-	reserved, err := model.TryReserveUserQuota(w.userId, amount)
+	if w.reservationID == "" {
+		w.reservationID = common.GetUUID()
+	}
+	if w.leaseDuration <= 0 {
+		w.leaseDuration = common.GetWalletQuotaReservationLease()
+	}
+	reserved, err := model.TryReserveWalletQuota(w.userId, amount, w.reservationID, time.Now().Add(w.leaseDuration).UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -52,26 +66,36 @@ func (w *WalletFunding) PreConsume(amount int) error {
 	}
 	// 发送前补扣会再次预扣，累加后退款才能退回全部预扣。
 	w.consumed += amount
+	if w.stopLease == nil && w.leaseContext != nil && w.leaseContext.Done() != nil {
+		w.stopLease = walletReservationLeases.add(w.leaseContext, w.reservationID, w.leaseDuration)
+	}
 	return nil
 }
 
 func (w *WalletFunding) Settle(delta int) error {
-	if delta == 0 {
-		return nil
+	defer w.stopReservationLease()
+	change, err := model.SettleWalletQuotaReservation(w.userId, w.consumed, w.consumed+delta, w.reservationID, w.captureBalance)
+	if err == nil && w.captureBalance {
+		w.quotaChanges = append(w.quotaChanges, change)
 	}
-	if delta > 0 {
-		return model.DecreaseUserQuotaForSettlement(w.userId, delta)
-	}
-	return model.IncreaseUserQuota(w.userId, -delta, false)
+	return err
 }
 
 func (w *WalletFunding) Refund() error {
+	defer w.stopReservationLease()
 	if w.consumed <= 0 {
 		return nil
 	}
 	// IncreaseUserQuota 是 quota += N 的非幂等操作，不能重试，否则会多退额度。
 	// 订阅的 RefundSubscriptionPreConsume 有 requestId 幂等保护所以可以重试。
-	return model.IncreaseUserQuota(w.userId, w.consumed, false)
+	return model.RefundWalletQuotaReservation(w.userId, w.consumed, w.reservationID)
+}
+
+func (w *WalletFunding) stopReservationLease() {
+	if w.stopLease != nil {
+		w.stopLease()
+		w.stopLease = nil
+	}
 }
 
 // ---------------------------------------------------------------------------

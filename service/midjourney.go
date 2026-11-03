@@ -123,8 +123,41 @@ func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.M
 
 // NotifyMidjourneyQuota sends the low-balance notification only after the
 // upstream has explicitly accepted the charged task.
-func NotifyMidjourneyQuota(relayInfo *relaycommon.RelayInfo, quota int) {
-	checkAndSendQuotaNotify(relayInfo, quota, 0)
+func NotifyMidjourneyQuota(relayInfo *relaycommon.RelayInfo, task *model.Midjourney) {
+	confirmMidjourneyQuota(relayInfo, task)
+}
+
+// confirmMidjourneyQuota is shared by foreground acceptance and recovery, so
+// whichever finalizes the durable reservation also sends its reminder.
+func confirmMidjourneyQuota(relayInfo *relaycommon.RelayInfo, task *model.Midjourney) bool {
+	if task == nil || task.BillingQuotaReserved == 0 {
+		return true
+	}
+	switch task.Status {
+	case constant.MjStatusReserving, constant.MjStatusSubmitting, constant.MjStatusSubmitUnknown, "FAILURE":
+		return true
+	}
+	if relayInfo == nil {
+		relayInfo = &relaycommon.RelayInfo{UserId: task.UserId}
+		if quotaReminderEnabled(relayInfo.UserSetting) {
+			user, err := model.GetUserById(task.UserId, false)
+			if err != nil {
+				return false
+			}
+			relayInfo.UserEmail = user.Email
+			relayInfo.UserSetting = user.GetSetting()
+		}
+	}
+	change, err := task.ConfirmBilling(quotaReminderEnabled(relayInfo.UserSetting))
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to confirm Midjourney wallet quota for task %d: %s", task.Id, err))
+		return false
+	}
+	if change != nil {
+		relayInfo.WalletQuotaChanges = append(relayInfo.WalletQuotaChanges, *change)
+	}
+	checkAndSendQuotaNotify(relayInfo, task.Quota, 0)
+	return true
 }
 
 // ReconcileMidjourneyTaskBilling resumes a durable charge or refund left
@@ -157,14 +190,18 @@ func ReconcileMidjourneyTaskBilling(ctx context.Context, task *model.Midjourney)
 		if failed && task.Quota > 0 {
 			return RefundMidjourneyQuota(ctx, task, "任务失败退款重试")
 		}
-		return true
+		return confirmMidjourneyQuota(nil, task)
 	case model.MidjourneyBillingStatusRefunding, model.MidjourneyBillingStatusRefundPending:
 		return RefundMidjourneyQuota(ctx, task, "退款状态恢复")
 	case "":
 		if failed && task.Quota > 0 {
 			return RefundMidjourneyQuota(ctx, task, "历史任务失败退款重试")
 		}
-		return true
+		_, err := task.ConfirmBilling(false)
+		return err == nil
+	case model.MidjourneyBillingStatusRefunded:
+		_, err := task.ConfirmBilling(false)
+		return err == nil
 	default:
 		logger.LogWarn(ctx, fmt.Sprintf("未知的 Midjourney 计费状态 task %s: %s", task.MjId, task.BillingStatus))
 		return false
@@ -179,6 +216,9 @@ func reconcileMidjourneyCharge(ctx context.Context, task *model.Midjourney) bool
 	result, err := task.SettleBilling(tokenKey)
 	if err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("恢复 Midjourney 扣费失败 task %s: %s", task.MjId, err.Error()))
+		return false
+	}
+	if !confirmMidjourneyQuota(nil, task) {
 		return false
 	}
 	if !result.Applied {

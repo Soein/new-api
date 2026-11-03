@@ -186,6 +186,9 @@ type RelayInfo struct {
 	// BillingSource indicates whether this request is billed from wallet quota or subscription.
 	// "" or "wallet" => wallet; "subscription" => subscription
 	BillingSource string
+	// WalletQuotaChanges carries committed legacy debits until their accepted
+	// request sends its reminder. BillingSession keeps its changes under its lock.
+	WalletQuotaChanges []common.WalletQuotaChange
 	// SubscriptionId is the user_subscriptions.id used when BillingSource == "subscription"
 	SubscriptionId int
 	// SubscriptionPreConsumed is the amount pre-consumed on subscription item (quota units or 1)

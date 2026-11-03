@@ -16,6 +16,13 @@ const (
 	MaxWalletQuota = 1<<53 - 1
 )
 
+// WalletQuotaChange holds the confirmed wallet balances around a charge,
+// excluding other requests' outstanding reservations.
+type WalletQuotaChange struct {
+	Before int
+	After  int
+}
+
 // ValidateWalletQuota enforces the upper bound shared by wallet mutations.
 // Negative balances remain valid because billing can temporarily overdraw a
 // wallet; callers that accept credits must apply their own positive check.

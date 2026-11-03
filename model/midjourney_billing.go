@@ -5,7 +5,9 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -151,9 +153,72 @@ func (midjourney *Midjourney) SettleBilling(tokenKey string) (result MidjourneyB
 	return result, nil
 }
 
+// ConfirmBilling finalizes the pending wallet reservation after a persisted
+// upstream acceptance. Its task marker makes duplicate and recovery calls safe.
+func (midjourney *Midjourney) ConfirmBilling(captureBalance bool) (*common.WalletQuotaChange, error) {
+	if midjourney == nil || midjourney.Id == 0 || midjourney.UserId <= 0 {
+		return nil, errors.New("midjourney task must be persisted before confirming billing")
+	}
+	var change *common.WalletQuotaChange
+	finalized := false
+	err := withUserQuotaMutation(midjourney.UserId, func() error {
+		return DB.Transaction(func(tx *gorm.DB) error {
+			var current Midjourney
+			if err := lockForUpdate(tx).Select("id", "user_id", "quota", "billing_status", "billing_quota_reserved", "status").First(&current, midjourney.Id).Error; err != nil {
+				return err
+			}
+			if current.UserId != midjourney.UserId {
+				return errors.New("midjourney billing user changed")
+			}
+			if current.BillingQuotaReserved == 0 {
+				return nil
+			}
+			switch current.BillingStatus {
+			case MidjourneyBillingStatusCharged:
+				switch current.Status {
+				case "", "NOT_START", "SUBMITTED", "IN_PROGRESS", "SUCCESS":
+				case constant.MjStatusReserving, constant.MjStatusSubmitting, constant.MjStatusSubmitUnknown, "FAILURE":
+					return nil
+				default:
+					return fmt.Errorf("cannot confirm Midjourney submission from status %q", current.Status)
+				}
+			case MidjourneyBillingStatusRefunded:
+			default:
+				return fmt.Errorf("cannot confirm Midjourney billing from status %q", current.BillingStatus)
+			}
+			var err error
+			change, err = finalizeMidjourneyWalletReservationTx(tx, &current, captureBalance && current.BillingStatus == MidjourneyBillingStatusCharged)
+			finalized = err == nil
+			return err
+		})
+	})
+	if err == nil && finalized {
+		midjourney.BillingQuotaReserved = 0
+	}
+	return change, err
+}
+
+func finalizeMidjourneyWalletReservationTx(tx *gorm.DB, task *Midjourney, captureBalance bool) (*common.WalletQuotaChange, error) {
+	if task.BillingQuotaReserved == 0 {
+		return nil, nil
+	}
+	settled, _, err := settleWalletQuotaReservationTx(tx, task.UserId, task.BillingQuotaReserved, task.BillingQuotaReserved, captureBalance, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Model(&Midjourney{}).Where("id = ?", task.Id).
+		Clauses(clause.Assignments(map[string]any{"billing_quota_reserved": 0})).Updates(nil).Error; err != nil {
+		return nil, err
+	}
+	if !captureBalance {
+		return nil, nil
+	}
+	return &settled, nil
+}
+
 func getMidjourneyBillingTask(taskId int) (Midjourney, error) {
 	var task Midjourney
-	err := DB.Select("id", "user_id", "channel_id", "quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta").
+	err := DB.Select("id", "user_id", "channel_id", "quota", "token_id", "billing_channel_id", "billing_status", "billing_quota_delta", "billing_quota_reserved", "status").
 		Where("id = ?", taskId).
 		First(&task).Error
 	return task, err
@@ -189,8 +254,8 @@ func settleMidjourneyBillingInDB(task *Midjourney) error {
 		}
 		if task.Quota > 0 {
 			updated := tx.Model(&User{}).
-				Where("id = ? AND quota >= ?", task.UserId, task.Quota).
-				Update("quota", gorm.Expr("quota - ?", task.Quota))
+				Where("id = ? AND quota >= ? AND quota_reserved <= ?", task.UserId, task.Quota, common.MaxWalletQuota-task.Quota).
+				Clauses(clause.Assignments(map[string]any{"quota": gorm.Expr("quota - ?", task.Quota), "quota_reserved": gorm.Expr("quota_reserved + ?", task.Quota)})).Updates(nil)
 			if updated.Error != nil {
 				return updated.Error
 			}
@@ -240,7 +305,7 @@ func settleMidjourneyBillingInDB(task *Midjourney) error {
 		}
 		return tx.Model(&Midjourney{}).
 			Where("id = ? AND billing_status = ?", task.Id, MidjourneyBillingStatusCharging).
-			Update("billing_status", MidjourneyBillingStatusChargePending).Error
+			Clauses(clause.Assignments(map[string]any{"billing_status": MidjourneyBillingStatusChargePending, "billing_quota_reserved": task.Quota})).Updates(nil).Error
 	})
 }
 
@@ -260,6 +325,7 @@ func copyMidjourneyBillingState(target *Midjourney, source *Midjourney) {
 	target.BillingChannelId = source.BillingChannelId
 	target.BillingStatus = source.BillingStatus
 	target.BillingQuotaDelta = source.BillingQuotaDelta
+	target.BillingQuotaReserved = source.BillingQuotaReserved
 }
 
 // CancelPreparedBilling clears a marker that never reached the charged state.
@@ -310,7 +376,17 @@ func (midjourney *Midjourney) RefundBilling(tokenKey string) (result MidjourneyB
 		}
 		if stored.Quota == 0 || stored.BillingStatus == MidjourneyBillingStatusRefunded {
 			result.Completed = true
-			return nil
+			if stored.BillingQuotaReserved == 0 {
+				return nil
+			}
+			return DB.Transaction(func(tx *gorm.DB) error {
+				var current Midjourney
+				if err := lockForUpdate(tx).First(&current, stored.Id).Error; err != nil {
+					return err
+				}
+				_, err := finalizeMidjourneyWalletReservationTx(tx, &current, false)
+				return err
+			})
 		}
 		if stored.BillingStatus == MidjourneyBillingStatusPrepared || stored.BillingStatus == MidjourneyBillingStatusCharging {
 			completed, cancelErr := cancelUnchargedMidjourneyBilling(&stored, tokenKey)
@@ -443,13 +519,18 @@ func refundMidjourneyBillingInDB(task *Midjourney) (quotaDelta int, err error) {
 	err = DB.Transaction(func(tx *gorm.DB) error {
 		var current Midjourney
 		if err := lockForUpdate(tx).
-			Select("id", "billing_status").
+			Select("id", "user_id", "billing_status", "billing_quota_reserved").
 			Where("id = ?", task.Id).
 			First(&current).Error; err != nil {
 			return err
 		}
 		if current.BillingStatus != MidjourneyBillingStatusRefunding {
 			return fmt.Errorf("midjourney refund cannot commit from status %q", current.BillingStatus)
+		}
+		if current.BillingQuotaReserved > 0 {
+			if _, err := finalizeMidjourneyWalletReservationTx(tx, &current, false); err != nil {
+				return err
+			}
 		}
 		var creditErr error
 		quotaDelta, creditErr = CreditUserQuotaWithTx(tx, task.UserId, task.Quota)
@@ -480,10 +561,11 @@ func refundMidjourneyBillingInDB(task *Midjourney) (quotaDelta int, err error) {
 		}
 		updated := tx.Model(&Midjourney{}).
 			Where("id = ? AND billing_status = ?", task.Id, MidjourneyBillingStatusRefunding).
-			Updates(map[string]interface{}{
-				"billing_status":      MidjourneyBillingStatusRefundPending,
-				"billing_quota_delta": quotaDelta,
-			})
+			Clauses(clause.Assignments(map[string]any{
+				"billing_status":         MidjourneyBillingStatusRefundPending,
+				"billing_quota_delta":    quotaDelta,
+				"billing_quota_reserved": 0,
+			})).Updates(nil)
 		if updated.Error != nil {
 			return updated.Error
 		}

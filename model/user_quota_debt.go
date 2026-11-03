@@ -156,38 +156,37 @@ func debitUserQuotaForSettlement(userID int, amount int) (int, error) {
 	var quotaDelta int
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var user User
-		if err := lockForUpdate(tx).Select("id", "quota").Where("id = ?", userID).First(&user).Error; err != nil {
+		if err := lockForUpdate(tx).Select("id", "quota").First(&user, userID).Error; err != nil {
 			return err
 		}
-
-		current := int64(user.Quota)
-		target := current - int64(amount)
-		floor := -int64(common.GetUserQuotaMaxDebtQuota())
-		bounded := target
-		if bounded < floor {
-			bounded = floor
-		}
-		quotaDelta = int(bounded - current)
-
-		if quotaDelta != 0 {
-			if err := tx.Model(&User{}).Where("id = ?", userID).Update("quota", bounded).Error; err != nil {
-				return err
-			}
-		}
-
-		overflow := bounded - target
-		if overflow <= 0 {
-			return nil
-		}
-		now := time.Now().Unix()
-		return tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "user_id"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"amount":     gorm.Expr("user_quota_debts.amount + ?", overflow),
-				"updated_at": now,
-			}),
-		}).Create(&UserQuotaDebt{UserId: userID, Amount: overflow, UpdatedAt: now}).Error
+		var err error
+		quotaDelta, err = debitUserQuotaForSettlementTx(tx, &user, amount)
+		return err
 	})
+	return quotaDelta, err
+}
+
+// debitUserQuotaForSettlementTx requires the caller to hold the user's row lock.
+func debitUserQuotaForSettlementTx(tx *gorm.DB, user *User, amount int) (int, error) {
+	current := int64(user.Quota)
+	target := current - int64(amount)
+	floor := -int64(common.GetUserQuotaMaxDebtQuota())
+	bounded := max(target, floor)
+	quotaDelta := int(bounded - current)
+	if quotaDelta != 0 {
+		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update("quota", bounded).Error; err != nil {
+			return 0, err
+		}
+	}
+	overflow := bounded - target
+	if overflow <= 0 {
+		return quotaDelta, nil
+	}
+	now := time.Now().Unix()
+	err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "user_id"}},
+		DoUpdates: clause.Assignments(map[string]any{"amount": gorm.Expr("? + ?", clause.Column{Table: clause.CurrentTable, Name: "amount"}, overflow), "updated_at": now}),
+	}).Create(&UserQuotaDebt{UserId: user.Id, Amount: overflow, UpdatedAt: now}).Error
 	return quotaDelta, err
 }
 

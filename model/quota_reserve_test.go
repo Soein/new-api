@@ -1,15 +1,109 @@
 package model
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
+
+func TestWalletReservationUsesConfiguredTables(t *testing.T) {
+	previousDB, previousRedis, previousDebt := DB, common.RedisEnabled, common.UserQuotaMaxDebtUsd
+	t.Cleanup(func() { DB, common.RedisEnabled, common.UserQuotaMaxDebtUsd = previousDB, previousRedis, previousDebt })
+	common.RedisEnabled, common.UserQuotaMaxDebtUsd = false, 0
+	for _, prefix := range []string{"", "wallet-review_"} {
+		t.Run(fmt.Sprintf("prefix=%s", prefix), func(t *testing.T) {
+			db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: prefix, SingularTable: prefix != ""}})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			require.NoError(t, db.AutoMigrate(&User{}, &UserQuotaDebt{}, &Midjourney{}, &WalletQuotaReservation{}))
+			DB = db
+			user := createReserveTestUser(t, 120)
+			requestID := common.GetUUID()
+			reserved, err := TryReserveWalletQuota(user.Id, 30, requestID, time.Now().Add(time.Minute).UnixMilli())
+			require.NoError(t, err)
+			require.True(t, reserved)
+			confirmed, err := GetWalletSettledQuota(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 120, confirmed)
+			change, err := SettleWalletQuotaReservation(user.Id, 30, 25, requestID, true)
+			require.NoError(t, err)
+			assert.Equal(t, common.WalletQuotaChange{Before: 120, After: 95}, change)
+			require.NoError(t, DecreaseUserQuotaForSettlement(user.Id, 100))
+			require.NoError(t, DecreaseUserQuotaForSettlement(user.Id, 20))
+			debt, err := GetUserQuotaDebt(user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 25, debt)
+			require.NoError(t, SetUserQuota(user.Id, 120))
+			task := Midjourney{UserId: user.Id, Quota: 30, BillingStatus: MidjourneyBillingStatusPrepared}
+			require.NoError(t, db.Create(&task).Error)
+			applied, err := task.SettleBilling("")
+			require.NoError(t, err)
+			require.True(t, applied.Applied)
+			changePtr, err := task.ConfirmBilling(true)
+			require.NoError(t, err)
+			require.NotNil(t, changePtr)
+			assert.Equal(t, common.WalletQuotaChange{Before: 120, After: 90}, *changePtr)
+			refunded, err := task.RefundBilling("")
+			require.NoError(t, err)
+			require.True(t, refunded.Completed)
+			confirmed, err = GetWalletSettledQuota(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 120, confirmed)
+		})
+	}
+}
+
+func TestWalletReservationRejectsSoftDeletedUsers(t *testing.T) {
+	for _, mode := range []string{"database", "cached", "cache unavailable"} {
+		t.Run(mode, func(t *testing.T) {
+			truncateTables(t)
+			previousRedis := common.RedisEnabled
+			t.Cleanup(func() { common.RedisEnabled = previousRedis })
+			common.RedisEnabled = false
+			user := createReserveTestUser(t, 120)
+			if mode != "database" {
+				server := useUserCacheMiniRedis(t)
+				require.NoError(t, populateUserCache(user))
+				if mode == "cache unavailable" {
+					server.Close()
+				}
+			}
+			require.NoError(t, DB.Delete(&user).Error)
+			reserved, err := TryReserveWalletQuota(user.Id, 30, common.GetUUID(), time.Now().Add(time.Minute).UnixMilli())
+			require.NoError(t, err)
+			assert.False(t, reserved)
+			if mode == "cached" {
+				cached, err := common.RDB.Exists(t.Context(), getUserCacheKey(user.Id)).Result()
+				require.NoError(t, err)
+				assert.Zero(t, cached, "a rejected database debit must invalidate stale quota admission data")
+			}
+			_, err = DecreaseUserQuotaWithBalance(user.Id, 30)
+			require.ErrorIs(t, err, ErrUserQuotaInsufficient)
+			task := Midjourney{UserId: user.Id, Quota: 30, BillingStatus: MidjourneyBillingStatusPrepared}
+			require.NoError(t, DB.Create(&task).Error)
+			applied, err := task.SettleBilling("")
+			require.Error(t, err)
+			assert.False(t, applied.Applied)
+			var deleted User
+			require.NoError(t, DB.Unscoped().First(&deleted, user.Id).Error)
+			assert.Equal(t, 120, deleted.Quota)
+			assert.Zero(t, deleted.QuotaReserved)
+			_, err = GetWalletSettledQuota(user.Id)
+			require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		})
+	}
+}
 
 func createReserveTestUser(t *testing.T, quota int) User {
 	t.Helper()

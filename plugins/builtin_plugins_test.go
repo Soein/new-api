@@ -1,17 +1,109 @@
 package plugins
 
 import (
+	"encoding/base64"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu", "xai"}
+
+func TestBuiltInTaskPluginHistoryKeepsPreUpgradeTasksPollable(t *testing.T) {
+	service.InitHttpClient()
+	const taskID = "upstream-history"
+	const googleOperation = "models/veo-3.0-generate-001/operations/" + taskID
+	const vertexOperation = "projects/history-project/locations/us-central1/publishers/google/models/veo-3.0-generate-001/operations/" + taskID
+	// These hashes are the identities persisted before the built-ins were upgraded.
+	// Keep the fixtures independent of Git availability and of the archive bytes.
+	cases := []struct {
+		key, version, sourceHash string
+		model                    string
+		upstreamID, method, path string
+		requestBody, response    string
+		wantStatus               string
+	}{
+		{"alibaba", "1.4.2", "63ef98833760d0bdcdddc66ec9e1dbc12e43a1b6016cda9caa4f3d4bf329e546", "wan2.6-t2v", taskID, "GET", "/ali/api/v1/tasks/" + taskID, "", `{"output":{"task_status":"RUNNING"}}`, "IN_PROGRESS"},
+		{"doubao", "1.3.0", "b3ad4a16dfbf582bb2917c7a631fc46a8b36d5a8b2ad26c6dd160fd6f9ea3f1c", "doubao-seedance-1-0-pro-250528", taskID, "GET", "/doubao/api/v3/contents/generations/tasks/" + taskID, "", `{"status":"running"}`, "IN_PROGRESS"},
+		{"google", "1.1.0", "edb5107d2798d55028331f5d804976e1c8c12576eafea266fa8ae1b57b20d2c5", "veo-3.0-generate-001", base64.RawURLEncoding.EncodeToString([]byte(googleOperation)), "GET", "/google/v1beta/" + googleOperation, "", `{"name":"` + googleOperation + `"}`, "IN_PROGRESS"},
+		{"hailuo", "1.3.0", "773b9aa3449dcab67890e2ddad9530b8951f32026114d1abd4100469e0917324", "MiniMax-Hailuo-2.3", taskID, "GET", "/hailuo/v1/query/video_generation/" + taskID, "", `{"status":"Processing","base_resp":{"status_code":0}}`, "IN_PROGRESS"},
+		{"jimeng", "1.1.0", "8ca1acc9fff4abf6188234324f7e41407f037c37b098d7ff27ab9f1e5d162f67", "jimeng_vgfm_t2v_l20", taskID, "POST", "/jimeng/?Action=CVSync2AsyncGetResult&Version=2022-08-31", `{"req_key":"jimeng_vgfm_t2v_l20","task_id":"` + taskID + `"}`, `{"code":10000,"data":{"status":"in_queue"}}`, "QUEUED"},
+		{"kling", "1.1.0", "c297187e42ef290bcc56564571a5cfeffc78121ae3f69029168d109b55ae5106", "kling-v1", taskID, "GET", "/kling/v1/videos/text2video/" + taskID, "", `{"code":0,"data":{"task_id":"` + taskID + `","task_status":"processing"}}`, "IN_PROGRESS"},
+		{"vertex-ai", "1.1.0", "084e70d7578ad965f730741375d99f9c8ca2df81e64086c6e0b1ff7b145e84a6", "veo-3.0-generate-001", base64.RawURLEncoding.EncodeToString([]byte(vertexOperation)), "POST", "/vertex-ai/v1/projects/history-project/locations/us-central1/publishers/google/models/veo-3.0-generate-001:fetchPredictOperation", `{"operationName":"` + vertexOperation + `"}`, `{"name":"` + vertexOperation + `"}`, "IN_PROGRESS"},
+		{"vidu", "1.1.0", "d7252585c1de4caf3a255aff7c92ff27b54ddaaea27077cca3b72149642d2c5f", "viduq2", taskID, "GET", "/vidu/ent/v2/tasks/" + taskID + "/creations", "", `{"state":"processing"}`, "IN_PROGRESS"},
+		{"xai", "1.1.0", "9ec1f0514fae96ed945a493636ded0f280ae340a6fd493e108c7e18e665b52a7", "grok-imagine-video", taskID, "GET", "/xai/v1/videos/" + taskID, "", `{"status":"pending"}`, "IN_PROGRESS"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			current, found := jsplugin.DefaultRegistry.FactoryPlugin(tc.key)
+			require.True(t, found)
+			require.NotEqual(t, tc.version, current.Meta.Version)
+			task := &model.Task{
+				TaskID: "task_history", Action: "text_to_video", Status: model.TaskStatusInProgress,
+				Properties: model.Properties{OriginModelName: tc.model},
+				PrivateData: model.TaskPrivateData{
+					UpstreamTaskID: tc.upstreamID,
+					Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+						Key: tc.key, Version: tc.version, APIVersion: 1,
+						Layer: jsplugin.PluginLayerFactory, SourceHash: tc.sourceHash,
+					}},
+				},
+			}
+			plugin, _, restored := service.ResolveExactTaskPluginForTask(task)
+			require.True(t, restored, "the source pinned by an in-flight task must remain available")
+			require.NotNil(t, plugin)
+			require.Contains(t, plugin.Meta.Models, tc.model)
+			assert.Equal(t, tc.version, plugin.Meta.Version)
+			assert.Equal(t, tc.sourceHash, plugin.SourceHash)
+			assert.Equal(t, jsplugin.PluginLayerFactory, plugin.Layer)
+			active, found := jsplugin.DefaultRegistry.Generation().Get(tc.key)
+			require.True(t, found)
+			assert.Same(t, current, active, "restoring a historical task must keep the current source serving new requests")
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, tc.method, r.Method)
+				assert.Equal(t, tc.path, r.URL.RequestURI())
+				if tc.requestBody != "" {
+					body, err := io.ReadAll(r.Body)
+					if assert.NoError(t, err) {
+						assert.JSONEq(t, tc.requestBody, string(body))
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, err := io.WriteString(w, tc.response)
+				assert.NoError(t, err)
+			}))
+			defer server.Close()
+			adaptor := taskplugin.New(plugin)
+			adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI}})
+			response, err := adaptor.FetchTask(server.URL, "sk-history-fixture", task, "")
+			require.NoError(t, err)
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, response.Body.Close())
+			require.NoError(t, err)
+			result, err := adaptor.ParseTaskResult(task, response, body)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantStatus, result.Status)
+
+			task.PrivateData.Execution.TaskPlugin.SourceHash = current.SourceHash
+			_, _, restored = service.ResolveExactTaskPluginForTask(task)
+			assert.False(t, restored, "an old version with a different source hash must fail closed")
+		})
+	}
+}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()

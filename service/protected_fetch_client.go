@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -165,6 +166,70 @@ func (t *ssrfProtectedRoundTripper) newTransport(proxyURL *url.URL) *http.Transp
 		transport.TLSClientConfig = common.InsecureTLSConfig.Clone()
 	}
 	return transport
+}
+
+// NewSSRFProtectedRedirectTransport isolates an untrusted redirect from relay
+// connection pools and applies the configured fetch policy at dial time. With
+// domain IP filtering enabled, it connects only to the IPs it just validated.
+// Proxy and unknown transports are rejected because their target resolution
+// cannot be constrained here. The caller must strip credentials on every hop.
+func NewSSRFProtectedRedirectTransport(base http.RoundTripper, rawProxyURL string) (http.RoundTripper, error) {
+	netDialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return newSSRFProtectedRedirectTransport(base, rawProxyURL, &protectedFetchDialer{
+		resolver: net.DefaultResolver, dialContext: netDialer.DialContext, getProtection: currentFetchProtection,
+	})
+}
+
+func newSSRFProtectedRedirectTransport(base http.RoundTripper, rawProxyURL string, dialer *protectedFetchDialer) (http.RoundTripper, error) {
+	if strings.TrimSpace(rawProxyURL) != "" {
+		return nil, fmt.Errorf("task query public redirects cannot use a channel proxy")
+	}
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if sharded, ok := base.(*shardedRoundTripper); ok && sharded != nil {
+		protected := &shardedRoundTripper{n: sharded.n, policy: sharded.policy}
+		for _, shard := range sharded.shards {
+			transport, err := newSSRFProtectedRedirectTransport(shard, rawProxyURL, dialer)
+			if err != nil {
+				return nil, err
+			}
+			protected.shards = append(protected.shards, transport)
+		}
+		return protected, nil
+	}
+	transport, ok := base.(*http.Transport)
+	if !ok || transport == nil {
+		return nil, fmt.Errorf("task query public redirect uses an unsupported transport")
+	}
+	protected := transport.Clone()
+	protected.Proxy = func(req *http.Request) (*url.URL, error) {
+		if transport.Proxy != nil {
+			proxyURL, err := transport.Proxy(req)
+			if err != nil {
+				return nil, fmt.Errorf("task query public redirect proxy resolution failed")
+			}
+			if proxyURL != nil {
+				return nil, fmt.Errorf("task query public redirects cannot use an environment proxy")
+			}
+		}
+		return nil, nil
+	}
+	protected.DialContext = dialer.DialContext
+	protected.DialTLS, protected.DialTLSContext = nil, nil
+	// The operator's TLS exceptions and client identity belong to the channel,
+	// not to a redirect target outside its credential boundary.
+	if protected.TLSClientConfig != nil {
+		protected.TLSClientConfig.InsecureSkipVerify = false
+		protected.TLSClientConfig.ServerName = ""
+		protected.TLSClientConfig.Certificates = nil
+		protected.TLSClientConfig.GetClientCertificate = nil
+		protected.TLSClientConfig.ClientSessionCache = nil
+	}
+	// This transport belongs to one query; do not leave idle pools behind once
+	// the returned response body is eventually closed by its caller.
+	protected.DisableKeepAlives = true
+	return protected, nil
 }
 
 func (d *protectedFetchDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {

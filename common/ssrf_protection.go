@@ -288,6 +288,11 @@ func (p *SSRFProtection) ValidateNetworkTarget(host string, port int) error {
 	if host == "" {
 		return fmt.Errorf("invalid host")
 	}
+	// A zone selects a local interface, and net.ParseIP would otherwise let a
+	// scoped IPv6 literal fall through to the less restrictive domain policy.
+	if strings.Contains(host, "%") {
+		return fmt.Errorf("scoped IPv6 addresses are not allowed")
+	}
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("invalid port: %d", port)
 	}

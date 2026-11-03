@@ -653,7 +653,7 @@ func (f taskQueryRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	return f(req)
 }
 
-func TestTaskQueryRedirects(t *testing.T) {
+func TestTaskQueryRedirectPolicy(t *testing.T) {
 	service.InitHttpClient()
 	client := service.GetHttpClient()
 	originalClient := *client
@@ -686,8 +686,6 @@ export function parseBatchResult() {return [];}
 		allowedHosts   []string
 		status         int
 		body           string
-		batch          bool
-		ordered        bool
 		loop           bool
 		wantRequests   int
 		credentialHops int
@@ -721,12 +719,12 @@ export function parseBatchResult() {return [];}
 	}
 	for _, status := range []int{307, 308} {
 		cases = append(cases,
-			redirectCase{name: fmt.Sprintf("batch same origin body %d", status), status: status, body: `{"ids":["task"]}`, batch: true, locations: []string{"/final"}, wantRequests: 2, credentialHops: 2},
-			redirectCase{name: fmt.Sprintf("batch untrusted body %d", status), status: status, body: `{"ids":["task"]}`, batch: true, locations: []string{"https://cdn.example/final?key=location-secret"}, wantRequests: 1, credentialHops: 1, wantError: "cannot replay a body"},
-			redirectCase{name: fmt.Sprintf("batch authorized body %d", status), status: status, body: `{"ids":["task"]}`, batch: true, ordered: true, locations: []string{"https://cdn.example/final"}, allowedHosts: []string{"cdn.example"}, wantRequests: 2, credentialHops: 2},
+			redirectCase{name: fmt.Sprintf("batch same origin body %d", status), status: status, body: `{"ids":["task"]}`, locations: []string{"/final"}, wantRequests: 2, credentialHops: 2},
+			redirectCase{name: fmt.Sprintf("batch untrusted body %d", status), status: status, body: `{"ids":["task"]}`, locations: []string{"https://cdn.example/final?key=location-secret"}, wantRequests: 1, credentialHops: 1, wantError: "cannot replay a body"},
+			redirectCase{name: fmt.Sprintf("batch authorized body %d", status), status: status, body: `{"ids":["task"]}`, locations: []string{"https://cdn.example/final"}, allowedHosts: []string{"cdn.example"}, wantRequests: 2, credentialHops: 2},
 		)
 	}
-	cases = append(cases, redirectCase{name: "POST to GET across origins", status: 303, body: `{"ids":["task"]}`, batch: true, locations: []string{"https://cdn.example/final"}, wantRequests: 2, credentialHops: 1})
+	cases = append(cases, redirectCase{name: "POST to GET across origins", status: 303, body: `{"ids":["task"]}`, locations: []string{"https://cdn.example/final"}, wantRequests: 2, credentialHops: 1})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.start == "" {
@@ -743,9 +741,6 @@ export function parseBatchResult() {return [];}
 			if tc.body != "" {
 				descriptor.Method, descriptor.Body = http.MethodPost, tc.body
 			}
-			state, err := common.Marshal(descriptor)
-			require.NoError(t, err)
-			task := &model.Task{TaskID: "task", PrivateData: model.TaskPrivateData{PluginState: state}}
 			type sentRequest struct {
 				request *http.Request
 				body    string
@@ -772,23 +767,19 @@ export function parseBatchResult() {return [];}
 				}
 				return resp, nil
 			})
-			pluginSource := source
-			if len(tc.allowedHosts) > 0 {
-				hosts, marshalErr := common.Marshal(tc.allowedHosts)
-				require.NoError(t, marshalErr)
-				pluginSource = strings.Replace(pluginSource, `fetchMode:"batch"`, `fetchMode:"batch",allowedHosts:`+string(hosts), 1)
+			req, err := http.NewRequest(descriptor.Method, descriptor.URL, strings.NewReader(tc.body))
+			require.NoError(t, err)
+			for name, value := range descriptor.Headers {
+				req.Header.Set(name, value)
 			}
-			if tc.ordered {
-				pluginSource = strings.Replace(pluginSource, `fetchMode:"batch"`, `fetchMode:"batch",requiredCapabilities:["json-order@1"]`, 1)
-			}
-			plugin, registerErr := pluginruntime.NewRegistry().Register(pluginSource, pluginruntime.Options{})
-			require.NoError(t, registerErr)
-			adaptor := New(plugin)
-			var resp *http.Response
-			if tc.batch {
-				resp, err = adaptor.FetchBatchTasks(tc.start, "channel-secret", []*model.Task{task}, "")
-			} else {
-				resp, err = adaptor.FetchTask(tc.start, "channel-secret", task, "")
+			// Isolate HTTP redirect/header policy from the transport's DNS
+			// checks; the adaptor integration below exercises both together.
+			policy := &taskQueryRedirectPolicy{client: client, initial: req, baseURL: tc.start, allowedHosts: tc.allowedHosts}
+			queryClient := *client
+			queryClient.CheckRedirect = policy.checkRedirect
+			resp, err := queryClient.Do(req)
+			if policy.redirectPolicyErr != nil {
+				err = policy.redirectPolicyErr
 			}
 			if tc.wantError != "" {
 				require.ErrorContains(t, err, tc.wantError)
@@ -852,17 +843,23 @@ export function parseBatchResult() {return [];}
 	t.Run("real HTTP receivers do not receive cross origin credentials", func(t *testing.T) {
 		client.Transport = originalClient.Transport
 		fetchSetting.AllowPrivateIp = true
-		received := make(chan http.Header, 2)
+		received := make(chan http.Header, 3)
+		var originURL string
 		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			received <- r.Header.Clone()
-			_, _ = w.Write([]byte(`{"status":"SUCCESS"}`))
+			http.Redirect(w, r, originURL+"/returned", http.StatusFound)
 		}))
 		defer target.Close()
 		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			received <- r.Header.Clone()
+			if r.URL.Path == "/returned" {
+				_, _ = w.Write([]byte(`{"status":"SUCCESS"}`))
+				return
+			}
 			http.Redirect(w, r, target.URL+"/final", http.StatusFound)
 		}))
 		defer origin.Close()
+		originURL = origin.URL
 		resp, err := New(defaultPlugin).doFetchDescriptor(origin.URL, "", "", requestDescriptor{
 			URL:     origin.URL + "/query?key=query-secret",
 			Headers: map[string]string{"X-API-Key": "channel-secret", "x-goog-api-key": "channel-secret", "X-Vendor-Credential": "channel-secret"},
@@ -872,10 +869,13 @@ export function parseBatchResult() {return [];}
 		require.NoError(t, err)
 		require.NoError(t, resp.Body.Close())
 		assert.JSONEq(t, `{"status":"SUCCESS"}`, string(body))
-		initialHeaders, redirectedHeaders := <-received, <-received
+		initialHeaders := <-received
 		assert.Equal(t, "channel-secret", initialHeaders.Get("X-API-Key"))
-		for _, name := range []string{"X-API-Key", "X-Goog-Api-Key", "X-Vendor-Credential", "Referer"} {
-			assert.Empty(t, redirectedHeaders.Get(name), name)
+		for range 2 {
+			redirectedHeaders := <-received
+			for _, name := range []string{"X-API-Key", "X-Goog-Api-Key", "X-Vendor-Credential", "Referer"} {
+				assert.Empty(t, redirectedHeaders.Get(name), name)
+			}
 		}
 	})
 }
@@ -1613,9 +1613,11 @@ func TestSubmitContextExposesClientHeadersWithoutCredentials(t *testing.T) {
 	c.Request.Header.Set("TypeSafe-Danger-Zone-Long-Context", "true")
 	c.Request.Header.Add("X-Trace", "first")
 	c.Request.Header.Add("X-Trace", "second")
-	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "Mj-Api-Secret"} {
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "Mj-Api-Secret", "Sec-WebSocket-Protocol"} {
 		c.Request.Header.Set(name, "gateway-secret")
 	}
+	c.Request.Header["sEc-WeBsOcKeT-pRoToCoL"] = []string{"realtime, openai-insecure-api-key.gateway-secret"}
+	assert.NotContains(t, ClientRequestHeaders(c.Request.Header), "Sec-Websocket-Protocol")
 
 	headers := adaptor.submitContext(c, info)["requestHeaders"]
 
@@ -2984,4 +2986,27 @@ export function buildContentRequest(ctx) {
 			assert.Equal(t, "video/mp4", descriptor.MimeType)
 		})
 	}
+}
+
+func TestTaskQueryRejectsUntrustedRedirectThroughUnknownTransport(t *testing.T) {
+	service.InitHttpClient()
+	fetchSetting := system_setting.GetFetchSetting()
+	originalSetting := *fetchSetting
+	*fetchSetting = system_setting.FetchSetting{EnableSSRFProtection: true}
+	t.Cleanup(func() { *fetchSetting = originalSetting })
+	client := service.GetHttpClient()
+	original := *client
+	t.Cleanup(func() { *client = original })
+	calls := 0
+	client.Transport = taskQueryRoundTripper(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": {"https://unknown.example/result?key=location-secret"}}, Body: http.NoBody, Request: req}, nil
+	})
+	plugin, err := pluginruntime.CompilePlugin(mockPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	resp, err := New(plugin).doFetchDescriptor("https://provider.example", "", "", requestDescriptor{URL: "https://provider.example/query"})
+	require.ErrorContains(t, err, "unsupported transport")
+	assert.NotContains(t, err.Error(), "location-secret")
+	assert.Nil(t, resp)
+	assert.Equal(t, 1, calls, "untrusted targets must not reach an unprotected transport")
 }

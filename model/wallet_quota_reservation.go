@@ -25,10 +25,11 @@ var lastWalletReservationCleanup atomic.Int64
 // All values are read in one statement, including on read-only callers.
 func walletSettledBalanceTx(tx *gorm.DB, userID int) (int, error) {
 	var wallet struct {
-		Quota    int
-		Reserved int
-		Debt     int64
-		Pending  int64
+		Quota           int
+		Reserved        int
+		Debt            int64
+		Pending         int64
+		RefundedPending int64
 	}
 	debt := &gorm.Statement{DB: tx}
 	if err := debt.Parse(&UserQuotaDebt{}); err != nil {
@@ -41,12 +42,20 @@ func walletSettledBalanceTx(tx *gorm.DB, userID int) (int, error) {
 	pending := tx.Model(&WalletQuotaReservation{}).Select("COALESCE(SUM(amount), 0)").
 		Where(clause.Eq{Column: clause.Column{Name: "user_id"}, Value: clause.Column{Table: user.Table, Name: "id"}}).
 		Where("expires_at > ?", time.Now().UnixMilli())
+	// An old poller can credit a new task's money without clearing its marker.
+	// refund_pending already means the SQL refund committed, including when
+	// cache finalization still needs recovery. Never add that money back twice.
+	refundedPending := tx.Model(&Midjourney{}).Select("COALESCE(SUM(billing_quota_reserved), 0)").
+		Where(clause.Eq{Column: clause.Column{Name: "user_id"}, Value: clause.Column{Table: user.Table, Name: "id"}}).
+		Where(clause.Gt{Column: clause.Column{Table: user.Table, Name: "quota_reserved"}, Value: 0}).
+		Where("billing_status IN ? AND billing_quota_reserved > 0", []string{MidjourneyBillingStatusRefundPending, MidjourneyBillingStatusRefunded})
 	query := tx.Model(&User{}).Clauses(
-		clause.Select{Expression: clause.Expr{SQL: "?, ? AS ?, COALESCE(?, 0) AS ?, (?) AS ?", Vars: []any{
+		clause.Select{Expression: clause.Expr{SQL: "?, ? AS ?, COALESCE(?, 0) AS ?, (?) AS ?, (?) AS ?", Vars: []any{
 			clause.Column{Table: clause.CurrentTable, Name: "quota"},
 			clause.Column{Table: clause.CurrentTable, Name: "quota_reserved"}, clause.Column{Name: "reserved"},
 			clause.Column{Table: debt.Table, Name: "amount"}, clause.Column{Name: "debt"},
 			pending, clause.Column{Name: "pending"},
+			refundedPending, clause.Column{Name: "refunded_pending"},
 		}}},
 		clause.From{Tables: []clause.Table{{Name: clause.CurrentTable}}, Joins: []clause.Join{{Type: clause.LeftJoin, Table: clause.Table{Name: debt.Table}, ON: clause.Where{Exprs: []clause.Expression{
 			clause.Eq{Column: clause.Column{Table: debt.Table, Name: "user_id"}, Value: clause.Column{Table: clause.CurrentTable, Name: "id"}},
@@ -56,7 +65,7 @@ func walletSettledBalanceTx(tx *gorm.DB, userID int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	available := int64(wallet.Quota) + int64(wallet.Reserved) + wallet.Pending
+	available := int64(wallet.Quota) + int64(wallet.Reserved) + wallet.Pending - wallet.RefundedPending
 	floor := -int64(common.GetUserQuotaMaxDebtQuota())
 	if wallet.Debt >= available-floor {
 		return int(floor), nil

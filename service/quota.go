@@ -533,6 +533,9 @@ func checkAndSendQuotaNotify(relayInfo *relaycommon.RelayInfo, quota int, preCon
 	}
 	userSetting := relayInfo.UserSetting
 	gopool.Go(func() {
+		if !quotaReminderEnabled(userSetting) {
+			return
+		}
 		lang := userSetting.Language
 		prompt := i18n.Translate(lang, i18n.MsgNotifyQuotaLowTitle)
 		content, values := quotaNotifyContent(lang, userSetting.NotifyType, prompt, logger.FormatQuota(balanceAfter))

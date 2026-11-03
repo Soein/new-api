@@ -554,6 +554,12 @@ func TestMidjourneyWalletConfirmationRejectsUncommittedStates(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, applied)
 	for _, status := range []string{model.MidjourneyBillingStatusPrepared, model.MidjourneyBillingStatusCharging, model.MidjourneyBillingStatusChargePending, model.MidjourneyBillingStatusRefunding, model.MidjourneyBillingStatusRefundPending, "invalid", ""} {
+		physical := 95
+		if status == model.MidjourneyBillingStatusRefundPending {
+			// This state is written only after the refund SQL commits.
+			physical = 120
+		}
+		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Update("quota", physical).Error)
 		require.NoError(t, model.DB.Table("midjourneys").Where("id = ?", task.Id).
 			Updates(map[string]any{"billing_status": status, "status": "SUCCESS", "quota": 0}).Error)
 		change, err := task.ConfirmBilling(true)
@@ -563,6 +569,7 @@ func TestMidjourneyWalletConfirmationRejectsUncommittedStates(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 120, confirmed)
 	}
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Update("quota", 95).Error)
 	require.NoError(t, model.DB.Table("midjourneys").Where("id = ?", task.Id).
 		Updates(map[string]any{"billing_status": model.MidjourneyBillingStatusCharged, "status": constant.MjStatusSubmitUnknown, "progress": "100%", "quota": 25}).Error)
 	change, err := task.ConfirmBilling(true)
@@ -571,31 +578,223 @@ func TestMidjourneyWalletConfirmationRejectsUncommittedStates(t *testing.T) {
 	assert.False(t, model.HasUnfinishedMidjourneyTasks(), "an unknown submission with no upstream ID must not spin the scheduler")
 }
 
-func TestMidjourneyWalletReservationRepairsLegacyTerminalRefund(t *testing.T) {
+func TestWalletQuotaReminderLegacyMidjourneyBalances(t *testing.T) {
+	for _, tc := range []struct {
+		name, billingStatus, status string
+		want                        int
+	}{
+		{"committed charge awaiting cache", model.MidjourneyBillingStatusChargePending, constant.MjStatusReserving, 120},
+		{"charged submission", model.MidjourneyBillingStatusCharged, constant.MjStatusSubmitting, 120},
+		{"unknown submission survives drain", model.MidjourneyBillingStatusCharged, constant.MjStatusSubmitUnknown, 120},
+		{"refund not yet committed", model.MidjourneyBillingStatusRefunding, constant.MjStatusSubmitUnknown, 120},
+		{"uncommitted charge", model.MidjourneyBillingStatusCharging, constant.MjStatusReserving, 90},
+		{"accepted charge", model.MidjourneyBillingStatusCharged, "SUCCESS", 90},
+		{"failed accepted charge has no reservation evidence", model.MidjourneyBillingStatusCharged, "FAILURE", 90},
+		{"legacy quota alone is not pending evidence", "", constant.MjStatusSubmitUnknown, 90},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			const userID = 2980
+			seedUser(t, userID, 120)
+			reserved, err := model.TryReserveUserQuota(userID, 30)
+			require.NoError(t, err)
+			require.True(t, reserved)
+			// These are the fields the old transaction durably wrote; it never
+			// created a new reminder marker or updated users.quota_reserved.
+			task := &model.Midjourney{UserId: userID, Quota: 30, BillingStatus: tc.billingStatus, Status: tc.status, Progress: "100%"}
+			require.NoError(t, task.Insert())
+			require.NoError(t, task.AdoptWalletReservation())
+			require.NoError(t, task.AdoptWalletReservation())
+			confirmed, err := model.GetWalletSettledQuota(userID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, confirmed)
+			physical, err := model.GetUserQuota(userID, true)
+			require.NoError(t, err)
+			assert.Equal(t, 90, physical, "compatibility accounting cannot change money")
+		})
+	}
+}
+
+func TestWalletQuotaReminderRollingDrain(t *testing.T) {
 	truncate(t)
-	const userID = 2961
+	previousEnabled, previousThreshold := common.QuotaRemindEnabled, common.QuotaRemindThreshold
+	t.Cleanup(func() { common.QuotaRemindEnabled, common.QuotaRemindThreshold = previousEnabled, previousThreshold })
+	common.QuotaRemindEnabled, common.QuotaRemindThreshold = false, 100
+	const userID = 2981
 	seedUser(t, userID, 120)
-	info := &relaycommon.RelayInfo{UserId: userID, IsPlayground: true}
-	task := &model.Midjourney{UserId: userID}
-	applied, err := ReserveMidjourneyTaskBilling(info, task, 30)
+	reserved, err := model.TryReserveUserQuota(userID, 30)
 	require.NoError(t, err)
-	require.True(t, applied)
-	// An older process can complete a refund without knowing the new marker.
-	// Recovery must retire that marker without crediting the money a second time.
-	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Update("quota", 120).Error)
-	require.NoError(t, model.DB.Table("midjourneys").Where("id = ?", task.Id).
-		Updates(map[string]any{"quota": 0, "billing_status": model.MidjourneyBillingStatusRefunded, "status": "FAILURE", "progress": "100%"}).Error)
-	require.True(t, model.HasUnfinishedMidjourneyTasks())
-	var reloaded model.Midjourney
-	require.NoError(t, model.DB.First(&reloaded, task.Id).Error)
-	require.True(t, ReconcileMidjourneyTaskBilling(context.Background(), &reloaded))
-	assert.False(t, model.HasUnfinishedMidjourneyTasks())
+	require.True(t, reserved)
 	confirmed, err := model.GetWalletSettledQuota(userID)
 	require.NoError(t, err)
-	assert.Equal(t, 120, confirmed)
+	assert.Equal(t, 90, confirmed, "old in-memory ordinary holds cannot be reconstructed")
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{UserId: userID, IsPlayground: true, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}}
+	require.Nil(t, PreConsumeBilling(ctx, 25, info))
+	// The old request completes and refunds its known reservation before drain
+	// finishes. No timer or balance comparison can establish this completion.
+	require.NoError(t, model.IncreaseUserQuota(userID, 30, false))
+	require.NoError(t, info.Billing.Settle(25))
+	_, due := claimWalletQuotaReminder(info, 25)
+	assert.False(t, due)
+	common.QuotaRemindEnabled = true
+	_, due = claimWalletQuotaReminder(info, 25)
+	assert.False(t, due, "reenabling reminders does not replay suppressed settlements")
+	require.NoError(t, info.Billing.Settle(25))
 	physical, err := model.GetUserQuota(userID, true)
 	require.NoError(t, err)
-	assert.Equal(t, 120, physical)
+	assert.Equal(t, 95, physical)
+	require.NoError(t, model.IncreaseUserQuota(userID, 25, false))
+	info = &relaycommon.RelayInfo{UserId: userID, IsPlayground: true, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}}
+	require.Nil(t, PreConsumeBilling(ctx, 30, info))
+	require.NoError(t, info.Billing.Settle(30))
+	balance, due := claimWalletQuotaReminder(info, 30)
+	assert.True(t, due)
+	assert.Equal(t, 90, balance)
+	_, due = claimWalletQuotaReminder(info, 30)
+	assert.False(t, due)
+}
+
+func TestWalletQuotaReminderLegacyMidjourneyCompletion(t *testing.T) {
+	previousEnabled, previousThreshold := common.QuotaRemindEnabled, common.QuotaRemindThreshold
+	t.Cleanup(func() { common.QuotaRemindEnabled, common.QuotaRemindThreshold = previousEnabled, previousThreshold })
+	common.QuotaRemindEnabled, common.QuotaRemindThreshold = true, 100
+	for _, refund := range []bool{false, true} {
+		t.Run(fmt.Sprintf("refund %t", refund), func(t *testing.T) {
+			truncate(t)
+			const userID = 2982
+			seedUser(t, userID, 120)
+			reserved, err := model.TryReserveUserQuota(userID, 30)
+			require.NoError(t, err)
+			require.True(t, reserved)
+			task := &model.Midjourney{UserId: userID, Quota: 30, BillingStatus: model.MidjourneyBillingStatusCharged, Status: constant.MjStatusSubmitUnknown}
+			require.NoError(t, task.Insert())
+			require.True(t, ReconcileMidjourneyTaskBilling(context.Background(), task))
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{UserId: userID, IsPlayground: true, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}}
+			require.Nil(t, PreConsumeBilling(ctx, 25, info))
+			require.NoError(t, info.Billing.Settle(25))
+			balance, due := claimWalletQuotaReminder(info, 25)
+			assert.True(t, due, "an identifiable legacy pending task must not hide a new confirmed charge")
+			assert.Equal(t, 95, balance)
+			// Adoption preserves the pending balance even between a failure
+			// status update and its eventual refund transaction.
+			task.Status, task.Progress = "FAILURE", "100%"
+			require.NoError(t, task.Update())
+			confirmed, err := model.GetWalletSettledQuota(userID)
+			require.NoError(t, err)
+			assert.Equal(t, 95, confirmed)
+			task.Status = "SUCCESS"
+			want := 65
+			if refund {
+				task.Status, want = "FAILURE", 95
+			}
+			require.NoError(t, task.Update())
+			require.True(t, ReconcileMidjourneyTaskBilling(context.Background(), task))
+			require.True(t, ReconcileMidjourneyTaskBilling(context.Background(), task))
+			change, err := task.ConfirmBilling(true)
+			require.NoError(t, err)
+			assert.Nil(t, change, "completed adopted reservations cannot replay their confirmation")
+			physical, err := model.GetUserQuota(userID, true)
+			require.NoError(t, err)
+			assert.Equal(t, want, physical)
+			confirmed, err = model.GetWalletSettledQuota(userID)
+			require.NoError(t, err)
+			assert.Equal(t, want, confirmed)
+		})
+	}
+}
+
+func TestMidjourneyWalletReservationRepairsLegacyTerminalRefund(t *testing.T) {
+	previousEnabled, previousThreshold := common.QuotaRemindEnabled, common.QuotaRemindThreshold
+	t.Cleanup(func() { common.QuotaRemindEnabled, common.QuotaRemindThreshold = previousEnabled, previousThreshold })
+	common.QuotaRemindEnabled, common.QuotaRemindThreshold = true, 100
+	for _, billingStatus := range []string{model.MidjourneyBillingStatusRefundPending, model.MidjourneyBillingStatusRefunded} {
+		t.Run(billingStatus, func(t *testing.T) {
+			truncate(t)
+			const userID = 2983
+			seedUser(t, userID, 120)
+			task := &model.Midjourney{UserId: userID}
+			applied, err := ReserveMidjourneyTaskBilling(&relaycommon.RelayInfo{UserId: userID, IsPlayground: true}, task, 30)
+			require.NoError(t, err)
+			require.True(t, applied)
+			// The old refund transaction credits money and writes refund_pending;
+			// its final cache step writes refunded/quota=0 but knows no new marker.
+			require.NoError(t, model.IncreaseUserQuota(userID, 30, false))
+			quota := 30
+			if billingStatus == model.MidjourneyBillingStatusRefunded {
+				quota = 0
+			}
+			require.NoError(t, model.DB.Model(task).Updates(map[string]any{"quota": quota, "billing_status": billingStatus, "billing_quota_delta": 30, "status": "FAILURE", "progress": "100%"}).Error)
+			confirmed, err := model.GetWalletSettledQuota(userID)
+			require.NoError(t, err)
+			assert.Equal(t, 120, confirmed, "already credited money must not retain a reminder add-back")
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{UserId: userID, IsPlayground: true, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}}
+			require.Nil(t, PreConsumeBilling(ctx, 25, info))
+			require.NoError(t, info.Billing.Settle(25))
+			balance, due := claimWalletQuotaReminder(info, 25)
+			assert.True(t, due, "an old refund's residual marker cannot hide a new crossing")
+			assert.Equal(t, 95, balance)
+			require.True(t, model.HasUnfinishedMidjourneyTasks())
+			var reloaded model.Midjourney
+			require.NoError(t, model.DB.First(&reloaded, task.Id).Error)
+			require.True(t, ReconcileMidjourneyTaskBilling(context.Background(), &reloaded))
+			require.True(t, ReconcileMidjourneyTaskBilling(context.Background(), &reloaded))
+			assert.False(t, model.HasUnfinishedMidjourneyTasks())
+			physical, err := model.GetUserQuota(userID, true)
+			require.NoError(t, err)
+			assert.Equal(t, 95, physical, "marker retirement cannot apply the old refund again")
+			confirmed, err = model.GetWalletSettledQuota(userID)
+			require.NoError(t, err)
+			assert.Equal(t, 95, confirmed)
+		})
+	}
+}
+
+func TestMidjourneyWalletReminderAfterOldAcceptanceDuringDrain(t *testing.T) {
+	truncate(t)
+	previousEnabled, previousThreshold := common.QuotaRemindEnabled, common.QuotaRemindThreshold
+	t.Cleanup(func() { common.QuotaRemindEnabled, common.QuotaRemindThreshold = previousEnabled, previousThreshold })
+	common.QuotaRemindEnabled, common.QuotaRemindThreshold = false, 100
+	const userID = 2984
+	seedUser(t, userID, 120)
+	task := &model.Midjourney{UserId: userID}
+	applied, err := ReserveMidjourneyTaskBilling(&relaycommon.RelayInfo{UserId: userID, IsPlayground: true}, task, 25)
+	require.NoError(t, err)
+	require.True(t, applied)
+	// The old poller can write acceptance but has no ConfirmBilling call.
+	require.NoError(t, model.DB.Model(task).Updates(map[string]any{"status": "SUCCESS", "progress": "100%"}).Error)
+	var copies [2]model.Midjourney
+	for i := range copies {
+		require.NoError(t, model.DB.First(&copies[i], task.Id).Error)
+	}
+	var workers sync.WaitGroup
+	errors := make(chan bool, len(copies))
+	for i := range copies {
+		workers.Go(func() { errors <- ReconcileMidjourneyTaskBilling(context.Background(), &copies[i]) })
+	}
+	workers.Wait()
+	close(errors)
+	for completed := range errors {
+		require.True(t, completed)
+	}
+	common.QuotaRemindEnabled = true
+	for i := range copies {
+		change, err := copies[i].ConfirmBilling(true)
+		require.NoError(t, err)
+		assert.Nil(t, change, "reenabling cannot replay the marker retired during drain")
+	}
+	physical, err := model.GetUserQuota(userID, true)
+	require.NoError(t, err)
+	assert.Equal(t, 95, physical)
+	confirmed, err := model.GetWalletSettledQuota(userID)
+	require.NoError(t, err)
+	assert.Equal(t, 95, confirmed)
+	assert.False(t, model.HasUnfinishedMidjourneyTasks())
 }
 
 // A low-balance reminder goes out once, on the charge that takes a wallet or

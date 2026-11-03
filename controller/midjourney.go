@@ -49,10 +49,30 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 	logger.LogInfo(ctx, common.LogText("unfinished tasks found: %v", len(tasks)))
 	taskChannelM := make(map[int][]string)
 	taskM := make(map[string]*model.Midjourney)
-	nullTaskIds := make([]int, 0)
-	nullTasks := make([]*model.Midjourney, 0)
 	for _, task := range tasks {
+		// Adoption must precede every submission-state change, including the
+		// no-upstream-ID branches that bypass normal billing reconciliation.
+		if err := task.AdoptWalletReservation(); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("Adopt Midjourney wallet reservation error task %d: %v", task.Id, err))
+			continue
+		}
 		if task.MjId == "" {
+			// Submission uncertainty does not erase an already committed charge
+			// or refund. Complete only those proven financial transitions first.
+			switch task.BillingStatus {
+			case model.MidjourneyBillingStatusChargePending:
+				if !service.ReconcileMidjourneyTaskBilling(ctx, task) {
+					continue
+				}
+			case model.MidjourneyBillingStatusRefunding, model.MidjourneyBillingStatusRefundPending, model.MidjourneyBillingStatusRefunded:
+				if service.ReconcileMidjourneyTaskBilling(ctx, task) {
+					task.Progress = "100%"
+					if _, err := task.UpdateUnsubmittedWithStatus(task.Status); err != nil {
+						logger.LogError(ctx, fmt.Sprintf("Finalize refunded Midjourney polling state error task %d: %v", task.Id, err))
+					}
+				}
+				continue
+			}
 			submissionAge := time.Duration(time.Now().UnixMilli()-task.SubmitTime) * time.Millisecond
 			switch task.Status {
 			case constant.MjStatusReserving:
@@ -66,17 +86,23 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 				task.Status = constant.MjStatusSubmitUnknown
 				task.Progress = "100%"
 				task.FailReason = "Midjourney submission outcome is unknown"
-				if err := task.Update(); err != nil {
+				if _, err := task.UpdateUnsubmittedWithStatus(constant.MjStatusSubmitting); err != nil {
 					logger.LogError(ctx, fmt.Sprintf("Mark unknown Midjourney submission error: %v", err))
 				}
 				continue
 			case constant.MjStatusSubmitUnknown:
 				continue
 			}
-			nullTaskIds = append(nullTaskIds, task.Id)
+			fromStatus := task.Status
 			task.Status = "FAILURE"
 			task.Progress = "100%"
-			nullTasks = append(nullTasks, task)
+			won, err := task.UpdateUnsubmittedWithStatus(fromStatus)
+			if err != nil {
+				logger.LogError(ctx, common.LogText("Fix null mj_id task error: %v", err))
+			} else if won {
+				summary.NullTasksFailed++
+				service.ReconcileMidjourneyTaskBilling(ctx, task)
+			}
 			continue
 		}
 		service.ReconcileMidjourneyTaskBilling(ctx, task)
@@ -85,21 +111,6 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		}
 		taskM[task.MjId] = task
 		taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], task.MjId)
-	}
-	if len(nullTaskIds) > 0 {
-		summary.NullTasksFailed = len(nullTaskIds)
-		err := model.MjBulkUpdateByTaskIds(nullTaskIds, map[string]any{
-			"status":   "FAILURE",
-			"progress": "100%",
-		})
-		if err != nil {
-			logger.LogError(ctx, common.LogText("Fix null mj_id task error: %v", err))
-		} else {
-			logger.LogInfo(ctx, common.LogText("Fix null mj_id task success: %v", nullTaskIds))
-			for _, task := range nullTasks {
-				service.ReconcileMidjourneyTaskBilling(ctx, task)
-			}
-		}
 	}
 	if len(taskChannelM) == 0 {
 		return summary

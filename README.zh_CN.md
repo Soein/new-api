@@ -246,6 +246,36 @@ docker compose logs -f new-api
 
 从[发布页](https://github.com/QuantumNous/new-api/releases)选择明确的镜像版本，阅读升级说明并先备份再升级。`latest` 会随发布构建变化；已有实例应按实际版本评估迁移与兼容性。
 
+### 钱包余额提醒的升级切换
+
+旧版本的普通请求只在进程内保存预扣金额；没有新请求预留记录，不能证明没有旧请求在途。升级时不能根据余额、充值、请求日志或等待固定时长推断这些预扣已结算，也不要手动清空预留或据此退款。长流、WebSocket 会话和任务轮询都属于需要交接的写入者。
+
+允许升级期间暂停提醒时，采用以下滚动流程：
+
+1. 通过管理设置关闭共有选项 `QuotaRemindEnabled`，确认每个旧节点已同步配置，并排空已经排队的通知。该选项也会暂停订阅余额提醒；已经交给邮件或推送服务的消息无法撤回。
+2. 先由可执行迁移的主节点（`NODE_TYPE` 不是 `slave`）完成数据库迁移，再将业务流量切给新节点。逐个停止向旧节点分配新请求，等待其普通请求、流和 WebSocket 会话完成结算或退款，再停止旧节点及其任务轮询器；新节点可以继续提供服务。进程失联的旧普通请求需要沿原有财务流程核实，其真实扣款保持原样，不会自动补退款。
+3. 所有旧写入者退出后，保持新主节点 `UPDATE_TASK=true`，由既有调度器执行 `midjourney_poll`（Midjourney 任务更新）；若之前停用了任务更新，恢复此变量并重启该主节点即可再次触发调度。它会幂等接管仍未定的旧提交（包括进度为 `100%`、没有上游 ID 的 `SUBMIT_UNKNOWN`），并恢复已接受或已退款任务的遗留提醒状态。在系统任务列表核对执行结果，再按下面的只读查询核查；有未处理行时排查恢复错误并继续调度，直到满足条件后再开启 `QuotaRemindEnabled`。不要用固定宽限期代替排空和恢复检查。暂停期间的结算以及没有可接管证据的历史任务完成都不会补发提醒。
+
+若不能接受普通请求提醒暂停，应暂时停止接入新请求，保持旧节点提醒开启，完整排空旧请求和通知后停止所有旧写入者，再启动新版本、完成任务恢复并切流。新旧普通请求同时写入期间无法保证跨版本提醒不漏发或不重复；新代码无法确认未修改的旧二进制是否已经发出消息。
+
+恢复提醒前，可用以下只读查询核实旧待提交行已接管、歧义待退款行已按原流程处理、可恢复的遗留标记已清理（使用自定义表前缀时替换表名）。计数应为零，非零时先检查任务恢复执行结果，不要手动清除标记。已接管且仍未知的提交不计入，不要求它们完成或退款：
+
+```sql
+SELECT COUNT(*) FROM midjourneys
+WHERE (billing_quota_reserved = 0 AND quota > 0
+       AND billing_status IN ('charge_pending', 'charged', 'refunding')
+       AND status IN ('RESERVING', 'SUBMITTING', 'SUBMIT_UNKNOWN'))
+   OR billing_status IN ('prepared', 'charging', 'charge_pending', 'refunding', 'refund_pending')
+   OR (status = 'FAILURE' AND quota > 0
+       AND (billing_status IN ('', 'charged') OR billing_status IS NULL))
+   OR (billing_quota_reserved > 0
+  AND (billing_status IN ('refund_pending', 'refunded')
+       OR (billing_status = 'charged'
+           AND status IN ('', 'NOT_START', 'SUBMITTED', 'IN_PROGRESS', 'SUCCESS', 'FAILURE'))));
+```
+
+旧 Midjourney 任务只有在持久化计费状态证明钱包已扣款、且提交状态仍为 `RESERVING`、`SUBMITTING` 或 `SUBMIT_UNKNOWN` 时，才接管为现有的持久提醒标记；接管不改资金或用量，已接管的未知任务以后明确被接受时可按正常确认发送一次提醒。未知提交不会因升级或超时自动变成成功或退款。已接受、失败以及仅有历史 `quota` 的记录不据此重建预扣；旧节点已经入账的退款只清理遗留提醒状态，不再次返款。提醒口径不参与额度准入，实际可用余额与债务仍按原有资金逻辑处理。
+
 <a id="development"></a>
 
 ## 开发与扩展

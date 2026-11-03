@@ -1,11 +1,14 @@
 package model
 
-import "gorm.io/gorm"
+import (
+	"github.com/QuantumNous/new-api/constant"
+	"gorm.io/gorm"
+)
 
 type Midjourney struct {
 	Id          int    `json:"id"`
 	Code        int    `json:"code"`
-	UserId      int    `json:"user_id" gorm:"index;index:idx_midjourney_user_billing,priority:1"`
+	UserId      int    `json:"user_id" gorm:"index;index:idx_midjourney_user_billing,priority:1;index:,composite:wallet_pending,priority:1"`
 	Action      string `json:"action" gorm:"type:varchar(40);index"`
 	MjId        string `json:"mj_id" gorm:"index"`
 	Prompt      string `json:"prompt"`
@@ -18,7 +21,7 @@ type Midjourney struct {
 	ImageUrl    string `json:"image_url"`
 	VideoUrl    string `json:"video_url"`
 	VideoUrls   string `json:"video_urls"`
-	Status      string `json:"status" gorm:"type:varchar(20);index"`
+	Status      string `json:"status" gorm:"type:varchar(20);index;index:,composite:wallet_pending,priority:4"`
 	Progress    string `json:"progress" gorm:"type:varchar(30);index"`
 	FailReason  string `json:"fail_reason"`
 	ChannelId   int    `json:"channel_id"`
@@ -28,9 +31,9 @@ type Midjourney struct {
 
 	TokenId              int    `json:"-" gorm:"default:0;index:idx_midjourney_token_billing,priority:1"`
 	BillingChannelId     int    `json:"-" gorm:"default:0"`
-	BillingStatus        string `json:"-" gorm:"type:varchar(16);index:idx_midjourney_user_billing,priority:2;index:idx_midjourney_token_billing,priority:2"`
+	BillingStatus        string `json:"-" gorm:"type:varchar(16);index:idx_midjourney_user_billing,priority:2;index:idx_midjourney_token_billing,priority:2;index:,composite:wallet_pending,priority:2"`
 	BillingQuotaDelta    int    `json:"-" gorm:"default:0"`
-	BillingQuotaReserved int    `json:"-" gorm:"->;column:billing_quota_reserved;type:bigint;not null;default:0"`
+	BillingQuotaReserved int    `json:"-" gorm:"->;column:billing_quota_reserved;type:bigint;not null;default:0;index:,composite:wallet_pending,priority:3"`
 }
 
 // TaskQueryParams 用于包含所有搜索条件的结构体，可以根据需求添加更多字段
@@ -128,9 +131,11 @@ func unfinishedMidjourneyTasksQuery(query *gorm.DB) *gorm.DB {
 		MidjourneyBillingStatusRefundPending,
 	}
 	return query.Where(
-		"progress != ? OR (billing_quota_reserved > 0 AND (status IN ? OR billing_status = ?)) OR billing_status IN ? OR (status = ? AND quota > 0 AND (billing_status = ? OR billing_status = ? OR billing_status IS NULL))",
+		"progress != ? OR (billing_quota_reserved > 0 AND (status IN ? OR billing_status = ?)) OR billing_status IN ? OR (status = ? AND quota > 0 AND (billing_status = ? OR billing_status = ? OR billing_status IS NULL)) OR (billing_quota_reserved = 0 AND quota > 0 AND billing_status IN ? AND status IN ?)",
 		"100%", []string{"", "NOT_START", "SUBMITTED", "IN_PROGRESS", "SUCCESS", "FAILURE"}, MidjourneyBillingStatusRefunded,
 		pendingBillingStatuses, "FAILURE", MidjourneyBillingStatusCharged, "",
+		[]string{MidjourneyBillingStatusChargePending, MidjourneyBillingStatusCharged, MidjourneyBillingStatusRefunding},
+		[]string{constant.MjStatusReserving, constant.MjStatusSubmitting, constant.MjStatusSubmitUnknown},
 	)
 }
 
@@ -210,6 +215,42 @@ func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) 
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+// UpdateUnsubmittedWithStatus changes only polling state while the task still
+// has no upstream ID and retains fromStatus. A persisted FAILURE also permits
+// idempotent billing recovery after a locked check, including MySQL no-op updates.
+func (midjourney *Midjourney) UpdateUnsubmittedWithStatus(fromStatus string) (bool, error) {
+	matched := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		query := tx.Model(&Midjourney{}).Where("id = ? AND (mj_id = ? OR mj_id IS NULL)", midjourney.Id, "")
+		if fromStatus == "" {
+			query = query.Where("status = ? OR status IS NULL", "")
+		} else {
+			query = query.Where("status = ?", fromStatus)
+		}
+		result := query.Updates(map[string]any{"status": midjourney.Status, "progress": midjourney.Progress, "fail_reason": midjourney.FailReason})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			matched = true
+			return nil
+		}
+		if fromStatus != "FAILURE" || midjourney.Status != "FAILURE" {
+			return nil
+		}
+		var current Midjourney
+		if err := lockForUpdate(tx).First(&current, midjourney.Id).Error; err != nil {
+			return err
+		}
+		if current.MjId == "" && current.Status == "FAILURE" {
+			*midjourney = current
+			matched = true
+		}
+		return nil
+	})
+	return matched, err
 }
 
 func MjBulkUpdate(mjIds []string, params map[string]any) error {

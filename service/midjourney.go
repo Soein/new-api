@@ -170,6 +170,10 @@ func ReconcileMidjourneyTaskBilling(ctx context.Context, task *model.Midjourney)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := task.AdoptWalletReservation(); err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("Adopt Midjourney wallet reservation error task %d: %v", task.Id, err))
+		return false
+	}
 
 	failed := task.Status == "FAILURE"
 	switch task.BillingStatus {
@@ -254,6 +258,12 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 	}
 	if !result.Completed {
 		return false
+	}
+	if task.BillingStatus == model.MidjourneyBillingStatusRefunded && task.BillingQuotaReserved > 0 {
+		if _, err := task.ConfirmBilling(false); err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("Retire refunded Midjourney wallet reservation error task %d: %v", task.Id, err))
+			return false
+		}
 	}
 	if !result.Applied {
 		return true

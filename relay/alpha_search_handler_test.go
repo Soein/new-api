@@ -201,7 +201,7 @@ func TestDeepSeekToolsRequestPriceAccounting(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.UserQuotaDebt{}, &model.WalletQuotaReservation{}, &model.Log{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.UserQuotaDebt{}, &model.WalletQuotaReservation{}, &model.Midjourney{}, &model.Log{}))
 	oldDB, oldLogDB := model.DB, model.LOG_DB
 	oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
 	oldBatch, oldLogConsume, oldRedis := common.BatchUpdateEnabled, common.LogConsumeEnabled, common.RedisEnabled

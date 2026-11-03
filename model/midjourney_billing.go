@@ -153,6 +153,71 @@ func (midjourney *Midjourney) SettleBilling(tokenKey string) (result MidjourneyB
 	return result, nil
 }
 
+func (midjourney *Midjourney) needsWalletReservationAdoption() bool {
+	if midjourney == nil || midjourney.Quota <= 0 || midjourney.BillingQuotaReserved != 0 {
+		return false
+	}
+	switch midjourney.BillingStatus {
+	case MidjourneyBillingStatusChargePending, MidjourneyBillingStatusCharged, MidjourneyBillingStatusRefunding:
+	default:
+		return false
+	}
+	switch midjourney.Status {
+	case constant.MjStatusReserving, constant.MjStatusSubmitting, constant.MjStatusSubmitUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// AdoptWalletReservation hands an old, durably charged but unconfirmed submission
+// to the current reminder accounting. It changes no money or usage, is safe to
+// repeat, and never reconstructs accepted, failed, or in-memory ordinary holds.
+func (midjourney *Midjourney) AdoptWalletReservation() error {
+	if !midjourney.needsWalletReservationAdoption() {
+		return nil
+	}
+	if midjourney.Id == 0 || midjourney.UserId <= 0 {
+		return errors.New("midjourney task must be persisted before adopting its wallet reservation")
+	}
+	var current Midjourney
+	err := withUserQuotaMutation(midjourney.UserId, func() error {
+		return DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockForUpdate(tx).First(&current, midjourney.Id).Error; err != nil {
+				return err
+			}
+			if current.UserId != midjourney.UserId {
+				return errors.New("midjourney billing user changed")
+			}
+			if !current.needsWalletReservationAdoption() {
+				return nil
+			}
+			updated := tx.Model(&User{}).Where("id = ? AND quota_reserved <= ?", current.UserId, common.MaxWalletQuota-current.Quota).
+				Clauses(clause.Assignments(map[string]any{"quota_reserved": gorm.Expr("quota_reserved + ?", current.Quota)})).Updates(nil)
+			if updated.Error != nil {
+				return updated.Error
+			}
+			if updated.RowsAffected != 1 {
+				return errors.New("cannot adopt Midjourney reservation for an unavailable wallet or an exceeded reminder limit")
+			}
+			updated = tx.Model(&Midjourney{}).Where("id = ? AND billing_quota_reserved = 0", current.Id).
+				Clauses(clause.Assignments(map[string]any{"billing_quota_reserved": current.Quota})).Updates(nil)
+			if updated.Error != nil {
+				return updated.Error
+			}
+			if updated.RowsAffected != 1 {
+				return errors.New("midjourney wallet reservation changed concurrently")
+			}
+			current.BillingQuotaReserved = current.Quota
+			return nil
+		})
+	})
+	if err == nil {
+		*midjourney = current
+	}
+	return err
+}
+
 // ConfirmBilling finalizes the pending wallet reservation after a persisted
 // upstream acceptance. Its task marker makes duplicate and recovery calls safe.
 func (midjourney *Midjourney) ConfirmBilling(captureBalance bool) (*common.WalletQuotaChange, error) {

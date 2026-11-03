@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
@@ -103,17 +104,19 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 	}
 	service.IOCopyBytesGracefully(c, httpResp, responseBody)
 
-	// DeepSeek bills a successful request only when it returns something: a
-	// non-empty results array for Search, page content for Fetch. A billable
-	// call settles at the routing name's request price; any other response
-	// releases the reservation.
+	// Only HTTP 200 with search results or usable Markdown page content is
+	// billable. Other responses keep their original payload and release the
+	// reservation: https://api-docs.deepseek.com/guides/search/#billing
 	var billable bool
-	switch info.RelayMode {
-	case relayconstant.RelayModeToolsFetch:
-		billable = ojson.GetBytes(responseBody, "content").String() != ""
-	default:
-		results := ojson.GetBytes(responseBody, "results")
-		billable = results.IsArray() && len(results.Array()) > 0
+	if httpResp.StatusCode == http.StatusOK && ojson.ValidBytes(responseBody) {
+		switch info.RelayMode {
+		case relayconstant.RelayModeToolsFetch:
+			content := ojson.GetBytes(responseBody, "content")
+			billable = content.Type == ojson.String && strings.TrimSpace(content.Str) != ""
+		default:
+			results := ojson.GetBytes(responseBody, "results")
+			billable = results.IsArray() && len(results.Array()) > 0
+		}
 	}
 	if !billable {
 		if info.Billing != nil {

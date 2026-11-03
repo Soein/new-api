@@ -242,6 +242,8 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 		CacheCreationRatio1h:  relayInfo.PriceData.CacheCreation1hRatio,
 		CacheCreationRatio12h: relayInfo.PriceData.CacheCreation12hRatio,
 		UsageSemantic:         usageSemanticFromUsage(relayInfo, usage),
+		FixedPriceBilling: relayInfo.PriceData.UsePrice &&
+			(relayInfo.RelayMode == relayconstant.RelayModeToolsSearch || relayInfo.RelayMode == relayconstant.RelayModeToolsFetch),
 	}
 	summary.IsClaudeUsageSemantic = summary.UsageSemantic == "anthropic"
 

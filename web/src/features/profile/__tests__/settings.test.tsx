@@ -60,6 +60,7 @@ afterEach(() => vi.restoreAllMocks())
 
 /** The body a PUT sends over the wire: undefined fields are left out. */
 function sentBody(put: { mock: { calls: unknown[][] } }): unknown {
+  // eslint-disable-next-line unicorn/prefer-structured-clone -- Simulates HTTP wire transport omitting undefined fields; structuredClone preserves them.
   return JSON.parse(JSON.stringify(put.mock.calls[0][1]))
 }
 

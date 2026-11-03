@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -131,11 +132,28 @@ func normalizeSyncValue(field string, value any) any {
 	return value
 }
 
-func getLocalPricingSyncData() map[string]any {
+func getLocalPricingSyncData(modelNames map[string]struct{}) map[string]any {
 	data := billing_setting.GetPricingSyncData(map[string]any(ratio_setting.GetExposedData()))
 	data["image_ratio"] = ratio_setting.GetImageRatioCopy()
 	data["audio_ratio"] = ratio_setting.GetAudioRatioCopy()
 	data["audio_completion_ratio"] = ratio_setting.GetAudioCompletionRatioCopy()
+	// Match modelPricingTarget's shared numeric keys before mode filtering;
+	// expressions, cache and image ratios remain exact-model configuration.
+	for _, field := range []string{"model_price", "model_ratio", "completion_ratio", "audio_ratio", "audio_completion_ratio"} {
+		configured := valueMap(data[field])
+		entries := maps.Clone(configured)
+		for name := range modelNames {
+			target := ratio_setting.FormatMatchingModelName(name)
+			if target == name {
+				continue
+			}
+			delete(entries, name)
+			if value, exists := configured[target]; exists {
+				entries[name] = value
+			}
+		}
+		data[field] = entries
+	}
 	return data
 }
 
@@ -573,13 +591,12 @@ func FetchUpstreamRatios(c *gin.Context) {
 	wg.Wait()
 	close(ch)
 
-	localData := effectivePricingSyncData(getLocalPricingSyncData())
-
 	var testResults []dto.TestResult
 	var successfulChannels []struct {
 		name string
 		data map[string]any
 	}
+	upstreamModels := make(map[string]struct{})
 
 	for r := range ch {
 		if r.Err != "" {
@@ -593,13 +610,20 @@ func FetchUpstreamRatios(c *gin.Context) {
 				Name:   r.Name,
 				Status: "success",
 			})
+			data := effectivePricingSyncData(r.Data)
 			successfulChannels = append(successfulChannels, struct {
 				name string
 				data map[string]any
-			}{name: r.Name, data: effectivePricingSyncData(r.Data)})
+			}{name: r.Name, data: data})
+			for _, field := range pricingSyncFields {
+				for name := range valueMap(data[field]) {
+					upstreamModels[name] = struct{}{}
+				}
+			}
 		}
 	}
 
+	localData := effectivePricingSyncData(getLocalPricingSyncData(upstreamModels))
 	differences := buildDifferences(localData, successfulChannels)
 	type modelSyncPrices struct {
 		Current   map[string]any            `json:"current"`

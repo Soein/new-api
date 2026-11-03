@@ -26,7 +26,8 @@ import {
   waitFor,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { useState } from 'react'
+import { StrictMode, useState } from 'react'
+import { toast } from 'sonner'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -408,26 +409,34 @@ describe('pricing synchronization', () => {
         },
       }
     })
-    const post = vi.spyOn(api, 'post').mockResolvedValue({
+    let saved = false
+    const post = vi.spyOn(api, 'post').mockImplementation(async () => ({
       data: {
         success: true,
         data: {
-          differences: {
-            m: {
-              billing_expr: {
-                current: null,
-                upstreams: { 'Upstream(7)': expression },
-                confidence: { 'Upstream(7)': true },
+          differences: saved
+            ? {}
+            : {
+                m: {
+                  billing_expr: {
+                    current: null,
+                    upstreams: { 'Upstream(7)': expression },
+                    confidence: { 'Upstream(7)': true },
+                  },
+                },
               },
-            },
-          },
           prices: {
             m: {
-              current: {
-                model_ratio: 1,
-                completion_ratio: 2,
-                billing_mode: 'ratio',
-              },
+              current: saved
+                ? {
+                    billing_mode: 'tiered_expr',
+                    billing_expr: expression,
+                  }
+                : {
+                    model_ratio: 1,
+                    completion_ratio: 2,
+                    billing_mode: 'ratio',
+                  },
               upstreams: {
                 'Upstream(7)': {
                   billing_mode: 'tiered_expr',
@@ -439,7 +448,7 @@ describe('pricing synchronization', () => {
           test_results: [{ name: 'Upstream(7)', status: 'success' }],
         },
       },
-    })
+    }))
     const patch = vi
       .spyOn(api, 'patch')
       .mockResolvedValueOnce({
@@ -448,7 +457,10 @@ describe('pricing synchronization', () => {
           message: 'Model pricing changed; reload before saving',
         },
       })
-      .mockResolvedValue({ data: { success: true } })
+      .mockImplementation(async () => {
+        saved = true
+        return { data: { success: true } }
+      })
     const client = new QueryClient({
       defaultOptions: {
         queries: { retry: false },
@@ -532,7 +544,7 @@ describe('pricing synchronization', () => {
         },
       ],
     })
-    expect(post).toHaveBeenCalledTimes(2)
+    expect(post).toHaveBeenCalledTimes(3)
     expect(
       get.mock.calls.filter(([url]) => url === '/api/option/model_pricing')
         .length
@@ -781,6 +793,17 @@ async function renderAdjustmentSync(
       },
     },
     c: { current: {}, upstreams: { 'Upstream(7)': { model_price: 21 } } },
+  },
+  fixtureOptions?: {
+    strictMode?: boolean
+    queryClient?: QueryClient
+    getModelPricing?: (
+      requested: string[],
+      config?: unknown
+    ) => Promise<{ data: unknown }> | { data: unknown }
+    getComparisonResponse?: (
+      request: unknown
+    ) => Promise<{ data: unknown }> | { data: unknown }
   }
 ) {
   useSystemConfigStore.getState().setConfig({
@@ -790,48 +813,80 @@ async function renderAdjustmentSync(
       usdExchangeRate: 7,
     },
   })
-  vi.spyOn(api, 'get').mockImplementation(async (url) => ({
-    data: {
-      success: true,
-      data:
-        url === '/api/ratio_sync/channels'
-          ? [
-              {
-                id: 7,
-                name: 'Upstream',
-                base_url: 'https://example.test',
-                type: 1,
-                status: 1,
-              },
-            ]
-          : {
-              entries: [],
-              empty_version: 'empty',
-              options: pricingOptions({}),
+  vi.spyOn(api, 'get').mockImplementation(async (url, config) => {
+    if (url === '/api/ratio_sync/channels') {
+      return {
+        data: {
+          success: true,
+          data: [
+            {
+              id: 7,
+              name: 'Upstream',
+              base_url: 'https://example.test',
+              type: 1,
+              status: 1,
             },
-    },
-  }))
-  vi.spyOn(api, 'post').mockResolvedValue({
-    data: {
-      success: true,
+          ],
+        },
+      }
+    }
+    const params = config?.params as URLSearchParams | undefined
+    const requested = params?.getAll?.('model') ?? []
+    if (fixtureOptions?.getModelPricing) {
+      return fixtureOptions.getModelPricing(requested, config)
+    }
+    return {
       data: {
-        prices: candidates,
-        differences: {},
-        test_results: [{ name: 'Upstream(7)', status: 'success' }],
+        success: true,
+        data: {
+          entries: requested.map((name: string) => ({
+            model_name: name,
+            numeric_model_name: name,
+            version: 'empty',
+            configured: {},
+            effective: {},
+          })),
+          empty_version: 'empty',
+          options: pricingOptions({}),
+        },
       },
-    },
+    }
+  })
+  const post = vi.spyOn(api, 'post').mockImplementation(async (url, data) => {
+    if (
+      url === '/api/ratio_sync/fetch' &&
+      fixtureOptions?.getComparisonResponse
+    ) {
+      return fixtureOptions.getComparisonResponse(data)
+    }
+    return {
+      data: {
+        success: true,
+        data: {
+          prices: candidates,
+          differences: {},
+          test_results: [{ name: 'Upstream(7)', status: 'success' }],
+        },
+      },
+    }
   })
   const patch = vi
     .spyOn(api, 'patch')
     .mockResolvedValue({ data: { success: true } })
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  })
-  render(
+  const client =
+    fixtureOptions?.queryClient ??
+    new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+  const ui = (
     <QueryClientProvider client={client}>
       <UpstreamRatioSync />
     </QueryClientProvider>
   )
+  render(fixtureOptions?.strictMode ? <StrictMode>{ui}</StrictMode> : ui)
   const user = userEvent.setup()
   await user.click(screen.getByRole('button', { name: 'Select price sources' }))
   await user.click(
@@ -843,7 +898,7 @@ async function renderAdjustmentSync(
       screen.queryByText('Fetching upstream prices...')
     ).not.toBeInTheDocument()
   )
-  return { user, patch }
+  return { user, patch, post }
 }
 
 it('applies bulk changes only to existing selections, allows row overrides and saves the frozen preview', async () => {
@@ -958,6 +1013,146 @@ it('applies bulk changes only to existing selections, allows row overrides and s
     })
   )
   expect(patch.mock.calls[0][1]).toHaveProperty('changes.length', 3)
+})
+
+it('locks table interactions during slow cache invalidation and reloads authoritatively once', async () => {
+  let resolveInvalidate: () => void = () => {}
+  const invalidatePromise = new Promise<void>((resolve) => {
+    resolveInvalidate = resolve
+  })
+
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  const origInvalidate = client.invalidateQueries.bind(client)
+  const invalidateSpy = vi
+    .spyOn(client, 'invalidateQueries')
+    .mockImplementation(async (filters, options) => {
+      await invalidatePromise
+      return origInvalidate(filters, options)
+    })
+
+  const { user, patch } = await renderAdjustmentSync(undefined, {
+    queryClient: client,
+  })
+
+  const selectA = await screen.findByRole('checkbox', {
+    name: 'Select price for a from Upstream(7)',
+  })
+  await user.click(selectA)
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+
+  const dialog = screen.getByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Changes' })
+  )
+
+  await waitFor(() => expect(patch).toHaveBeenCalledTimes(1))
+  await waitFor(() => expect(invalidateSpy).toHaveBeenCalled())
+  expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+
+  // During slow invalidation window, table shows loading state and controls are locked/disabled
+  expect(screen.getByText('Fetching upstream prices...')).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Select price sources' })
+  ).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Apply Sync' })).toBeDisabled()
+  expect(
+    screen.getByRole('combobox', { name: 'Set selected prices' })
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('button', { name: /Multiply by exchange rate/ })
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('button', { name: /Divide by exchange rate/ })
+  ).toBeDisabled()
+
+  // Release deferred invalidation
+  resolveInvalidate()
+
+  // Wait for post-sync refresh to complete
+  await waitFor(() =>
+    expect(
+      screen.queryByText('Fetching upstream prices...')
+    ).not.toBeInTheDocument()
+  )
+
+  // Controls are now unlocked
+  await waitFor(() => {
+    expect(
+      screen.getByRole('checkbox', {
+        name: 'Select price for a from Upstream(7)',
+      })
+    ).not.toBeDisabled()
+  })
+  expect(
+    screen.getByRole('checkbox', {
+      name: 'Select price for b from Upstream(7)',
+    })
+  ).not.toBeDisabled()
+  expect(
+    screen.getByRole('button', { name: 'Select price sources' })
+  ).not.toBeDisabled()
+
+  // Authoritative reload occurred once, exactly one PATCH was made
+  expect(patch).toHaveBeenCalledTimes(1)
+})
+
+it('does not repeat a confirmed successful PATCH when baseline reload fails and is retried', async () => {
+  let failBaseline = false
+  const toastErrorSpy = vi.spyOn(toast, 'error')
+  const { user, patch } = await renderAdjustmentSync(undefined, {
+    getModelPricing: async (requested) => {
+      if (failBaseline && requested.length === 0) {
+        throw new Error('Simulated baseline load failure')
+      }
+      return {
+        data: {
+          success: true,
+          data: {
+            entries: requested.map((name: string) => ({
+              model_name: name,
+              numeric_model_name: name,
+              version: 'empty',
+              configured: {},
+              effective: {},
+            })),
+            empty_version: 'empty',
+            options: pricingOptions({}),
+          },
+        },
+      }
+    },
+  })
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for a from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+
+  const dialog = screen.getByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+
+  failBaseline = true
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Changes' })
+  )
+
+  await waitFor(() => expect(patch).toHaveBeenCalledTimes(1))
+  expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+
+  await waitFor(() =>
+    expect(toastErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Simulated baseline load failure')
+    )
+  )
+
+  expect(patch).toHaveBeenCalledTimes(1)
 })
 
 it('does not compound repeated bulk conversion and resets adjustments when switching sources or clearing selection', async () => {
@@ -1385,4 +1580,780 @@ it('syncs v2 image rule expressions alongside flat price models when dividing by
       ]),
     })
   )
+})
+
+it('resolves wildcard alias in StrictMode, handles cancel and re-apply, and submits expected version', async () => {
+  const { user, patch } = await renderAdjustmentSync(
+    {
+      'gpt-4o-gizmo-new': {
+        current: { model_price: 1 },
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+    },
+    {
+      strictMode: true,
+      getModelPricing: (requested) => ({
+        data: {
+          success: true,
+          data: {
+            entries: requested.includes('gpt-4o-gizmo-new')
+              ? [
+                  {
+                    model_name: 'gpt-4o-gizmo-new',
+                    numeric_model_name: 'gpt-4o-gizmo-*',
+                    version: 'alias-v1',
+                    configured: { ModelPrice: 1 },
+                    effective: { ModelPrice: 1 },
+                  },
+                ]
+              : [],
+            empty_version: 'empty',
+            options: pricingOptions({
+              ModelPrice: '{"gpt-4o-gizmo-*":1}',
+            }),
+          },
+        },
+      }),
+    }
+  )
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-new from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+  const dialog = await screen.findByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+  expect(within(dialog).getByText('gpt-4o-gizmo-new')).toBeVisible()
+
+  await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+  expect(patch).not.toHaveBeenCalled()
+
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+  const reopened = await screen.findByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+  await user.click(
+    within(reopened).getByRole('button', { name: 'Confirm Changes' })
+  )
+  await waitFor(() =>
+    expect(patch).toHaveBeenCalledWith('/api/option/model_pricing', {
+      changes: [
+        {
+          model_name: 'gpt-4o-gizmo-new',
+          expected_version: 'alias-v1',
+          pricing: {
+            ModelPrice: 2,
+            'billing_setting.billing_mode': 'ratio',
+          },
+        },
+      ],
+    })
+  )
+})
+
+it('rejects conflicting selected numeric aliases with no preview and no writes', async () => {
+  const { user, patch } = await renderAdjustmentSync(
+    {
+      'gpt-4o-gizmo-a': {
+        current: {},
+        upstreams: { 'Upstream(7)': { model_price: 1 } },
+      },
+      'gpt-4o-gizmo-b': {
+        current: {},
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+    },
+    {
+      getModelPricing: (requested) => ({
+        data: {
+          success: true,
+          data: {
+            entries: [
+              ...(requested.includes('gpt-4o-gizmo-a')
+                ? [
+                    {
+                      model_name: 'gpt-4o-gizmo-a',
+                      numeric_model_name: 'gpt-4o-gizmo-*',
+                      version: 'alias-v1',
+                      configured: { ModelPrice: 1 },
+                      effective: { ModelPrice: 1 },
+                    },
+                  ]
+                : []),
+              ...(requested.includes('gpt-4o-gizmo-b')
+                ? [
+                    {
+                      model_name: 'gpt-4o-gizmo-b',
+                      numeric_model_name: 'gpt-4o-gizmo-*',
+                      version: 'alias-v2',
+                      configured: { ModelPrice: 1 },
+                      effective: { ModelPrice: 1 },
+                    },
+                  ]
+                : []),
+            ],
+            empty_version: 'empty',
+            options: pricingOptions({
+              ModelPrice: '{"gpt-4o-gizmo-*":1}',
+            }),
+          },
+        },
+      }),
+    }
+  )
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-a from Upstream(7)',
+    })
+  )
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-b from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+
+  await waitFor(() => {
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  })
+  expect(patch).not.toHaveBeenCalled()
+})
+
+it('allows compatible mixed expression and numeric alias selections to preview and save', async () => {
+  const { user, patch } = await renderAdjustmentSync(
+    {
+      'gpt-4o-gizmo-a': {
+        current: { model_price: 1 },
+        upstreams: {
+          'Upstream(7)': {
+            billing_mode: 'tiered_expr',
+            billing_expr: 'tier("base", p * 2)',
+          },
+        },
+      },
+      'gpt-4o-gizmo-b': {
+        current: { model_price: 1 },
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+    },
+    {
+      getModelPricing: (requested) => ({
+        data: {
+          success: true,
+          data: {
+            entries: [
+              ...(requested.includes('gpt-4o-gizmo-a')
+                ? [
+                    {
+                      model_name: 'gpt-4o-gizmo-a',
+                      numeric_model_name: 'gpt-4o-gizmo-*',
+                      version: 'alias-v1',
+                      configured: { ModelPrice: 1 },
+                      effective: { ModelPrice: 1 },
+                    },
+                  ]
+                : []),
+              ...(requested.includes('gpt-4o-gizmo-b')
+                ? [
+                    {
+                      model_name: 'gpt-4o-gizmo-b',
+                      numeric_model_name: 'gpt-4o-gizmo-*',
+                      version: 'alias-v2',
+                      configured: { ModelPrice: 1 },
+                      effective: { ModelPrice: 1 },
+                    },
+                  ]
+                : []),
+            ],
+            empty_version: 'empty',
+            options: pricingOptions({
+              ModelPrice: '{"gpt-4o-gizmo-*":1}',
+            }),
+          },
+        },
+      }),
+    }
+  )
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-a from Upstream(7)',
+    })
+  )
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-b from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+
+  const dialog = await screen.findByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+  expect(within(dialog).getByText('gpt-4o-gizmo-a')).toBeVisible()
+  expect(within(dialog).getByText('gpt-4o-gizmo-b')).toBeVisible()
+
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Changes' })
+  )
+  await waitFor(() =>
+    expect(patch).toHaveBeenCalledWith('/api/option/model_pricing', {
+      changes: [
+        {
+          model_name: 'gpt-4o-gizmo-a',
+          expected_version: 'alias-v1',
+          pricing: {
+            ModelPrice: 2,
+            'billing_setting.billing_mode': 'tiered_expr',
+            'billing_setting.billing_expr': 'tier("base", p * 2)',
+          },
+        },
+        {
+          model_name: 'gpt-4o-gizmo-b',
+          expected_version: 'alias-v2',
+          pricing: {
+            ModelPrice: 2,
+            'billing_setting.billing_mode': 'ratio',
+          },
+        },
+      ],
+    })
+  )
+})
+
+it('refreshes sibling alias effective price in table after confirming single alias selection', async () => {
+  let isSaved = false
+  const requestedBatches: string[][] = []
+  const unrelatedRows: PricingSyncModels = {}
+  for (let i = 0; i < 20; i++) {
+    unrelatedRows[`z-catalog-extra-${i}`] = {
+      current: { model_price: 10, billing_mode: 'ratio' },
+      upstreams: { 'Upstream(7)': { model_price: 10 } },
+    }
+  }
+  const candidates: PricingSyncModels = {
+    'gpt-4o-gizmo-a': {
+      current: { model_price: 1 },
+      upstreams: { 'Upstream(7)': { model_price: 2 } },
+    },
+    'gpt-4o-gizmo-b': {
+      current: { model_price: 1 },
+      upstreams: { 'Upstream(7)': { model_price: 2 } },
+    },
+    'token-model-unrelated': {
+      current: { model_ratio: 2, billing_mode: 'ratio' },
+      upstreams: {
+        'Upstream(7)': { model_ratio: 2, billing_mode: 'ratio' },
+      },
+    },
+    ...unrelatedRows,
+  }
+
+  const { user, patch, post } = await renderAdjustmentSync(candidates, {
+    getModelPricing: (requested) => {
+      requestedBatches.push(requested)
+      return {
+        data: {
+          success: true,
+          data: {
+            entries: [
+              ...(requested.includes('gpt-4o-gizmo-a')
+                ? [
+                    {
+                      model_name: 'gpt-4o-gizmo-a',
+                      numeric_model_name: 'gpt-4o-gizmo-*',
+                      version: 'alias-v1',
+                      configured: { ModelPrice: 1 },
+                      effective: { ModelPrice: isSaved ? 2 : 1 },
+                    },
+                  ]
+                : []),
+              ...(requested.includes('gpt-4o-gizmo-b')
+                ? [
+                    {
+                      model_name: 'gpt-4o-gizmo-b',
+                      numeric_model_name: 'gpt-4o-gizmo-*',
+                      version: 'alias-v2',
+                      configured: { ModelPrice: isSaved ? 2 : 1 },
+                      effective: { ModelPrice: isSaved ? 2 : 1 },
+                    },
+                  ]
+                : []),
+            ],
+            empty_version: 'empty',
+            options: pricingOptions({
+              ModelPrice: isSaved
+                ? '{"gpt-4o-gizmo-*":2}'
+                : '{"gpt-4o-gizmo-*":1}',
+            }),
+          },
+        },
+      }
+    },
+    getComparisonResponse: () => ({
+      data: {
+        success: true,
+        data: {
+          prices: {
+            ...candidates,
+            'gpt-4o-gizmo-a': {
+              current: { model_price: isSaved ? 2 : 1, billing_mode: 'ratio' },
+              upstreams: { 'Upstream(7)': { model_price: 2 } },
+            },
+            'gpt-4o-gizmo-b': {
+              current: { model_price: isSaved ? 2 : 1, billing_mode: 'ratio' },
+              upstreams: { 'Upstream(7)': { model_price: 2 } },
+            },
+            'token-model-unrelated': {
+              current: { model_ratio: 2, billing_mode: 'ratio' },
+              upstreams: {
+                'Upstream(7)': { model_ratio: 2, billing_mode: 'ratio' },
+              },
+            },
+          },
+          differences: isSaved
+            ? {}
+            : {
+                'gpt-4o-gizmo-a': {
+                  model_price: {
+                    current: 1,
+                    upstreams: { 'Upstream(7)': 2 },
+                    confidence: { 'Upstream(7)': true },
+                  },
+                },
+                'gpt-4o-gizmo-b': {
+                  model_price: {
+                    current: 1,
+                    upstreams: { 'Upstream(7)': 2 },
+                    confidence: { 'Upstream(7)': true },
+                  },
+                },
+              },
+          test_results: [{ name: 'Upstream(7)', status: 'success' }],
+        },
+      },
+    }),
+  })
+
+  await user.click(
+    screen.getByRole('checkbox', {
+      name: 'Show models with matching prices',
+    })
+  )
+
+  const rowABefore = (await screen.findByText('gpt-4o-gizmo-a')).closest('tr')
+  const rowBBefore = (await screen.findByText('gpt-4o-gizmo-b')).closest('tr')
+  const rowTokenBefore = (
+    await screen.findByText('token-model-unrelated')
+  ).closest('tr')
+  expect(
+    rowABefore?.querySelector('[data-column-id="current"]')
+  ).toHaveTextContent('$1')
+  expect(
+    rowBBefore?.querySelector('[data-column-id="current"]')
+  ).toHaveTextContent('$1')
+  expect(
+    rowTokenBefore?.querySelector('[data-column-id="current"]')
+  ).toHaveTextContent('$4')
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-b from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+
+  const dialog = await screen.findByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+  expect(within(dialog).getByText('gpt-4o-gizmo-b')).toBeVisible()
+  expect(within(dialog).queryByText('gpt-4o-gizmo-a')).not.toBeInTheDocument()
+
+  // Verify intentional lookup for selected alias occurred before preview
+  expect(requestedBatches).toContainEqual(['gpt-4o-gizmo-b'])
+
+  patch.mockImplementationOnce(async () => {
+    isSaved = true
+    return { data: { success: true } }
+  })
+
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Changes' })
+  )
+
+  await waitFor(() =>
+    expect(patch).toHaveBeenCalledWith('/api/option/model_pricing', {
+      changes: [
+        {
+          model_name: 'gpt-4o-gizmo-b',
+          expected_version: 'alias-v2',
+          pricing: {
+            ModelPrice: 2,
+            'billing_setting.billing_mode': 'ratio',
+          },
+        },
+      ],
+    })
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+
+  // Verify comparison was sent again with original request
+  expect(post).toHaveBeenCalledTimes(2)
+  expect(post).toHaveBeenLastCalledWith(
+    '/api/ratio_sync/fetch',
+    expect.objectContaining({
+      upstreams: expect.any(Array),
+      timeout: 10,
+      include_unchanged: true,
+    })
+  )
+
+  // Verify no name-heavy GET was sent during post-save refresh
+  const intentionalIndex = requestedBatches.findIndex(
+    (batch) => batch.length === 1 && batch[0] === 'gpt-4o-gizmo-b'
+  )
+  const postSaveBatches = requestedBatches.slice(intentionalIndex + 1)
+  expect(postSaveBatches.length).toBeGreaterThan(0)
+  for (const batch of postSaveBatches) {
+    expect(batch.length).toBe(0)
+  }
+
+  const rowAAfter = (await screen.findByText('gpt-4o-gizmo-a')).closest('tr')
+  const rowBAfter = (await screen.findByText('gpt-4o-gizmo-b')).closest('tr')
+  const rowTokenAfter = (
+    await screen.findByText('token-model-unrelated')
+  ).closest('tr')
+  await waitFor(() => {
+    expect(
+      rowAAfter?.querySelector('[data-column-id="current"]')
+    ).toHaveTextContent('$2')
+  })
+  expect(
+    rowBAfter?.querySelector('[data-column-id="current"]')
+  ).toHaveTextContent('$2')
+  // Verify token-only model remains identical without injected default ratios
+  expect(
+    rowTokenAfter?.querySelector('[data-column-id="current"]')
+  ).toHaveTextContent('$4')
+  expect(
+    within(rowTokenAfter as HTMLElement).queryByText(/Completion|Output/)
+  ).not.toBeInTheDocument()
+})
+
+it('retains low confidence warning when previously matching source becomes divergent on server refresh', async () => {
+  let isSaved = false
+  const { user, patch } = await renderAdjustmentSync(
+    {
+      'source-match-model': {
+        current: { model_price: 2, billing_mode: 'ratio' },
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+      'target-change-model': {
+        current: { model_price: 1 },
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+    },
+    {
+      getComparisonResponse: () => ({
+        data: {
+          success: true,
+          data: {
+            prices: {
+              'source-match-model': {
+                current: {
+                  model_price: isSaved ? 3 : 2,
+                  billing_mode: 'ratio',
+                },
+                upstreams: { 'Upstream(7)': { model_price: 2 } },
+              },
+              'target-change-model': {
+                current: {
+                  model_price: isSaved ? 2 : 1,
+                  billing_mode: 'ratio',
+                },
+                upstreams: { 'Upstream(7)': { model_price: 2 } },
+              },
+            },
+            differences: isSaved
+              ? {
+                  'source-match-model': {
+                    model_price: {
+                      current: 3,
+                      upstreams: { 'Upstream(7)': 2 },
+                      confidence: { 'Upstream(7)': false },
+                    },
+                  },
+                }
+              : {
+                  'target-change-model': {
+                    model_price: {
+                      current: 1,
+                      upstreams: { 'Upstream(7)': 2 },
+                      confidence: { 'Upstream(7)': true },
+                    },
+                  },
+                },
+            test_results: [{ name: 'Upstream(7)', status: 'success' }],
+          },
+        },
+      }),
+    }
+  )
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for target-change-model from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+  const dialog = await screen.findByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+
+  patch.mockImplementationOnce(async () => {
+    isSaved = true
+    return { data: { success: true } }
+  })
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Changes' })
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+
+  expect(await screen.findByText('source-match-model')).toBeVisible()
+  expect(screen.getByText('Verify upstream pricing')).toBeVisible()
+})
+
+it('proves exactly one PATCH is sent across refresh failure and subsequent retry', async () => {
+  let isSaved = false
+  let shouldFailRefresh = false
+  const { user, patch } = await renderAdjustmentSync(
+    {
+      'retry-test-model': {
+        current: { model_price: 1 },
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+    },
+    {
+      getComparisonResponse: () => {
+        if (shouldFailRefresh) {
+          throw new Error('Upstream comparison failed')
+        }
+        return {
+          data: {
+            success: true,
+            data: {
+              prices: {
+                'retry-test-model': {
+                  current: {
+                    model_price: isSaved ? 2 : 1,
+                    billing_mode: 'ratio',
+                  },
+                  upstreams: { 'Upstream(7)': { model_price: 2 } },
+                },
+              },
+              differences: isSaved
+                ? {}
+                : {
+                    'retry-test-model': {
+                      model_price: {
+                        current: 1,
+                        upstreams: { 'Upstream(7)': 2 },
+                        confidence: { 'Upstream(7)': true },
+                      },
+                    },
+                  },
+              test_results: [{ name: 'Upstream(7)', status: 'success' }],
+            },
+          },
+        }
+      },
+    }
+  )
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for retry-test-model from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+  const dialog = await screen.findByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+
+  patch.mockImplementationOnce(async () => {
+    isSaved = true
+    shouldFailRefresh = true
+    return { data: { success: true } }
+  })
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Changes' })
+  )
+
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+
+  // Verify ErrorState is displayed and retry button is present
+  expect(await screen.findByText('Upstream comparison failed')).toBeVisible()
+  expect(patch).toHaveBeenCalledTimes(1)
+
+  // Click Retry
+  shouldFailRefresh = false
+  await user.click(screen.getByRole('button', { name: 'Retry' }))
+
+  // Verify table refreshes with authoritative prices, and no second PATCH was called
+  await waitFor(() =>
+    expect(
+      screen.queryByText('Upstream comparison failed')
+    ).not.toBeInTheDocument()
+  )
+  expect(patch).toHaveBeenCalledTimes(1)
+})
+
+it('discards stale preview if selections change during delayed lookup and re-enables apply', async () => {
+  let resolveLookup: (value?: unknown) => void = () => {}
+  const { user, patch } = await renderAdjustmentSync(
+    {
+      'gpt-4o-gizmo-new': {
+        current: { model_price: 1 },
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+    },
+    {
+      getModelPricing: (requested) => {
+        if (requested.includes('gpt-4o-gizmo-new')) {
+          return new Promise((resolve) => {
+            resolveLookup = () =>
+              resolve({
+                data: {
+                  success: true,
+                  data: {
+                    entries: [
+                      {
+                        model_name: 'gpt-4o-gizmo-new',
+                        numeric_model_name: 'gpt-4o-gizmo-*',
+                        version: 'alias-v1',
+                        configured: { ModelPrice: 1 },
+                        effective: { ModelPrice: 1 },
+                      },
+                    ],
+                    empty_version: 'empty',
+                    options: pricingOptions({
+                      ModelPrice: '{"gpt-4o-gizmo-*":1}',
+                    }),
+                  },
+                },
+              })
+          })
+        }
+        return {
+          data: {
+            success: true,
+            data: {
+              entries: [],
+              empty_version: 'empty',
+              options: pricingOptions({
+                ModelPrice: '{"gpt-4o-gizmo-*":1}',
+              }),
+            },
+          },
+        }
+      },
+    }
+  )
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-new from Upstream(7)',
+    })
+  )
+
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+  await user.click(screen.getByRole('button', { name: 'Clear selection' }))
+
+  resolveLookup()
+
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+  expect(patch).not.toHaveBeenCalled()
+
+  await user.click(
+    screen.getByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-new from Upstream(7)',
+    })
+  )
+  const applyButton = screen.getByRole('button', { name: 'Apply Sync' })
+  expect(applyButton).toBeEnabled()
+  await user.click(applyButton)
+  resolveLookup()
+
+  const dialog = await screen.findByRole('alertdialog', {
+    name: 'Preview price changes',
+  })
+  expect(dialog).toBeVisible()
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Changes' })
+  )
+  await waitFor(() => expect(patch).toHaveBeenCalledTimes(1))
+})
+
+it('aborts preview without saving when server pricing drifted before resolution', async () => {
+  const { user, patch } = await renderAdjustmentSync(
+    {
+      'gpt-4o-gizmo-new': {
+        current: { model_price: 1 },
+        upstreams: { 'Upstream(7)': { model_price: 2 } },
+      },
+    },
+    {
+      getModelPricing: (requested) => ({
+        data: {
+          success: true,
+          data: {
+            entries: requested.includes('gpt-4o-gizmo-new')
+              ? [
+                  {
+                    model_name: 'gpt-4o-gizmo-new',
+                    numeric_model_name: 'gpt-4o-gizmo-*',
+                    version: 'alias-v2',
+                    configured: { ModelPrice: 3 },
+                    effective: { ModelPrice: 3 },
+                  },
+                ]
+              : [],
+            empty_version: 'empty',
+            options: pricingOptions({
+              ModelPrice: requested.includes('gpt-4o-gizmo-new')
+                ? '{"gpt-4o-gizmo-*":3}'
+                : '{"gpt-4o-gizmo-*":1}',
+            }),
+          },
+        },
+      }),
+    }
+  )
+
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select price for gpt-4o-gizmo-new from Upstream(7)',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply Sync' }))
+
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+  expect(patch).not.toHaveBeenCalled()
 })

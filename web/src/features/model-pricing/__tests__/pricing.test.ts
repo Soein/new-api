@@ -32,6 +32,7 @@ import {
   preparePricingChanges,
   resolvePricingSnapshot,
   saveModelPricing,
+  PRICING_URL_BYTE_BUDGET,
   type ModelPricingConfig,
   type ModelPricingEntry,
 } from '../api'
@@ -386,6 +387,234 @@ describe('shared model pricing', () => {
     })
 
     expect(() => buildPricingChanges(snapshot, before, after)).toThrow()
+  })
+
+  it('rejects conflicting selected numeric aliases before preview or saving in either selection order', () => {
+    const snapshot: ModelPricingConfig = {
+      options: pricingOptions({
+        ModelPrice: '{"gpt-4o-gizmo-*":1}',
+      }),
+      empty_version: 'empty',
+      entries: [
+        {
+          model_name: 'gpt-4o-gizmo-a',
+          numeric_model_name: 'gpt-4o-gizmo-*',
+          version: 'v1',
+          configured: { ModelPrice: 1 },
+          effective: { ModelPrice: 1 },
+        },
+        {
+          model_name: 'gpt-4o-gizmo-b',
+          numeric_model_name: 'gpt-4o-gizmo-*',
+          version: 'v2',
+          configured: { ModelPrice: 1 },
+          effective: { ModelPrice: 1 },
+        },
+      ],
+    }
+    const before = pricingDisplayOptions(snapshot)
+
+    // Order 1: A=1 (equals inherited price), B=2
+    const selectionsOrder1 = {
+      'gpt-4o-gizmo-a': { model_price: 1 },
+      'gpt-4o-gizmo-b': { model_price: 2 },
+    }
+    const after1 = applyPriceSyncSelections(before, selectionsOrder1)
+    expect(() =>
+      buildPricingChanges(
+        snapshot,
+        before,
+        after1,
+        Object.keys(selectionsOrder1)
+      )
+    ).toThrow()
+
+    // Order 2: B=2, A=1
+    const selectionsOrder2 = {
+      'gpt-4o-gizmo-b': { model_price: 2 },
+      'gpt-4o-gizmo-a': { model_price: 1 },
+    }
+    const after2 = applyPriceSyncSelections(before, selectionsOrder2)
+    expect(() =>
+      buildPricingChanges(
+        snapshot,
+        before,
+        after2,
+        Object.keys(selectionsOrder2)
+      )
+    ).toThrow()
+  })
+
+  it('allows compatible selected numeric aliases and does not spuriously conflict with unselected siblings', () => {
+    const snapshot: ModelPricingConfig = {
+      options: pricingOptions({
+        ModelPrice: '{"gpt-4o-gizmo-*":1}',
+      }),
+      empty_version: 'empty',
+      entries: [
+        {
+          model_name: 'gpt-4o-gizmo-a',
+          numeric_model_name: 'gpt-4o-gizmo-*',
+          version: 'v1',
+          configured: { ModelPrice: 1 },
+          effective: { ModelPrice: 1 },
+        },
+        {
+          model_name: 'gpt-4o-gizmo-b',
+          numeric_model_name: 'gpt-4o-gizmo-*',
+          version: 'v2',
+          configured: { ModelPrice: 1 },
+          effective: { ModelPrice: 1 },
+        },
+      ],
+    }
+    const before = pricingDisplayOptions(snapshot)
+
+    // Compatible group: both selected with same price (2)
+    const compatibleSelections = {
+      'gpt-4o-gizmo-a': { model_price: 2 },
+      'gpt-4o-gizmo-b': { model_price: 2 },
+    }
+    const afterCompatible = applyPriceSyncSelections(
+      before,
+      compatibleSelections
+    )
+    const changesCompatible = buildPricingChanges(
+      snapshot,
+      before,
+      afterCompatible,
+      Object.keys(compatibleSelections)
+    )
+    expect(changesCompatible).toEqual([
+      {
+        model_name: 'gpt-4o-gizmo-a',
+        expected_version: 'v1',
+        pricing: {
+          ModelPrice: 2,
+          'billing_setting.billing_mode': 'ratio',
+        },
+      },
+      {
+        model_name: 'gpt-4o-gizmo-b',
+        expected_version: 'v2',
+        pricing: {
+          ModelPrice: 2,
+          'billing_setting.billing_mode': 'ratio',
+        },
+      },
+    ])
+
+    // One selection: only B selected with price 2; unselected sibling A must not conflict
+    const singleSelection = {
+      'gpt-4o-gizmo-b': { model_price: 2 },
+    }
+    const afterSingle = applyPriceSyncSelections(before, singleSelection)
+    const changesSingle = buildPricingChanges(
+      snapshot,
+      before,
+      afterSingle,
+      Object.keys(singleSelection)
+    )
+    expect(changesSingle).toEqual([
+      {
+        model_name: 'gpt-4o-gizmo-b',
+        expected_version: 'v2',
+        pricing: {
+          ModelPrice: 2,
+          'billing_setting.billing_mode': 'ratio',
+        },
+      },
+    ])
+  })
+
+  it('allows compatible mixed expression and numeric alias selections in either order', () => {
+    const snapshot: ModelPricingConfig = {
+      options: pricingOptions({
+        ModelPrice: '{"gpt-4o-gizmo-*":1}',
+      }),
+      empty_version: 'empty',
+      entries: [
+        {
+          model_name: 'gpt-4o-gizmo-a',
+          numeric_model_name: 'gpt-4o-gizmo-*',
+          version: 'v1',
+          configured: { ModelPrice: 1 },
+          effective: { ModelPrice: 1 },
+        },
+        {
+          model_name: 'gpt-4o-gizmo-b',
+          numeric_model_name: 'gpt-4o-gizmo-*',
+          version: 'v2',
+          configured: { ModelPrice: 1 },
+          effective: { ModelPrice: 1 },
+        },
+      ],
+    }
+    const before = pricingDisplayOptions(snapshot)
+
+    // Order 1: A=expression, B=numeric2
+    const selectionsOrder1 = {
+      'gpt-4o-gizmo-a': { billing_expr: 'tier("base", p * 2)' },
+      'gpt-4o-gizmo-b': { model_price: 2 },
+    }
+    const after1 = applyPriceSyncSelections(before, selectionsOrder1)
+    const changes1 = buildPricingChanges(
+      snapshot,
+      before,
+      after1,
+      Object.keys(selectionsOrder1)
+    )
+    expect(changes1).toEqual([
+      {
+        model_name: 'gpt-4o-gizmo-a',
+        expected_version: 'v1',
+        pricing: {
+          ModelPrice: 2,
+          'billing_setting.billing_mode': 'tiered_expr',
+          'billing_setting.billing_expr': 'tier("base", p * 2)',
+        },
+      },
+      {
+        model_name: 'gpt-4o-gizmo-b',
+        expected_version: 'v2',
+        pricing: {
+          ModelPrice: 2,
+          'billing_setting.billing_mode': 'ratio',
+        },
+      },
+    ])
+
+    // Order 2: B=numeric2, A=expression
+    const selectionsOrder2 = {
+      'gpt-4o-gizmo-b': { model_price: 2 },
+      'gpt-4o-gizmo-a': { billing_expr: 'tier("base", p * 2)' },
+    }
+    const after2 = applyPriceSyncSelections(before, selectionsOrder2)
+    const changes2 = buildPricingChanges(
+      snapshot,
+      before,
+      after2,
+      Object.keys(selectionsOrder2)
+    )
+    expect(changes2).toEqual([
+      {
+        model_name: 'gpt-4o-gizmo-a',
+        expected_version: 'v1',
+        pricing: {
+          ModelPrice: 2,
+          'billing_setting.billing_mode': 'tiered_expr',
+          'billing_setting.billing_expr': 'tier("base", p * 2)',
+        },
+      },
+      {
+        model_name: 'gpt-4o-gizmo-b',
+        expected_version: 'v2',
+        pricing: {
+          ModelPrice: 2,
+          'billing_setting.billing_mode': 'ratio',
+        },
+      },
+    ])
   })
 
   it('projects canonical configured prices and removes stale raw values without mutating source snapshot options', () => {
@@ -909,6 +1138,156 @@ describe('shared model pricing', () => {
 
     await expect(
       resolvePricingSnapshot(snapshot, ['gpt-4o-gizmo-new'])
+    ).rejects.toThrow()
+  })
+
+  it('batches missing model names under URL byte budget and builds confirmed changes for 500+ models', async () => {
+    const names: string[] = []
+    for (let i = 0; i < 520; i++) {
+      names.push(
+        `vendor/custom-model-${i.toString().padStart(4, '0')}&tier=standard 中文%20`
+      )
+    }
+
+    const snapshot: ModelPricingConfig = {
+      options: pricingOptions({}),
+      empty_version: 'v-empty',
+      entries: [],
+    }
+
+    const requestedBatches: string[][] = []
+    vi.spyOn(api, 'get').mockImplementation(async (url, config) => {
+      const params = (config as { params?: URLSearchParams })?.params
+      const targetUrl = `${url}?${params?.toString() ?? ''}`
+      if (targetUrl.length > PRICING_URL_BYTE_BUDGET) {
+        throw new Error(
+          `414 URI Too Long: request length ${targetUrl.length} exceeds ${PRICING_URL_BYTE_BUDGET}`
+        )
+      }
+      const models = params?.getAll('model') ?? []
+      requestedBatches.push(models)
+      return {
+        data: {
+          success: true,
+          data: {
+            options: snapshot.options,
+            empty_version: snapshot.empty_version,
+            entries: models.map((name) => ({
+              model_name: name,
+              numeric_model_name: name,
+              version: `ver-${name}`,
+              configured: {},
+              effective: {},
+            })),
+          },
+        },
+      }
+    })
+
+    const resolved = await resolvePricingSnapshot(snapshot, names)
+
+    expect(requestedBatches.length).toBeGreaterThan(1)
+    expect(requestedBatches.flat()).toEqual(names)
+    expect(snapshot.entries).toHaveLength(0)
+
+    expect(resolved.entries).toHaveLength(names.length)
+    expect(resolved.entries.map((e) => e.model_name)).toEqual(names)
+    expect(resolved.empty_version).toBe('v-empty')
+
+    const resolutions = Object.fromEntries(
+      names.map((name) => [name, { model_price: 1 }])
+    )
+    const before = pricingDisplayOptions(resolved)
+    const after = applyPriceSyncSelections(before, resolutions)
+    const changes = buildPricingChanges(resolved, before, after, names)
+
+    expect(changes).toHaveLength(names.length)
+    for (let i = 0; i < names.length; i++) {
+      expect(changes[i].model_name).toBe(names[i])
+      expect(changes[i].expected_version).toBe(`ver-${names[i]}`)
+      expect(changes[i].pricing).toHaveProperty('ModelPrice', 1)
+    }
+  })
+
+  it('rejects oversized single model name without submitting an over-limit URL', async () => {
+    const oversized = 'm'.repeat(PRICING_URL_BYTE_BUDGET + 100)
+    const snapshot: ModelPricingConfig = {
+      options: pricingOptions({}),
+      empty_version: 'v-empty',
+      entries: [],
+    }
+
+    const getSpy = vi.spyOn(api, 'get')
+
+    await expect(
+      resolvePricingSnapshot(snapshot, [oversized])
+    ).rejects.toThrow()
+    expect(getSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects and leaves no partial result when late batch fails on network or CAS mismatch', async () => {
+    const snapshot: ModelPricingConfig = {
+      options: pricingOptions({}),
+      empty_version: 'v-empty',
+      entries: [],
+    }
+
+    const filler1 = 'f1-'.repeat(800)
+    const filler2 = 'f2-'.repeat(800)
+    let callCount = 0
+
+    vi.spyOn(api, 'get').mockImplementation(async (_url, config) => {
+      callCount++
+      if (callCount === 2) {
+        throw new Error('500 Internal Server Error on batch 2')
+      }
+      const params = (config as { params?: URLSearchParams })?.params
+      const models = params?.getAll('model') ?? []
+      return {
+        data: {
+          success: true,
+          data: {
+            options: snapshot.options,
+            empty_version: snapshot.empty_version,
+            entries: models.map((name) => ({
+              model_name: name,
+              version: `ver-${name}`,
+              configured: {},
+              effective: {},
+            })),
+          },
+        },
+      }
+    })
+
+    await expect(
+      resolvePricingSnapshot(snapshot, [filler1, filler2])
+    ).rejects.toThrow('500 Internal Server Error on batch 2')
+
+    callCount = 0
+    vi.spyOn(api, 'get').mockImplementation(async (_url, config) => {
+      callCount++
+      const params = (config as { params?: URLSearchParams })?.params
+      const models = params?.getAll('model') ?? []
+      return {
+        data: {
+          success: true,
+          data: {
+            options: snapshot.options,
+            empty_version: snapshot.empty_version,
+            entries: models.map((name) => ({
+              model_name: name,
+              version: `ver-${name}`,
+              configured: callCount === 2 ? { ModelPrice: 999 } : {},
+              effective: {},
+            })),
+          },
+        },
+      }
+    })
+
+    await expect(
+      resolvePricingSnapshot(snapshot, [filler1, filler2])
     ).rejects.toThrow()
   })
 

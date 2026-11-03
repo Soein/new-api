@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckSquare, RefreshCcw } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -29,6 +29,7 @@ import {
   buildPricingChanges,
   getModelPricing,
   invalidateModelPricing,
+  resolvePricingSnapshot,
   saveModelPricing,
   type ModelPricingConfig,
   type ModelPricingChange,
@@ -141,6 +142,18 @@ export function UpstreamRatioSync() {
   )
   const [preview, setPreview] = useState<SyncPreview | null>(null)
   const [loadingBaseline, setLoadingBaseline] = useState(false)
+  const [isResolvingBaseline, setIsResolvingBaseline] = useState(false)
+  const isResolvingRef = useRef(false)
+  const syncRequestIdRef = useRef(0)
+  const lastFetchRequestRef = useRef<
+    Parameters<typeof fetchUpstreamRatios>[0] | null
+  >(null)
+  useEffect(() => {
+    const syncRequestId = syncRequestIdRef
+    return () => {
+      syncRequestId.current++
+    }
+  }, [])
   const { data: channelsData } = useQuery({
     queryKey: ['upstream-channels'],
     queryFn: async () => requireServerSuccess(await getUpstreamChannels()),
@@ -200,11 +213,13 @@ export function UpstreamRatioSync() {
       return response
     },
     onMutate: () => {
+      syncRequestIdRef.current++
       setPrices({})
       setDifferences({})
       setSelections({})
     },
-    onSuccess: (response) => {
+    onSuccess: (response, variables) => {
+      lastFetchRequestRef.current = variables
       const errors = response.data.test_results.filter(
         (result) => result.status === 'error'
       )
@@ -234,24 +249,30 @@ export function UpstreamRatioSync() {
       await saveModelPricing(confirmed.changes)
       return confirmed.resolutions
     },
-    onSuccess: async (saved) => {
-      setPrices((previous) =>
-        Object.fromEntries(
-          Object.entries(previous).map(([name, row]) => [
-            name,
-            { ...row, current: saved[name] ?? row.current },
-          ])
-        )
-      )
-      setSelections({})
+    onSuccess: async () => {
+      const lastRequest = lastFetchRequestRef.current ?? fetchMutation.variables
+      if (lastRequest) {
+        lastFetchRequestRef.current = lastRequest
+      }
       setConflictDialogOpen(false)
-      setPricingBaseline(null)
+      setPreview(null)
+      setSelections({})
       toast.success(t('Prices synced successfully'))
-      await invalidateModelPricing(queryClient)
+      setLoadingBaseline(true)
       try {
-        setPricingBaseline(await getModelPricing())
+        await invalidateModelPricing(queryClient)
+        if (lastRequest) {
+          const fresh = await getModelPricing()
+          setPricingBaseline(fresh)
+          fetchMutation.mutate(lastRequest)
+        }
       } catch (error) {
-        handleServerError(error, t('Reload pricing'))
+        setPrices({})
+        setDifferences({})
+        setPricingBaseline(null)
+        handleServerError(error, t('Failed to load model pricing'))
+      } finally {
+        setLoadingBaseline(false)
       }
     },
     onError: (error: Error) =>
@@ -272,7 +293,10 @@ export function UpstreamRatioSync() {
       endpoint:
         channelEndpoints[channel.id] || getDefaultEndpointForChannel(channel),
     }))
+    const request = { upstreams, timeout: 10, include_unchanged: true }
+    lastFetchRequestRef.current = request
     setLoadingBaseline(true)
+    syncRequestIdRef.current++
     setPrices({})
     setDifferences({})
     fetchMutation.reset()
@@ -281,15 +305,35 @@ export function UpstreamRatioSync() {
     syncMutation.reset()
     try {
       setPricingBaseline(await getModelPricing())
-      fetchMutation.mutate({ upstreams, timeout: 10, include_unchanged: true })
+      fetchMutation.mutate(request)
     } catch (error) {
       handleServerError(error, t('Failed to load model pricing'))
     } finally {
       setLoadingBaseline(false)
     }
   }
+  const handleRetryFetch = async () => {
+    const lastRequest = lastFetchRequestRef.current ?? fetchMutation.variables
+    if (lastRequest) {
+      setLoadingBaseline(true)
+      try {
+        setPricingBaseline(await getModelPricing())
+        fetchMutation.mutate(lastRequest)
+      } catch (error) {
+        setPrices({})
+        setDifferences({})
+        setPricingBaseline(null)
+        handleServerError(error, t('Failed to load model pricing'))
+      } finally {
+        setLoadingBaseline(false)
+      }
+      return
+    }
+    void handleConfirmChannelSelection(selectedChannelIds)
+  }
   const handleSelectPrices = useCallback(
     (selected: PricingSourceSelection[]) => {
+      syncRequestIdRef.current++
       setSelections((previous) => {
         const next = { ...previous }
         for (const entry of selected) {
@@ -303,6 +347,7 @@ export function UpstreamRatioSync() {
     [prices]
   )
   const handleUnselectPrices = useCallback((models: string[]) => {
+    syncRequestIdRef.current++
     setSelections((previous) => {
       const next = { ...previous }
       for (const model of models) delete next[model]
@@ -311,6 +356,7 @@ export function UpstreamRatioSync() {
   }, [])
   const handleAdjustPrices = useCallback(
     (models: string[], adjustment: PriceAdjustment) => {
+      syncRequestIdRef.current++
       setSelections((previous) => {
         const next = { ...previous }
         for (const model of models) {
@@ -321,8 +367,10 @@ export function UpstreamRatioSync() {
     },
     []
   )
-  const handleApplySync = () => {
-    if (!pricingBaseline || hasAdjustmentErrors) return
+  const handleApplySync = async () => {
+    if (!pricingBaseline || hasAdjustmentErrors || isResolvingRef.current) {
+      return
+    }
     const resolutions: Record<string, PricingSyncValues> = {}
     const conflicts: ConflictItem[] = []
     for (const [model, entry] of Object.entries(selections)) {
@@ -355,15 +403,31 @@ export function UpstreamRatioSync() {
             : undefined,
       })
     }
+    const currentBaseline = pricingBaseline
+    const requestId = ++syncRequestIdRef.current
+    isResolvingRef.current = true
+    setIsResolvingBaseline(true)
     try {
-      const before = pricingDisplayOptions(pricingBaseline)
+      const resolvedBaseline = await resolvePricingSnapshot(
+        currentBaseline,
+        Object.keys(resolutions)
+      )
+      if (syncRequestIdRef.current !== requestId) {
+        return
+      }
+      const before = pricingDisplayOptions(resolvedBaseline)
       const after = applyPriceSyncSelections(before, resolutions)
       // Freeze the exact save payload and its preview together. Changes to the
       // site exchange rate while this dialog is open cannot change the charge.
       setPreview({
         conflicts,
         resolutions,
-        changes: buildPricingChanges(pricingBaseline, before, after),
+        changes: buildPricingChanges(
+          resolvedBaseline,
+          before,
+          after,
+          Object.keys(resolutions)
+        ),
         exchangeRateSummary: isValidPricingCurrency(currency)
           ? t('Current exchange rate: 1 USD = {{rate}} {{currency}}', {
               rate: String(rate),
@@ -371,17 +435,24 @@ export function UpstreamRatioSync() {
             })
           : undefined,
       })
+      setPricingBaseline(resolvedBaseline)
       syncMutation.reset()
       setConflictDialogOpen(true)
     } catch (error) {
-      handleServerError(error, t('Failed to sync prices'))
+      if (syncRequestIdRef.current === requestId) {
+        handleServerError(error, t('Failed to sync prices'))
+      }
+    } finally {
+      isResolvingRef.current = false
+      setIsResolvingBaseline(false)
     }
   }
-  const isLoading =
+  const isSyncing =
     loadingBaseline || fetchMutation.isPending || syncMutation.isPending
+  const isLoading = isSyncing || isResolvingBaseline
   const selectedModels = Object.keys(selections)
   const batchAdjustmentDisabled =
-    isLoading || selectedModels.length === 0 || rate === null
+    isSyncing || selectedModels.length === 0 || rate === null
   return (
     <div className='flex h-full min-h-0 flex-col gap-3'>
       <div className='flex shrink-0 flex-wrap items-center gap-2'>
@@ -389,7 +460,7 @@ export function UpstreamRatioSync() {
           value={null}
           currency={currency}
           label={t('Set selected prices')}
-          disabled={isLoading || !Object.keys(selections).length}
+          disabled={isSyncing || !Object.keys(selections).length}
           onChange={(mode) => handleAdjustPrices(Object.keys(selections), mode)}
         />
         <span className='text-muted-foreground text-xs'>
@@ -406,12 +477,7 @@ export function UpstreamRatioSync() {
           <ErrorState
             description={fetchMutation.error.message}
             action={
-              <Button
-                variant='outline'
-                onClick={() =>
-                  void handleConfirmChannelSelection(selectedChannelIds)
-                }
-              >
+              <Button variant='outline' onClick={() => void handleRetryFetch()}>
                 {t('Retry')}
               </Button>
             }
@@ -435,7 +501,7 @@ export function UpstreamRatioSync() {
             adjustedPrices={adjustedPrices}
             currency={currency}
             onAdjustPrices={handleAdjustPrices}
-            isDisabled={isLoading}
+            isDisabled={isSyncing}
             isSyncing={fetchMutation.isPending || loadingBaseline}
             onSelectPrices={handleSelectPrices}
             onUnselectPrices={handleUnselectPrices}
@@ -494,8 +560,11 @@ export function UpstreamRatioSync() {
             <Button
               variant='ghost'
               size='sm'
-              disabled={isLoading}
-              onClick={() => setSelections({})}
+              disabled={isSyncing}
+              onClick={() => {
+                syncRequestIdRef.current++
+                setSelections({})
+              }}
             >
               {t('Clear selection')}
             </Button>
@@ -537,6 +606,7 @@ export function UpstreamRatioSync() {
         isLoading={syncMutation.isPending}
         error={syncMutation.error?.message}
         onReload={() => {
+          syncRequestIdRef.current++
           setConflictDialogOpen(false)
           setSelections({})
           setPrices({})

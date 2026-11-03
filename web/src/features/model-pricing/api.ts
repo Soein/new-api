@@ -181,7 +181,8 @@ export function useSaveModelPricing() {
 export function buildPricingChanges(
   snapshot: ModelPricingConfig,
   before: PricingOptions,
-  after: PricingOptions
+  after: PricingOptions,
+  selectedModelNames?: Iterable<string>
 ): ModelPricingChange[] {
   const previous = pricingValuesByModel(before)
   const next = pricingValuesByModel(after)
@@ -189,6 +190,39 @@ export function buildPricingChanges(
     snapshot.entries.map((entry) => [entry.model_name, entry])
   )
   const allNames = new Set([...previous.keys(), ...next.keys()])
+
+  if (selectedModelNames) {
+    const selectedSet = new Set(selectedModelNames)
+    const groupedSelected = new Map<string, PricingValues[]>()
+
+    for (const name of selectedSet) {
+      const values = next.get(name) ?? {}
+      if (values['billing_setting.billing_mode'] === 'tiered_expr') {
+        continue
+      }
+      const entry = entries.get(name)
+      const aliasKey = entry?.numeric_model_name?.trim() || name
+      let list = groupedSelected.get(aliasKey)
+      if (!list) {
+        list = []
+        groupedSelected.set(aliasKey, list)
+      }
+      list.push(values)
+    }
+
+    for (const members of groupedSelected.values()) {
+      if (members.length <= 1) continue
+      const first = members[0]
+      for (let i = 1; i < members.length; i++) {
+        const other = members[i]
+        for (const sharedKey of SHARED_PRICING_KEYS) {
+          if (first[sharedKey] !== other[sharedKey]) {
+            throw new Error(t('Reload pricing'))
+          }
+        }
+      }
+    }
+  }
 
   type DirtyItem = {
     name: string
@@ -291,6 +325,44 @@ export function buildPricingChanges(
   return changes
 }
 
+export const PRICING_URL_BYTE_BUDGET = 4096
+const PRICING_PATH_OVERHEAD = '/api/option/model_pricing?'.length
+const MAX_QUERY_BYTES = PRICING_URL_BYTE_BUDGET - PRICING_PATH_OVERHEAD
+
+function batchMissingModelNames(names: string[]): string[][] {
+  const batches: string[][] = []
+  let currentBatch: string[] = []
+  let currentBytes = 0
+
+  for (const name of names) {
+    const encoded = new URLSearchParams([['model', name]]).toString()
+    const encodedBytes = encoded.length
+    if (PRICING_PATH_OVERHEAD + encodedBytes > PRICING_URL_BYTE_BUDGET) {
+      throw new Error(t('Failed to load model pricing'))
+    }
+
+    const additionalBytes =
+      currentBatch.length === 0 ? encodedBytes : 1 + encodedBytes
+    if (
+      currentBatch.length > 0 &&
+      currentBytes + additionalBytes > MAX_QUERY_BYTES
+    ) {
+      batches.push(currentBatch)
+      currentBatch = [name]
+      currentBytes = encodedBytes
+    } else {
+      currentBatch.push(name)
+      currentBytes += additionalBytes
+    }
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch)
+  }
+
+  return batches
+}
+
 export async function resolvePricingSnapshot(
   snapshot: ModelPricingConfig,
   names: string[] = []
@@ -306,10 +378,14 @@ export async function resolvePricingSnapshot(
     return snapshot
   }
 
-  const freshConfig = await getModelPricing(missingNames)
-  const freshEntries = new Map(
-    freshConfig.entries.map((entry) => [entry.model_name, entry])
-  )
+  const batches = batchMissingModelNames(missingNames)
+  const freshEntries = new Map<string, ModelPricingEntry>()
+  for (const batch of batches) {
+    const freshConfig = await getModelPricing(batch)
+    for (const entry of freshConfig.entries) {
+      freshEntries.set(entry.model_name, entry)
+    }
+  }
 
   const rawPrevious = pricingValuesByModel(snapshot.options)
   const missingEntryList: ModelPricingEntry[] = []
@@ -359,7 +435,8 @@ export async function resolvePricingSnapshot(
 export async function preparePricingChanges(
   snapshot: ModelPricingConfig,
   before: PricingOptions,
-  after: PricingOptions
+  after: PricingOptions,
+  selectedModelNames?: Iterable<string>
 ): Promise<ModelPricingChange[]> {
   const previous = pricingValuesByModel(before)
   const next = pricingValuesByModel(after)
@@ -383,5 +460,5 @@ export async function preparePricingChanges(
   }
 
   const resolved = await resolvePricingSnapshot(snapshot, missingNames)
-  return buildPricingChanges(resolved, before, after)
+  return buildPricingChanges(resolved, before, after, selectedModelNames)
 }

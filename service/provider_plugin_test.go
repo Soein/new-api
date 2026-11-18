@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -464,6 +465,92 @@ func TestRefreshRotatedTokenIsNeverSentAgain(t *testing.T) {
 	assert.Zero(t, server.reuses.Load())
 }
 
+func TestRefreshFindsRotatedCredentialAfterReorder(t *testing.T) {
+	const pluginKey = "refresh-reorder"
+	plugin := registerProviderPlugin(t, pluginKey, "redirect")
+	old := expiringLine(t, pluginKey, "refresh-0", "acct-1", 1)
+	disabled := expiringLine(t, pluginKey, "refresh-disabled", "acct-2", 0)
+	neighbor := expiringLine(t, pluginKey, "refresh-neighbor", "acct-3", 0)
+	for _, tc := range []struct {
+		name          string
+		before, after []string
+		disableBound  bool
+	}{
+		{name: "bound account moved", before: []string{old, disabled}, after: []string{disabled, old}},
+		{name: "disabled neighbor moved", before: []string{old, neighbor, disabled}, after: []string{old, disabled}},
+		{name: "bound account disabled after moving", before: []string{old, disabled}, after: []string{disabled, old}, disableBound: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useProviderPluginDatabase(t)
+			server := newFakeAuthServer(t)
+			server.newRefreshToken("refresh-0")
+			channel := createProviderChannel(t, pluginKey, server.URL, strings.Join(tc.before, "\n"), true)
+			_, err := model.UpdateChannelLocked(channel.Id, func(stored *model.Channel) error {
+				stored.ChannelInfo.MultiKeyStatusList = map[int]int{
+					slices.Index(tc.before, disabled): common.ChannelStatusManuallyDisabled,
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			common.MemoryCacheEnabled = true
+			t.Cleanup(func() { common.MemoryCacheEnabled = false; model.InitChannelCache() })
+			model.InitChannelCache()
+			staleChannel, err := model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+
+			// Preserve the polling node's snapshot while another node
+			// changes the order and rotates the bound account.
+			newIndex := slices.Index(tc.after, old)
+			_, err = model.UpdateChannelLocked(channel.Id, func(stored *model.Channel) error {
+				stored.Key = strings.Join(tc.after, "\n")
+				stored.ChannelInfo.MultiKeySize = len(tc.after)
+				stored.ChannelInfo.MultiKeyStatusList = map[int]int{
+					slices.Index(tc.after, disabled): common.ChannelStatusManuallyDisabled,
+				}
+				if tc.disableBound {
+					stored.ChannelInfo.MultiKeyStatusList[newIndex] = common.ChannelStatusManuallyDisabled
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			otherNode := &PluginCredentialRefresher{}
+			rotated, err := otherNode.Refresh(t.Context(), channel.Id, newIndex, old)
+			require.NoError(t, err)
+			require.NotEqual(t, old, rotated)
+			model.CacheUpdateChannel(staleChannel)
+
+			staleLine := staleChannel.GetKeys()[0]
+			if newIndex != 0 {
+				fresh, err := FreshPluginCredentialLine(t.Context(), plugin, channel.Id, 0, staleLine)
+				require.ErrorIs(t, err, ErrPluginCredentialRemoved)
+				assert.Empty(t, fresh, "ordinary requests do not recover the moved credential")
+			}
+			fresh, err := FreshBoundTaskPluginCredentialLine(t.Context(), plugin, channel.Id, 0, staleLine)
+			require.NoError(t, err)
+			assert.Equal(t, rotated, fresh)
+			expectedStored := slices.Clone(tc.after)
+			expectedStored[newIndex] = rotated
+			assert.Equal(t, strings.Join(expectedStored, "\n"), storedChannel(t, channel.Id).Key)
+			assert.EqualValues(t, 1, server.refreshCalls.Load())
+			assert.Zero(t, server.reuses.Load())
+
+			cached, err := model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, tc.before, staleChannel.GetKeys(), "polls already holding the old snapshot keep its keys")
+			expectedCached := slices.Clone(tc.before)
+			if !tc.disableBound {
+				expectedCached[0] = rotated
+			}
+			assert.Equal(t, expectedCached, cached.GetKeys())
+			for range len(expectedCached) {
+				selected, _, apiErr := cached.GetNextEnabledKey()
+				require.Nil(t, apiErr)
+				assert.NotEqual(t, disabled, selected)
+			}
+		})
+	}
+}
+
 func TestRefreshMergesItsResult(t *testing.T) {
 	useProviderPluginDatabase(t)
 	server := newFakeAuthServer(t)
@@ -517,16 +604,23 @@ func TestRefreshRemovedCredential(t *testing.T) {
 	plugin := registerProviderPlugin(t, pluginKey, "redirect")
 	soon := time.Now().Add(20 * time.Second).Unix()
 	line := expiringLine(t, pluginKey, "refresh-0", "acct-1", soon)
+	other := expiringLine(t, pluginKey, "refresh-9", "acct-9", 0)
 	for _, tc := range []struct {
 		name        string
 		replacement string
 	}{
-		{name: "different account", replacement: expiringLine(t, pluginKey, "refresh-9", "acct-9", 0)},
+		{name: "different account", replacement: other},
 		{name: "accountless credential", replacement: expiringLine(t, pluginKey, "refresh-9", "", 0)},
+		{name: "same account belongs to another plugin", replacement: other + "\n" + expiringLine(t, "other-plugin", "refresh-other", "acct-1", 0)},
+		{name: "ambiguous account after reorder", replacement: strings.Join([]string{
+			other,
+			expiringLine(t, pluginKey, "refresh-a", "acct-1", 0),
+			expiringLine(t, pluginKey, "refresh-b", "acct-1", 0),
+		}, "\n")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			channel := createProviderChannel(t, pluginKey, server.URL, tc.replacement, false)
-			fresh, err := FreshPluginCredentialLine(t.Context(), plugin, channel.Id, 0, line)
+			channel := createProviderChannel(t, pluginKey, server.URL, tc.replacement, strings.Contains(tc.replacement, "\n"))
+			fresh, err := FreshBoundTaskPluginCredentialLine(t.Context(), plugin, channel.Id, 0, line)
 			require.ErrorIs(t, err, ErrPluginCredentialRemoved)
 			assert.Empty(t, fresh)
 			assert.Equal(t, tc.replacement, storedChannel(t, channel.Id).Key)
@@ -540,6 +634,38 @@ func TestRefreshRemovedCredential(t *testing.T) {
 		fresh, err := FreshPluginCredentialLine(t.Context(), plugin, channel.Id, 0, legacy)
 		require.NoError(t, err)
 		assert.Equal(t, current, fresh)
+	})
+
+	t.Run("accountless lookup keeps cached slot identities", func(t *testing.T) {
+		legacy := expiringLine(t, pluginKey, "refresh-legacy", "", 1)
+		disabled := expiringLine(t, pluginKey, "refresh-disabled", "acct-1", 0)
+		const enabled = "fixture-static-key"
+		channel := createProviderChannel(t, pluginKey, server.URL, disabled+"\n"+enabled, true)
+		stored, err := model.UpdateChannelLocked(channel.Id, func(stored *model.Channel) error {
+			stored.ChannelInfo.MultiKeyStatusList = map[int]int{0: common.ChannelStatusManuallyDisabled}
+			return nil
+		})
+		require.NoError(t, err)
+		stale := *stored
+		stale.Key = strings.Join([]string{legacy, disabled, enabled}, "\n")
+		stale.ChannelInfo.MultiKeySize = 3
+		stale.ChannelInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusManuallyDisabled}
+		common.MemoryCacheEnabled = true
+		t.Cleanup(func() { common.MemoryCacheEnabled = false; model.InitChannelCache() })
+		model.InitChannelCache()
+		model.CacheUpdateChannel(&stale)
+
+		fresh, err := FreshPluginCredentialLine(t.Context(), plugin, channel.Id, 0, legacy)
+		require.NoError(t, err)
+		assert.Equal(t, disabled, fresh, "the legacy caller keeps its same-plugin fallback")
+		cached, err := model.CacheGetChannel(channel.Id)
+		require.NoError(t, err)
+		assert.Equal(t, stale.Key, cached.Key)
+		for range stale.ChannelInfo.MultiKeySize {
+			selected, _, apiErr := cached.GetNextEnabledKey()
+			require.Nil(t, apiErr)
+			assert.NotEqual(t, disabled, selected)
+		}
 	})
 
 	assert.Zero(t, server.refreshCalls.Load())

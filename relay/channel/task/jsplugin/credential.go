@@ -90,12 +90,16 @@ func (a *TaskAdaptor) taskCredentialLine(ctx context.Context, key string, task *
 		return key, nil
 	}
 	lines := strings.Split(strings.Trim(key, "\n"), "\n")
+	freshCredentialLine := service.FreshPluginCredentialLine
+	if account != "" {
+		freshCredentialLine = service.FreshBoundTaskPluginCredentialLine
+	}
 	for index, line := range lines {
 		credential, ok := pluginruntime.ParseCredential(line)
 		if !ok || credential.Plugin != a.plugin.Meta.Key || (account != "" && credential.AccountID != account) {
 			continue
 		}
-		fresh, err := service.FreshPluginCredentialLine(ctx, a.plugin, a.info.ChannelId, index, line)
+		fresh, err := freshCredentialLine(ctx, a.plugin, a.info.ChannelId, index, line)
 		if err != nil || account == "" || fresh == line {
 			return fresh, err
 		}

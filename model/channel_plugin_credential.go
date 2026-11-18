@@ -215,6 +215,34 @@ func CacheUpdateChannelKey(id int, key string) {
 	channelsIDM[id] = &updated
 }
 
+// CacheReplaceChannelKeyLine applies a credential rotation to the cached
+// slot if it still holds oldLine. The cached key order and its per-slot
+// statuses stay together until the full channel synchronizes.
+func CacheReplaceChannelKeyLine(id, index int, oldLine, newLine string) {
+	if !common.MemoryCacheEnabled {
+		return
+	}
+	// The snapshot includes the cursor advanced by GetNextEnabledKey.
+	pollingLock := GetChannelPollingLock(id)
+	pollingLock.Lock()
+	defer pollingLock.Unlock()
+	channelSyncLock.Lock()
+	defer channelSyncLock.Unlock()
+	cached, ok := channelsIDM[id]
+	if !ok {
+		return
+	}
+	keys := cached.GetKeys()
+	if index < 0 || index >= len(keys) || keys[index] != oldLine {
+		return
+	}
+	updated := *cached
+	updated.Keys = slices.Clone(keys)
+	updated.Keys[index] = newLine
+	updated.Key = strings.Join(updated.Keys, "\n")
+	channelsIDM[id] = &updated
+}
+
 // channelRelayConfig returns the relay routes of a task plugin channel's
 // plugin, nil for any other channel. It reads the setting without GetSetting,
 // which clears the stored setting when it is invalid, so a pricing read never

@@ -163,10 +163,17 @@ func RefreshPluginCredential(ctx context.Context, channelID, keyIndex int, line 
 
 // Refresh is RefreshPluginCredential on this refresher's single-flight group.
 func (r *PluginCredentialRefresher) Refresh(ctx context.Context, channelID, keyIndex int, line string) (string, error) {
+	return r.refresh(ctx, channelID, keyIndex, line, false)
+}
+
+func (r *PluginCredentialRefresher) refresh(ctx context.Context, channelID, keyIndex int, line string, allowMovedAccount bool) (string, error) {
 	sum := sha256.Sum256([]byte(line))
-	flight := r.group.DoChan(strconv.Itoa(channelID)+":"+hex.EncodeToString(sum[:]), func() (any, error) {
+	// Callers with different slot or account permissions need their own
+	// result. The distributed channel lock still serializes refresh calls.
+	key := fmt.Sprintf("%d:%d:%t:%x", channelID, keyIndex, allowMovedAccount, sum)
+	flight := r.group.DoChan(key, func() (any, error) {
 		// The call is shared, so no single caller's cancellation ends it.
-		return refreshPluginCredentialLine(channelID, keyIndex, line)
+		return refreshPluginCredentialLine(channelID, keyIndex, line, allowMovedAccount)
 	})
 	select {
 	case result := <-flight:
@@ -179,15 +186,23 @@ func (r *PluginCredentialRefresher) Refresh(ctx context.Context, channelID, keyI
 	}
 }
 
-func refreshPluginCredentialLine(channelID, keyIndex int, used string) (string, error) {
+func refreshPluginCredentialLine(channelID, keyIndex int, used string, allowMovedAccount bool) (string, error) {
 	usedCredential, ok := jsplugin.ParseCredential(used)
 	if !ok {
 		return "", errors.New("channel key is not a plugin credential")
 	}
-	var current, storedKey, channelName string
+	var current, channelName string
 	multiKey, autoBan := false, false
 	needsLogin := false
-	storedElsewhere := false
+	updateCachedKey := false
+	useStoredLine := func(channel *model.Channel, index int, line string) {
+		current = line
+		// A legacy lookup can return a different account at the same
+		// index. The cache only learns verified, enabled credentials.
+		status, configured := channel.ChannelInfo.MultiKeyStatusList[index]
+		updateCachedKey = usedCredential.AccountID != "" && channel.Status == common.ChannelStatusEnabled &&
+			(!channel.ChannelInfo.IsMultiKey || !configured || status == common.ChannelStatusEnabled)
+	}
 	// A refresh waits for another one of the channel at most as long as that
 	// one's plugin call may take.
 	lockCtx, cancelLock := context.WithTimeout(context.Background(), pluginCredentialHookTimeout)
@@ -197,7 +212,7 @@ func refreshPluginCredentialLine(channelID, keyIndex int, used string) (string, 
 		if err != nil {
 			return err
 		}
-		channelName, multiKey, autoBan, storedKey = channel.Name, channel.ChannelInfo.IsMultiKey, channel.GetAutoBan(), channel.Key
+		channelName, multiKey, autoBan = channel.Name, channel.ChannelInfo.IsMultiKey, channel.GetAutoBan()
 		plugin, ok := PluginOfChannel(channel)
 		if !ok || plugin.Meta.Key != usedCredential.Plugin {
 			return fmt.Errorf("channel #%d is not bound to plugin %s", channelID, usedCredential.Plugin)
@@ -206,13 +221,13 @@ func refreshPluginCredentialLine(channelID, keyIndex int, used string) (string, 
 			return fmt.Errorf("plugin %s does not export refresh", plugin.Meta.Key)
 		}
 		lines := pluginCredentialKeyLines(channel)
-		index := locatePluginCredentialLine(lines, keyIndex, used, usedCredential)
+		index := locatePluginCredentialLine(lines, keyIndex, used, usedCredential, allowMovedAccount)
 		if index < 0 {
 			return ErrPluginCredentialRemoved
 		}
 		if lines[index] != used {
 			// Another node refreshed or a login replaced it meanwhile.
-			current, storedElsewhere = lines[index], true
+			useStoredLine(channel, index, lines[index])
 			return nil
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), pluginCredentialHookTimeout)
@@ -237,14 +252,14 @@ func refreshPluginCredentialLine(channelID, keyIndex int, used string) (string, 
 		}
 		// The plugin call held no channel lock, so the result replaces the
 		// line only if no login or edit replaced it meanwhile.
-		stored, err := model.UpdateChannelLocked(channelID, func(channel *model.Channel) error {
+		_, err = model.UpdateChannelLocked(channelID, func(channel *model.Channel) error {
 			lines := pluginCredentialKeyLines(channel)
-			index := locatePluginCredentialLine(lines, keyIndex, used, usedCredential)
+			index := locatePluginCredentialLine(lines, keyIndex, used, usedCredential, allowMovedAccount)
 			if index < 0 {
 				return ErrPluginCredentialRemoved
 			}
 			if lines[index] != used {
-				current, storedElsewhere = lines[index], true
+				useStoredLine(channel, index, lines[index])
 				return nil
 			}
 			current, needsLogin = refreshed, result.Relogin
@@ -252,19 +267,13 @@ func refreshPluginCredentialLine(channelID, keyIndex int, used string) (string, 
 			channel.Key = strings.Join(lines, "\n")
 			return nil
 		})
-		if err != nil {
-			return err
-		}
-		storedKey = stored.Key
-		return nil
+		return err
 	})
 	if err != nil {
 		return "", err
 	}
-	if storedElsewhere {
-		// This node's cache may still hold the line the request used, and
-		// would send every request here until the next cache sync.
-		model.CacheUpdateChannelKey(channelID, storedKey)
+	if updateCachedKey {
+		model.CacheReplaceChannelKeyLine(channelID, keyIndex, used, current)
 	}
 	if needsLogin {
 		DisablePluginCredentialForLogin(channelID, channelName, multiKey, autoBan, current)
@@ -382,6 +391,17 @@ func InvalidatePluginKeyToken(plugin *jsplugin.LoadedPlugin, channelID int, line
 // An expired credential whose refresh failed reports ErrPluginCredentialRefreshFailed.
 // A static key is returned as it is.
 func FreshPluginCredentialLine(ctx context.Context, plugin *jsplugin.LoadedPlugin, channelID, keyIndex int, line string) (string, error) {
+	return freshPluginCredentialLine(ctx, plugin, channelID, keyIndex, line, false)
+}
+
+// FreshBoundTaskPluginCredentialLine also finds a rotated credential that
+// moved to another slot. Callers must first match line to the persisted task
+// account. A manually disabled slot may still serve its in-flight task.
+func FreshBoundTaskPluginCredentialLine(ctx context.Context, plugin *jsplugin.LoadedPlugin, channelID, keyIndex int, line string) (string, error) {
+	return freshPluginCredentialLine(ctx, plugin, channelID, keyIndex, line, true)
+}
+
+func freshPluginCredentialLine(ctx context.Context, plugin *jsplugin.LoadedPlugin, channelID, keyIndex int, line string, allowMovedAccount bool) (string, error) {
 	credential, ok := jsplugin.ParseCredential(line)
 	if !ok {
 		return line, nil
@@ -393,7 +413,7 @@ func FreshPluginCredentialLine(ctx context.Context, plugin *jsplugin.LoadedPlugi
 	if !credential.ExpiresWithin(now, PluginCredentialRequestMargin) || !plugin.HasProviderHook("refresh") {
 		return line, nil
 	}
-	refreshed, err := RefreshPluginCredential(ctx, channelID, keyIndex, line)
+	refreshed, err := pluginCredentialRefresher.refresh(ctx, channelID, keyIndex, line, allowMovedAccount)
 	if err == nil || errors.Is(err, ErrPluginCredentialNeedsLogin) {
 		return refreshed, err
 	}
@@ -437,11 +457,11 @@ func pluginCredentialKeyLines(channel *model.Channel) []string {
 	return strings.Split(strings.Trim(channel.Key, "\n"), "\n")
 }
 
-// locatePluginCredentialLine finds the stored line of a used credential: at
-// its index, the same line or a newer credential of the same plugin and
-// account; otherwise the same line where it moved. It returns -1 when the
-// credential is gone.
-func locatePluginCredentialLine(lines []string, index int, used string, usedCredential *jsplugin.Credential) int {
+// locatePluginCredentialLine finds the stored line for a credential. It
+// prefers a match at the previous index, then the exact line at another
+// index. A bound task may also recover a rotated line at a new index by
+// uniquely matching the plugin and account. It returns -1 if no match exists.
+func locatePluginCredentialLine(lines []string, index int, used string, usedCredential *jsplugin.Credential, allowMovedAccount bool) int {
 	if index >= 0 && index < len(lines) {
 		if lines[index] == used {
 			return index
@@ -452,12 +472,24 @@ func locatePluginCredentialLine(lines []string, index int, used string, usedCred
 			return index
 		}
 	}
-	for candidate, line := range lines {
-		if line == used {
-			return candidate
-		}
+	if moved := slices.Index(lines, used); moved >= 0 {
+		return moved
 	}
-	return -1
+	if !allowMovedAccount || usedCredential.AccountID == "" {
+		return -1
+	}
+	match := -1
+	for candidate, line := range lines {
+		stored, ok := jsplugin.ParseCredential(line)
+		if !ok || stored.Plugin != usedCredential.Plugin || stored.AccountID != usedCredential.AccountID {
+			continue
+		}
+		if match >= 0 {
+			return -1
+		}
+		match = candidate
+	}
+	return match
 }
 
 var (

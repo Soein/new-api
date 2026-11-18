@@ -12,6 +12,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -29,6 +30,7 @@ import (
 
 type imageReservation struct {
 	held, limit int
+	settled     []int
 }
 
 func (s *imageReservation) Reserve(quota int) error {
@@ -39,9 +41,12 @@ func (s *imageReservation) Reserve(quota int) error {
 	return nil
 }
 func (s *imageReservation) GetPreConsumedQuota() int { return s.held }
-func (*imageReservation) Settle(int) error           { return nil }
-func (*imageReservation) Refund(*gin.Context)        {}
-func (*imageReservation) NeedsRefund() bool          { return false }
+func (s *imageReservation) Settle(quota int) error {
+	s.settled = append(s.settled, quota)
+	return nil
+}
+func (*imageReservation) Refund(*gin.Context) {}
+func (*imageReservation) NeedsRefund() bool   { return false }
 
 func (s *imageReservation) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }
 
@@ -172,6 +177,89 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 				assert.Equal(t, tc.body, string(info.BillingRequestInput.Body))
 				assert.Equal(t, 1, *info.BillingRequestInput.ImageCount)
 			}
+		})
+	}
+}
+
+func TestReplicateImageSettlementUsesUsableOutputs(t *testing.T) {
+	db := setupRelayChannelDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	user := model.User{Username: "replicate-image"}
+	require.NoError(t, db.Create(&user).Error)
+	channel := model.Channel{Name: "Replicate fixture", Type: constant.ChannelTypeReplicate}
+	require.NoError(t, db.Create(&channel).Error)
+	service.InitHttpClient()
+	batchUpdates, consumeLogs := common.BatchUpdateEnabled, common.LogConsumeEnabled
+	common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false
+	t.Cleanup(func() { common.BatchUpdateEnabled, common.LogConsumeEnabled = batchUpdates, consumeLogs })
+
+	const requestBody = `{"model":"fixture-image-model","prompt":"a cat","n":3}`
+	const imageURL = `"https://example.com/image.png"`
+	const requested = 3
+	const modelPrice = 0.04
+	unitQuota := common.QuotaFromFloat(modelPrice * common.QuotaPerUnit)
+	for _, tc := range []struct {
+		name, status, output   string
+		dataCount, chargeCount int
+		tiered                 bool
+		errorCode              types.ErrorCode
+	}{
+		{name: "array with unusable entries", status: "succeeded", output: `["https://example.com/1.png","  ",null,23,"https://example.com/2.png"]`, dataCount: 2, chargeCount: 2},
+		{name: "single output with expression pricing", status: "succeeded", output: imageURL, dataCount: 1, chargeCount: 1, tiered: true},
+		{name: "out-of-range count retains reservation", status: "succeeded", output: "[" + strings.Repeat(imageURL+",", dto.MaxImageN) + imageURL + "]", dataCount: dto.MaxImageN + 1, chargeCount: requested},
+		{name: "empty output", status: "succeeded", output: `["",null]`, errorCode: types.ErrorCodeBadResponseBody},
+		{name: "failed prediction with output", status: "failed", output: imageURL, errorCode: types.ErrorCodeBadResponse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = io.WriteString(w, `{"status":"`+tc.status+`","output":`+tc.output+`}`)
+			}))
+			t.Cleanup(upstream.Close)
+
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			t.Cleanup(func() { common.CleanupBodyStorage(c) })
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(requestBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeReplicate)
+			common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelKey, "fixture-key")
+			request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+			require.NoError(t, err)
+			reservation := &imageReservation{limit: requested * unitQuota}
+			info := relaycommon.GenRelayInfoImage(c, request)
+			info.UserId = user.Id
+			info.OriginModelName = request.Model
+			info.Billing = reservation
+			info.PriceData = hosttypes.PriceData{UsePrice: true, ModelPrice: modelPrice, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}}
+			if tc.tiered {
+				const expr = `v2:tier("image", per_image(0.04))`
+				info.PriceData.UsePrice = false
+				info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+					BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr),
+					ExprVersion: billingexpr.ExprVersion(expr), QuotaPerUnit: common.QuotaPerUnit,
+				}
+			}
+
+			apiErr := ImageHelper(c, info)
+
+			assert.Equal(t, requested*unitQuota, reservation.held)
+			if tc.errorCode != "" {
+				require.NotNil(t, apiErr)
+				assert.Equal(t, tc.errorCode, apiErr.GetErrorCode())
+				assert.Equal(t, requested, info.GetImageBillingCount())
+				assert.Empty(t, reservation.settled)
+				return
+			}
+			require.Nil(t, apiErr)
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			var output dto.ImageResponse
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &output))
+			assert.Len(t, output.Data, tc.dataCount)
+			assert.Equal(t, []int{tc.chargeCount * unitQuota}, reservation.settled)
 		})
 	}
 }

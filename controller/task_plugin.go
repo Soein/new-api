@@ -986,7 +986,8 @@ func relayPaths(meta jsplugin.Meta) []string {
 }
 
 func GetTaskPluginOptions(c *gin.Context) {
-	snapshot := jsplugin.DefaultRegistry.Snapshot()
+	registry := jsplugin.DefaultRegistry
+	snapshot := registry.Snapshot()
 	seen := make(map[string]bool)
 	options := make([]gin.H, 0, len(snapshot.Factory)+len(snapshot.Override))
 	for layer, metas := range [][]jsplugin.Meta{snapshot.Override, snapshot.Factory} {
@@ -1000,17 +1001,28 @@ func GetTaskPluginOptions(c *gin.Context) {
 			if layer == 1 && setting.IsTaskPluginFactoryDisabled(meta.Key) {
 				continue
 			}
-			loaded, ok := jsplugin.DefaultRegistry.Get(meta.Key)
+			loaded, ok := registry.Get(meta.Key)
 			switchedOff := !ok
 			if switchedOff {
 				// With the master switch off, a plugin's request processing
 				// part still runs; its channel parts do not.
-				if loaded, ok = jsplugin.DefaultRegistry.GetIgnoringMasterSwitch(meta.Key); !ok || !loaded.Meta.HasTransformPart() {
+				if loaded, ok = registry.GetIgnoringMasterSwitch(meta.Key); !ok {
 					continue
 				}
 			}
 			parts := loadedTaskPluginParts(loaded)
+			transformMeta := loaded.Meta
+			if !parts.Transform {
+				if transform := registry.GetTransformPlugin(meta.Key); transform != nil {
+					parts.Transform = true
+					parts.TransformHooks = append([]string{}, transform.TransformHooks()...)
+					transformMeta = transform.Meta
+				}
+			}
 			if switchedOff {
+				if !parts.Transform {
+					continue
+				}
 				parts.Task, parts.Provider, parts.Login, parts.Refresh = false, false, false, false
 			}
 			seen[meta.Key] = true
@@ -1036,14 +1048,14 @@ func GetTaskPluginOptions(c *gin.Context) {
 				"upstreams":       meta.Upstreams,
 				"usageSchema":     meta.UsageSchema,
 				"usageProfiles":   meta.UsageProfiles,
-				"configSchema":    meta.ConfigSchema,
+				"configSchema":    transformMeta.ConfigSchema,
 				"task":            parts.Task,
 				"provider":        parts.Provider,
 				"transform":       parts.Transform,
 				"transform_hooks": parts.TransformHooks,
-				"samples":         append([]jsplugin.Sample{}, meta.Samples...),
-				"optional":        meta.Optional,
-				"scope":           meta.Scope,
+				"samples":         append([]jsplugin.Sample{}, transformMeta.Samples...),
+				"optional":        transformMeta.Optional,
+				"scope":           transformMeta.Scope,
 				"login":           parts.Login,
 				"refresh":         parts.Refresh,
 

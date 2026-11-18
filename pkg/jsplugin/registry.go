@@ -920,6 +920,28 @@ func (r *Registry) GetIgnoringMasterSwitch(key string) (*LoadedPlugin, bool) {
 	return plugin, ok
 }
 
+// GetTransformPlugin finds the request processing part for key, independent
+// of the master switch. An override with only channel parts leaves an enabled
+// factory request processing part available to existing instances.
+func (r *Registry) GetTransformPlugin(key string) *LoadedPlugin {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	plugin, ok := r.GetIgnoringMasterSwitch(key)
+	if !ok {
+		return nil
+	}
+	if plugin.Meta.HasTransformPart() {
+		return plugin
+	}
+	if _, disabled := r.disabledFactory[key]; disabled {
+		return nil
+	}
+	if factory := r.factory[key]; factory != nil && factory.Meta.HasTransformPart() {
+		return factory
+	}
+	return nil
+}
+
 func (r *Registry) PluginsByChannelType(channelType int) []*LoadedPlugin {
 	return r.Generation().PluginsByChannelType(channelType)
 }

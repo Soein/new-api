@@ -90,6 +90,7 @@ func UpdateRequestPluginInstances(c *gin.Context) {
 // instance needs an available plugin; a disabled one may keep a plugin that
 // was removed or switched off, so the rest of the list can still be saved.
 func normalizeRequestPluginInstances(instances []request_plugin_setting.Instance) ([]request_plugin_setting.Instance, error) {
+	registry := jsplugin.DefaultRegistry
 	normalized := make([]request_plugin_setting.Instance, 0, len(instances))
 	ids := make(map[string]bool, len(instances))
 	savedScopes := map[string]*request_plugin_setting.Scope{}
@@ -145,17 +146,23 @@ func normalizeRequestPluginInstances(instances []request_plugin_setting.Instance
 		if len(instance.Config) == 0 || string(instance.Config) == "null" {
 			instance.Config = json.RawMessage("{}")
 		}
-		// Request processing does not follow the plugin master switch.
-		plugin, ok := jsplugin.DefaultRegistry.GetIgnoringMasterSwitch(instance.Plugin)
-		if ok && !plugin.Meta.HasTransformPart() {
-			return nil, common.NewMessage("Plugin {{plugin}} has no request processing hooks", map[string]any{"plugin": instance.Plugin})
+		plugin := registry.GetTransformPlugin(instance.Plugin)
+		if plugin == nil {
+			if _, installed := registry.GetIgnoringMasterSwitch(instance.Plugin); installed {
+				// A disabled instance can keep its factory filter config
+				// when only the same-key channel plugin is running.
+				factory, _ := registry.FactoryPlugin(instance.Plugin)
+				if instance.Enabled || factory == nil || !factory.Meta.HasTransformPart() {
+					return nil, common.NewMessage("Plugin {{plugin}} has no request processing hooks", map[string]any{"plugin": instance.Plugin})
+				}
+			}
 		}
 		if instance.PluginScope != nil {
 			// The confirmed scope is the plugin's current one, sent back as
 			// the administrator saw it. A saved instance may keep the scope
 			// it confirmed before, so other edits of the list still save.
 			var declared *jsplugin.TransformScope
-			if ok {
+			if plugin != nil {
 				declared = plugin.Meta.Scope
 			}
 			saved := savedScopes[instance.ID]
@@ -167,7 +174,7 @@ func normalizeRequestPluginInstances(instances []request_plugin_setting.Instance
 			instance.Global, instance.Groups, instance.Models = false, []string{}, []string{}
 			instance.PluginScope = instance.PluginScope.Clone()
 		}
-		if !ok {
+		if plugin == nil {
 			if instance.Enabled {
 				return nil, common.NewMessage("Plugin {{plugin}} is not installed or is turned off", map[string]any{"plugin": instance.Plugin})
 			}

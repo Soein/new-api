@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/relay/requestplugin"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
@@ -584,6 +585,96 @@ export function validateConfig(config) { if (config.limit === 13) throw new Erro
 	assert.Equal(t, "2.0.0", active.Meta.Version)
 	_, found = jsplugin.DefaultRegistry.Get(plugin.Meta.Key)
 	assert.False(t, found)
+}
+
+func TestTaskOnlyOverridePreservesFactoryRequestFilter(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	const key = "request-filter"
+	registry := jsplugin.DefaultRegistry
+	originalEnabled := registry.Enabled()
+	originalDisabled := registry.Snapshot().DisabledFactory
+	require.NotContains(t, originalDisabled, key)
+	cleanupTaskPluginControllerRuntime(t, key)
+	t.Cleanup(func() {
+		registry.SetDisabledFactoryKeys(originalDisabled)
+		registry.SetEnabled(originalEnabled)
+	})
+	registry.SetEnabled(true)
+	_, err := registry.Register(taskPluginControllerTestSource(key, "1.0.0"), jsplugin.Options{})
+	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name            string
+		masterEnabled   bool
+		factoryDisabled bool
+	}{
+		{name: "task override and factory filter", masterEnabled: true},
+		{name: "master switch off"},
+		{name: "factory filter disabled", masterEnabled: true, factoryDisabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry.SetEnabled(test.masterEnabled)
+			if test.factoryDisabled {
+				registry.SetDisabledFactoryKeys(append(slices.Clone(originalDisabled), key))
+			}
+
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/task_plugin_options", nil)
+			GetTaskPluginOptions(c)
+			require.Equal(t, http.StatusOK, recorder.Code)
+			type pluginOption struct {
+				Key            string          `json:"key"`
+				Task           bool            `json:"task"`
+				Transform      bool            `json:"transform"`
+				TransformHooks []string        `json:"transform_hooks"`
+				ConfigSchema   json.RawMessage `json:"configSchema"`
+			}
+			var options struct {
+				Data []pluginOption `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &options))
+			i := slices.IndexFunc(options.Data, func(option pluginOption) bool { return option.Key == key })
+			require.NotEqual(t, -1, i)
+			option := options.Data[i]
+			assert.Equal(t, test.masterEnabled, option.Task)
+			assert.Equal(t, !test.factoryDisabled, option.Transform)
+
+			instance := request_plugin_setting.Instance{
+				ID: "rp_legacy", Name: "Keyword filter", Plugin: key, Enabled: true, Global: true,
+				Config: json.RawMessage(`{"keywords":"review marker"}`),
+			}
+			normalized, err := normalizeRequestPluginInstances([]request_plugin_setting.Instance{instance})
+			if test.factoryDisabled {
+				require.Error(t, err)
+				disabled := instance
+				disabled.Enabled = false
+				normalized, err := normalizeRequestPluginInstances([]request_plugin_setting.Instance{disabled})
+				require.NoError(t, err)
+				require.Len(t, normalized, 1)
+				assert.False(t, normalized[0].Enabled)
+				assert.JSONEq(t, string(disabled.Config), string(normalized[0].Config))
+			} else {
+				require.NoError(t, err)
+				require.Len(t, normalized, 1)
+				instance = normalized[0]
+				assert.Contains(t, option.TransformHooks, "ingress")
+				assert.Contains(t, string(option.ConfigSchema), `"keywords"`)
+			}
+			result := requestplugin.DryRun(t.Context(), requestplugin.DryRunInput{
+				Format: "openai", Model: "gpt", Instance: &instance,
+				Body: []byte(`{"model":"gpt","messages":[{"role":"user","content":"review marker"}]}`),
+			})
+			require.Nil(t, result.Failed)
+			if test.factoryDisabled {
+				assert.Nil(t, result.Rejected)
+				return
+			}
+			require.NotNil(t, result.Rejected)
+			assert.Equal(t, instance.ID, result.Rejected.Instance)
+			assert.Equal(t, "request_filtered", result.Rejected.Code)
+		})
+	}
 }
 
 func TestGetTaskPluginOptionsIncludesDescriptionUsageSchemaIconBaseURLAndChannelTypes(t *testing.T) {
@@ -1469,6 +1560,11 @@ func TestSyncTaskPluginsCachesRejectedDesiredSourceWithoutLosingIncumbent(t *tes
 	cleanupTaskPluginControllerRuntime(t, ownerKey)
 	v1Source := taskPluginControllerModelSource(pluginKey, "1.0.0", "retained-v1")
 	v2Source := taskPluginControllerModelSource(pluginKey, "2.0.0", "OWNED-MODEL")
+	v1Source = strings.Replace(v1Source, "models:", `configSchema: {type: "object", properties: {oldLimit: {type: "integer", title: "Old limit"}}}, models:`, 1)
+	v2Source = strings.Replace(v2Source, "models:", `configSchema: {type: "object", properties: {newLimit: {type: "integer", title: "New limit"}}}, models:`, 1)
+	const ingress = `export function ingress() { return { action: "continue" }; }`
+	v1Source += ingress
+	v2Source += ingress
 	ownerSource := taskPluginControllerModelSource(ownerKey, "1.0.0", "owned-model")
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
 		Key: pluginKey, APIVersion: 1, Version: "1.0.0", Source: model.LongText(v1Source), SourceHash: "retained-v1", Enabled: true,
@@ -1502,6 +1598,28 @@ func TestSyncTaskPluginsCachesRejectedDesiredSourceWithoutLosingIncumbent(t *tes
 		taskPluginSyncState.Unlock()
 		assert.Same(t, rejectedGeneration, jsplugin.DefaultRegistry.Generation())
 	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/task_plugin_options", nil)
+	GetTaskPluginOptions(c)
+	var options struct {
+		Data []struct {
+			Key          string          `json:"key"`
+			ConfigSchema json.RawMessage `json:"configSchema"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &options))
+	found := false
+	for _, option := range options.Data {
+		if option.Key == pluginKey {
+			found = true
+			assert.Contains(t, string(option.ConfigSchema), `"oldLimit"`)
+			assert.NotContains(t, string(option.ConfigSchema), `"newLimit"`)
+			break
+		}
+	}
+	require.True(t, found)
 
 	require.NoError(t, model.SaveTaskPlugin(&model.TaskPlugin{
 		Key: ownerKey, APIVersion: 1, Version: "2.0.0",

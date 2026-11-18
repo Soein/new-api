@@ -149,9 +149,7 @@ func newPlanOf(instances []request_plugin_setting.Instance) *Plan {
 		}
 		plugin, seen := plugins[instance.Plugin]
 		if !seen {
-			if plugin, _ = jsplugin.DefaultRegistry.GetIgnoringMasterSwitch(instance.Plugin); plugin != nil && !plugin.Meta.HasTransformPart() {
-				plugin = nil
-			}
+			plugin = jsplugin.DefaultRegistry.GetTransformPlugin(instance.Plugin)
 			plugins[instance.Plugin] = plugin
 		}
 		loadErr, unavailable := "", false

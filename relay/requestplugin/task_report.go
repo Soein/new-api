@@ -135,8 +135,8 @@ func ReportTask(task *model.Task) {
 		if index < 0 || !instances[index].Enabled {
 			continue
 		}
-		plugin, _ := jsplugin.DefaultRegistry.GetIgnoringMasterSwitch(instances[index].Plugin)
-		if plugin == nil || !plugin.Meta.HasTransformPart() || !slices.Contains(plugin.TransformHooks(), jsplugin.ReportHook) {
+		plugin := jsplugin.DefaultRegistry.GetTransformPlugin(instances[index].Plugin)
+		if plugin == nil || !slices.Contains(plugin.TransformHooks(), jsplugin.ReportHook) {
 			continue
 		}
 		targets = append(targets, reportTarget{plugin: plugin, instance: &instances[index]})

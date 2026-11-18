@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -478,10 +480,14 @@ func locatePluginCredentialLine(lines []string, index int, used string, usedCred
 	if !allowMovedAccount || usedCredential.AccountID == "" {
 		return -1
 	}
+	return uniquePluginCredentialAccountIndex(lines, usedCredential.Plugin, usedCredential.AccountID)
+}
+
+func uniquePluginCredentialAccountIndex(lines []string, plugin, account string) int {
 	match := -1
 	for candidate, line := range lines {
 		stored, ok := jsplugin.ParseCredential(line)
-		if !ok || stored.Plugin != usedCredential.Plugin || stored.AccountID != usedCredential.AccountID {
+		if !ok || stored.Plugin != plugin || stored.AccountID != account {
 			continue
 		}
 		if match >= 0 {
@@ -490,6 +496,29 @@ func locatePluginCredentialLine(lines []string, index int, used string, usedCred
 		match = candidate
 	}
 	return match
+}
+
+// RotatedBoundTaskPluginCredential finds a different, usable credential for
+// the bound account in the current channel row. A rejected poll can use it
+// once, including on a manually disabled slot. It leaves the shared cache
+// and upstream refresh state alone.
+func RotatedBoundTaskPluginCredential(channel *model.Channel, plugin, account, rejected string) string {
+	used, ok := jsplugin.ParseCredential(rejected)
+	if !ok || account == "" || used.Plugin != plugin || used.AccountID != account {
+		return ""
+	}
+	lines := pluginCredentialKeyLines(channel)
+	index := uniquePluginCredentialAccountIndex(lines, plugin, account)
+	if index < 0 || lines[index] == rejected {
+		return ""
+	}
+	// The unique match established that the stored line parses.
+	replacement, _ := jsplugin.ParseCredential(lines[index])
+	if replacement.NeedsLogin || replacement.ExpiresWithin(time.Now(), 0) ||
+		(bytes.Equal(used.Data, replacement.Data) && maps.Equal(used.Headers, replacement.Headers) && maps.Equal(used.Query, replacement.Query)) {
+		return ""
+	}
+	return lines[index]
 }
 
 var (

@@ -33,9 +33,10 @@ const credentialTaskPlugin = `
 export const meta = {
   apiVersion: 1, key: "%KEY%", name: "Credential task", version: "1.0.0", author: {name: "Test"},
   models: ["cred-video"], fetchMode: "per_task",
+  channelConfig: {type: "object", properties: {tenant: {type: "string", title: "Tenant"}}},
 };
 function seen(ctx) {
-  return {"X-Seen-Auth": ctx.authHeader || "", "X-Seen-Credential": ctx.credential ? ctx.credential.access : "", "X-Seen-Api-Key": String(ctx.apiKey)};
+  return {"X-Seen-Auth": ctx.authHeader || "", "X-Seen-Credential": ctx.credential ? ctx.credential.access : "", "X-Seen-Api-Key": String(ctx.apiKey), "X-Seen-Tenant": ctx.config.tenant || ""};
 }
 export function buildSubmitRequest(ctx) {
   return {url: ctx.baseUrl + "/submit", method: "POST", headers: seen(ctx), body: {prompt: ctx.requestBody.prompt}};
@@ -499,4 +500,145 @@ func TestExpiringTaskCredentialIsRefreshedFirst(t *testing.T) {
 		assert.Equal(t, strings.Split(key, "\n")[0], lines[0], "the other credential is untouched")
 		assert.Contains(t, lines[1], "fresh-tok-b")
 	})
+}
+
+func TestBoundTaskPollRecoversCredentialRotatedBeforeRefreshWindow(t *testing.T) {
+	const pluginKey = "task-cred-poll-rotation"
+	plugin := registerCredentialTaskPlugin(t, pluginKey)
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	old := taskCredentialLine(t, pluginKey, "old", "acct-1", expiresAt)
+	metadataOnly := taskCredentialLine(t, pluginKey, "old", "acct-1", expiresAt+60)
+	rotated := taskCredentialLine(t, pluginKey, "rotated", "acct-1", expiresAt)
+	other := taskCredentialLine(t, pluginKey, "other", "acct-2", expiresAt)
+	for _, tc := range []struct {
+		name, storedKey, account string
+		status, want, attempts   int
+		batch, disableRotated    bool
+		upstreamChanged          bool
+		pluginConfigChanged      bool
+		rejectReplacement        bool
+		retryTransportFails      bool
+	}{
+		{name: "single poll", storedKey: other + "\n" + rotated, account: "acct-1", status: 401, want: 200, attempts: 2},
+		{name: "batch poll with disabled bound slot", storedKey: other + "\n" + rotated, account: "acct-1", status: 403, want: 200, attempts: 2, batch: true, disableRotated: true},
+		{name: "unchanged credential", storedKey: old, account: "acct-1", status: 401, want: 401, attempts: 1},
+		{name: "expiry changed only", storedKey: metadataOnly, account: "acct-1", status: 401, want: 401, attempts: 1},
+		{name: "account removed", storedKey: other, account: "acct-1", status: 401, want: 401, attempts: 1},
+		{name: "ambiguous account", storedKey: old + "\n" + rotated, account: "acct-1", status: 401, want: 401, attempts: 1},
+		{name: "expired replacement", storedKey: taskCredentialLine(t, pluginKey, "rotated", "acct-1", 1), account: "acct-1", status: 401, want: 401, attempts: 1},
+		{name: "unbound task", storedKey: rotated, status: 401, want: 401, attempts: 1},
+		{name: "rate limit", storedKey: rotated, account: "acct-1", status: 429, want: 429, attempts: 1},
+		{name: "upstream changed", storedKey: rotated, account: "acct-1", status: 401, want: 401, attempts: 1, upstreamChanged: true},
+		{name: "plugin config changed", storedKey: rotated, account: "acct-1", status: 401, want: 401, attempts: 1, pluginConfigChanged: true},
+		{name: "replacement rejected once", storedKey: rotated, account: "acct-1", status: 401, want: 401, attempts: 2, rejectReplacement: true},
+		{name: "retry transport error is redacted", storedKey: rotated, account: "acct-1", status: 401, attempts: 2, batch: true, retryTransportFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useCredentialTestDB(t, &model.Channel{}, &model.SystemTask{})
+			var requests []taskUpstreamRequest
+			var mu sync.Mutex
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				requests = append(requests, taskUpstreamRequest{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: string(body)})
+				mu.Unlock()
+				if tc.rejectReplacement || r.Header.Get("Authorization") != "Bearer rotated" {
+					w.WriteHeader(tc.status)
+					_, _ = io.WriteString(w, "original upstream response")
+					return
+				}
+				if tc.retryTransportFails {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err == nil {
+						_ = conn.Close()
+					}
+					return
+				}
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			t.Cleanup(upstream.Close)
+			storedBaseURL := upstream.URL
+			if tc.upstreamChanged {
+				storedBaseURL += "/new"
+			}
+			channel := insertCredentialChannel(t, pluginKey, storedBaseURL, tc.storedKey, strings.Contains(tc.storedKey, "\n"))
+			if tc.pluginConfigChanged {
+				stale := *channel
+				stale.SetOtherSettings(dto.ChannelOtherSettings{PluginConfig: json.RawMessage(`{"tenant":"previous"}`)})
+				channel.SetOtherSettings(dto.ChannelOtherSettings{PluginConfig: json.RawMessage(`{"tenant":"current"}`)})
+				require.NoError(t, model.DB.Model(channel).Update("settings", channel.OtherSettings).Error)
+				common.MemoryCacheEnabled = true
+				model.CacheUpdateChannel(&stale)
+			}
+			if tc.disableRotated {
+				_, err := model.UpdateChannelLocked(channel.Id, func(stored *model.Channel) error {
+					stored.ChannelInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusManuallyDisabled}
+					return nil
+				})
+				require.NoError(t, err)
+			}
+			info := credentialTaskInfo(upstream.URL, old, constant.ChannelTypeTaskPlugin)
+			info.ChannelId = channel.Id
+			info.ChannelSetting = channel.GetSetting()
+			info.HeadersOverride = channel.GetHeaderOverride()
+			adaptor := New(plugin)
+			adaptor.Init(info)
+			task := &model.Task{ChannelId: channel.Id, PrivateData: model.TaskPrivateData{UpstreamTaskID: "up-1", CredentialAccount: tc.account}}
+			var resp *http.Response
+			var err error
+			if tc.batch {
+				resp, err = adaptor.FetchBatchTasks(upstream.URL, old, []*model.Task{task}, "")
+			} else {
+				resp, err = adaptor.FetchTask(upstream.URL, old, task, "")
+			}
+			var body []byte
+			if tc.retryTransportFails {
+				require.EqualError(t, err, "failed to send task poll retry")
+				require.Nil(t, resp)
+			} else {
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, tc.want, resp.StatusCode)
+				body, err = io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				if tc.want != http.StatusOK {
+					assert.Equal(t, "original upstream response", string(body))
+				}
+			}
+			mu.Lock()
+			sent := append([]taskUpstreamRequest(nil), requests...)
+			mu.Unlock()
+			require.Len(t, sent, tc.attempts)
+			assert.Equal(t, "Bearer old", sent[0].Header.Get("Authorization"))
+			if tc.pluginConfigChanged {
+				assert.Equal(t, "previous", sent[0].Header.Get("X-Seen-Tenant"))
+			}
+			if tc.attempts == 2 {
+				retry := sent[1]
+				assert.Equal(t, "Bearer rotated", retry.Header.Get("Authorization"))
+				assert.Equal(t, "rotated", retry.Header.Get("X-Seen-Credential"))
+				assert.Equal(t, sent[0].Body, retry.Body)
+				assert.Equal(t, signature("rotated", retry.Method, upstream.URL+retry.Path+"?account=acct-1", retry.Body), retry.Header.Get("X-Signature"))
+			}
+			if tc.want == http.StatusOK {
+				if tc.batch {
+					results, err := adaptor.ParseBatchResult([]*model.Task{task}, resp, body)
+					require.NoError(t, err)
+					require.Contains(t, results, "up-1")
+					assert.JSONEq(t, `{"credential":"rotated"}`, string(results["up-1"].TaskInfo.PluginState))
+				} else {
+					result, err := adaptor.ParseTaskResult(task, resp, body)
+					require.NoError(t, err)
+					assert.JSONEq(t, `{"credential":"rotated"}`, string(result.PluginState))
+				}
+			}
+			if tc.disableRotated {
+				stored, err := model.GetChannelById(channel.Id, true)
+				require.NoError(t, err)
+				selected, _, apiErr := stored.GetNextEnabledKey()
+				require.Nil(t, apiErr)
+				assert.Equal(t, other, selected, "a new request still selects an enabled slot")
+			}
+		})
+	}
 }

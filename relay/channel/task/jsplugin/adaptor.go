@@ -155,6 +155,8 @@ type TaskAdaptor struct {
 	// pollKey is the key line the last FetchTask or FetchBatchTasks sent; the
 	// parse hooks of its response receive the same line.
 	pollKey string
+	// pollConfig pins the effective config across poll building and signing.
+	pollConfig json.RawMessage
 	// bodySHA256 hashes the submit body for signRequest.
 	bodySHA256 string
 }
@@ -835,32 +837,38 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 	if len(tasks) > 0 {
 		first = tasks[0]
 	}
+	if first != nil && first.PrivateData.CredentialAccount != "" && slices.ContainsFunc(tasks, func(task *model.Task) bool {
+		return task == nil || task.ChannelId != first.ChannelId || task.PrivateData.CredentialAccount != first.PrivateData.CredentialAccount
+	}) {
+		return nil, errors.New("batch poll tasks must use the same credential account")
+	}
 	key, err := a.taskCredentialLine(context.Background(), key, first)
 	if err != nil {
 		return nil, err
 	}
-	a.pollKey = key
+	return a.fetchTaskPoll(baseURL, key, proxy, first, func(key string) (requestDescriptor, error) {
+		return a.buildBatchPoll(baseURL, key, proxy, tasks)
+	})
+}
+
+func (a *TaskAdaptor) buildBatchPoll(baseURL, key, proxy string, tasks []*model.Task) (requestDescriptor, error) {
 	taskContexts := make([]map[string]any, 0, len(tasks))
 	taskIDs := make([]string, 0, len(tasks))
 	for _, task := range tasks {
 		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
 		if err != nil {
-			return nil, err
+			return requestDescriptor{}, err
 		}
 		taskContexts = append(taskContexts, taskCtx)
 		taskIDs = append(taskIDs, common.Interface2String(taskCtx["taskId"]))
 	}
 	ctx, err := a.batchQueryContext(key, baseURL, proxy, taskContexts)
 	if err != nil {
-		return nil, err
+		return requestDescriptor{}, err
 	}
 	// Keep the v1 ID-array argument compatible with persisted plugin sources;
 	// richer per-task polling state is available through ctx.tasks.
-	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildBatchQueryRequest", ctx, taskIDs)
-	if err != nil {
-		return nil, err
-	}
-	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	return a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildBatchQueryRequest", ctx, taskIDs)
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
@@ -871,16 +879,81 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 	if err != nil {
 		return nil, err
 	}
+	return a.fetchTaskPoll(baseURL, key, proxy, task, func(key string) (requestDescriptor, error) {
+		ctx, err := a.queryContext(task, key, baseURL, proxy)
+		if err != nil {
+			return requestDescriptor{}, err
+		}
+		return a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildQueryRequest", ctx)
+	})
+}
+
+// fetchTaskPoll retries a rejected query once when another node has already
+// stored a usable credential for the task's bound account.
+func (a *TaskAdaptor) fetchTaskPoll(baseURL, key, proxy string, task *model.Task, build func(string) (requestDescriptor, error)) (*http.Response, error) {
 	a.pollKey = key
-	ctx, err := a.queryContext(task, key, baseURL, proxy)
+	bound := task != nil && task.PrivateData.CredentialAccount != "" &&
+		a.channelType() == constant.ChannelTypeTaskPlugin && task.ChannelId == a.info.ChannelId
+	if bound {
+		if channel, err := model.CacheGetChannel(a.info.ChannelId); err == nil {
+			a.pollConfig = a.taskPollPluginConfig(channel)
+			defer func() { a.pollConfig = nil }()
+		}
+	}
+	descriptor, err := build(key)
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildQueryRequest", ctx)
-	if err != nil {
-		return nil, err
+	resp, err := a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	if err != nil || resp == nil || !bound || a.pollConfig == nil ||
+		(resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden) ||
+		resp.Request == nil || resp.Request.Response != nil {
+		return resp, err
 	}
-	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	// A stale channel may point to a different credential recipient or
+	// proxy. Only retry within the same stored upstream configuration.
+	stored, err := model.GetChannelById(a.info.ChannelId, true)
+	if err != nil || stored.Type != constant.ChannelTypeTaskPlugin || stored.Setting == nil {
+		return resp, nil
+	}
+	storedBaseURL := stored.GetBaseURL()
+	if storedBaseURL == "" {
+		storedBaseURL = constant.GetChannelBaseURL(stored.Type)
+	}
+	var settings kitdto.ChannelSettings
+	if storedBaseURL != baseURL || common.UnmarshalJsonStr(*stored.Setting, &settings) != nil ||
+		settings.TaskPluginKey != a.plugin.Meta.Key || settings.Proxy != proxy ||
+		!reflect.DeepEqual(settings, a.channelSetting()) ||
+		!bytes.Equal(a.taskPollPluginConfig(stored), a.pollConfig) ||
+		!maps.EqualFunc(stored.GetHeaderOverride(), relaycommon.GetEffectiveHeaderOverride(a.info), reflect.DeepEqual) {
+		return resp, nil
+	}
+	replacement := service.RotatedBoundTaskPluginCredential(stored, a.plugin.Meta.Key, task.PrivateData.CredentialAccount, key)
+	if replacement == "" {
+		return resp, nil
+	}
+	_ = resp.Body.Close()
+	descriptor, err = build(replacement)
+	if err != nil {
+		// Hook errors can include data from the replacement credential.
+		return nil, errors.New("failed to build task poll retry")
+	}
+	a.pollKey = replacement
+	resp, err = a.doFetchDescriptor(baseURL, replacement, proxy, descriptor)
+	if err != nil {
+		// A request error can include the newly signed URL.
+		return nil, errors.New("failed to send task poll retry")
+	}
+	return resp, nil
+}
+
+// taskPollPluginConfig reads the hook config without repairing a stored row.
+func (a *TaskAdaptor) taskPollPluginConfig(channel *model.Channel) json.RawMessage {
+	var settings kitdto.ChannelOtherSettings
+	if channel.OtherSettings != "" && common.UnmarshalJsonStr(channel.OtherSettings, &settings) != nil {
+		return nil
+	}
+	return a.plugin.ChannelConfigFor(settings.PluginConfig)
 }
 
 // hookFetcher sends a driver hook's utils.fetch requests to the hosts its
@@ -1158,9 +1231,6 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
-	if task != nil && task.PrivateData.Key != "" {
-		key = task.PrivateData.Key
-	}
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
@@ -1527,7 +1597,7 @@ func (a *TaskAdaptor) queryContext(task *model.Task, key, baseURL, proxy string)
 			}
 			ctx["state"] = state
 		}
-		if task.PrivateData.Key != "" {
+		if task.PrivateData.CredentialAccount == "" && task.PrivateData.Key != "" {
 			key = task.PrivateData.Key
 		}
 	}
@@ -1626,6 +1696,10 @@ func (a *TaskAdaptor) applyUpstreamCredentials(ctx map[string]any, channelType i
 // serves (meta.channelTypes) the channel's raw other setting as channelOther.
 func (a *TaskAdaptor) applyChannelContext(ctx map[string]any, channelType int) {
 	ctx["config"] = map[string]any{}
+	if channelType == constant.ChannelTypeTaskPlugin && a.pollConfig != nil {
+		ctx["config"] = pluginruntime.RawJSON(a.pollConfig)
+		return
+	}
 	if a.info == nil || !a.info.HasChannelMeta() || a.info.ChannelId == 0 || channelType == constant.ChannelTypeNewAPI {
 		return
 	}

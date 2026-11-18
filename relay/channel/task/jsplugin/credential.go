@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -148,8 +147,8 @@ func (a *TaskAdaptor) signTaskRequest(ctx context.Context, channelType int, base
 	if channelType != constant.ChannelTypeTaskPlugin || !a.plugin.HasProviderHook("signRequest") {
 		return nil
 	}
-	config := json.RawMessage(nil)
-	if a.info != nil && a.info.HasChannelMeta() && a.info.ChannelId != 0 {
+	config := a.pollConfig
+	if config == nil && a.info != nil && a.info.HasChannelMeta() && a.info.ChannelId != 0 {
 		if channel, err := model.CacheGetChannel(a.info.ChannelId); err == nil {
 			config = a.plugin.ChannelConfigFor(channel.GetOtherSettings().PluginConfig)
 		}

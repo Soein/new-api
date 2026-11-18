@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/MoeForge/moego/regexp"
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"gorm.io/gorm"
@@ -27,8 +26,6 @@ type RequestPolicySnapshot struct {
 	RetryCodes      []operation_setting.StatusCodeRange
 	DisableCodes    []operation_setting.StatusCodeRange
 	DisableKeywords []string
-	CheckText       bool
-	TextKeywords    []string
 	AutoDisable     bool
 	Options         map[string]string
 }
@@ -56,9 +53,6 @@ func requestPolicyDefaultOptions() map[string]string {
 	defaults["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	defaults["AutomaticDisableKeywords"] = operation_setting.AutomaticDisableKeywordsToString()
 	defaults["AutomaticDisableChannelEnabled"] = strconv.FormatBool(common.AutomaticDisableChannelEnabled)
-	defaults["CheckSensitiveEnabled"] = strconv.FormatBool(setting.CheckSensitiveEnabled)
-	defaults["CheckSensitiveOnPromptEnabled"] = strconv.FormatBool(setting.CheckSensitiveOnPromptEnabled)
-	defaults["SensitiveWords"] = setting.SensitiveWordsToString()
 	defaults["AutomaticEnableChannelEnabled"] = strconv.FormatBool(common.AutomaticEnableChannelEnabled)
 	defaults["ChannelDisableThreshold"] = strconv.FormatFloat(common.ChannelDisableThreshold, 'f', -1, 64)
 	defaults["FrtBreakerEnabled"] = strconv.FormatBool(common.FrtBreakerEnabled)
@@ -79,7 +73,7 @@ func IsRequestPolicyOption(key string) bool {
 	}
 	switch key {
 	case "FrtBreakerEnabled", "FrtBreakerThresholdSec", "FrtBreakerStrikes", "FrtBreakerWindowSec", "FrtBreakerCooldownSec", "FrtBreakerHalfOpenEnabled", "FrtBreakerHalfOpenWindowSec", "FrtBreakerHalfOpenStrikes", "FrtBreakerHalfOpenSweepSec",
-		"CheckSensitiveEnabled", "CheckSensitiveOnPromptEnabled", "SensitiveWords", "AutomaticEnableChannelEnabled", "ChannelDisableThreshold", "monitor_setting.auto_test_channel_enabled", "monitor_setting.auto_test_channel_minutes", "monitor_setting.channel_test_concurrency", "monitor_setting.channel_test_mode", "RetryTimes", "AutomaticRetryStatusCodes", "AutomaticDisableChannelEnabled", "AutomaticDisableStatusCodes", "AutomaticDisableKeywords":
+		"AutomaticEnableChannelEnabled", "ChannelDisableThreshold", "monitor_setting.auto_test_channel_enabled", "monitor_setting.auto_test_channel_minutes", "monitor_setting.channel_test_concurrency", "monitor_setting.channel_test_mode", "RetryTimes", "AutomaticRetryStatusCodes", "AutomaticDisableChannelEnabled", "AutomaticDisableStatusCodes", "AutomaticDisableKeywords":
 		return true
 	}
 	return false
@@ -153,7 +147,7 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 		return nil, err
 	}
 	snapshot.DisableKeywords = strings.Split(raw["AutomaticDisableKeywords"], "\n")
-	for _, key := range []string{"CheckSensitiveEnabled", "CheckSensitiveOnPromptEnabled", "AutomaticEnableChannelEnabled", "monitor_setting.auto_test_channel_enabled"} {
+	for _, key := range []string{"AutomaticEnableChannelEnabled", "monitor_setting.auto_test_channel_enabled"} {
 		if _, err := strconv.ParseBool(raw[key]); err != nil {
 			return nil, fmt.Errorf("invalid boolean: %s", key)
 		}
@@ -174,12 +168,6 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 		value, err := strconv.Atoi(raw[option.key])
 		if err != nil || value < option.min {
 			return nil, fmt.Errorf("invalid numeric value: %s", option.key)
-		}
-	}
-	snapshot.CheckText = raw["CheckSensitiveEnabled"] == "true" && raw["CheckSensitiveOnPromptEnabled"] == "true"
-	for word := range strings.SplitSeq(raw["SensitiveWords"], "\n") {
-		if word = strings.TrimSpace(word); word != "" {
-			snapshot.TextKeywords = append(snapshot.TextKeywords, word)
 		}
 	}
 	if err := operation_setting.ValidateChannelTestConcurrency(raw["monitor_setting.channel_test_concurrency"]); err != nil {
@@ -276,6 +264,7 @@ func UpdateRequestPolicyOptions(values map[string]string) error {
 	}); err != nil {
 		return err
 	}
+	BumpSyncTopic(SyncTopicOptions)
 	for key, value := range values {
 		if err := updateOptionMap(key, value); err != nil {
 			return err

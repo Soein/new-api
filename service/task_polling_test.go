@@ -35,9 +35,10 @@ type taskPollingFetchAdaptor struct {
 
 type batchPollingAdaptor struct {
 	taskPollingFetchAdaptor
-	batchCalls int
-	batchIDs   []string
-	results    map[string]*BatchTaskResult
+	batchCalls      int
+	batchIDs        []string
+	results         map[string]*BatchTaskResult
+	batchHTTPStatus func(key string, first *model.Task) int
 }
 
 type terminalPollingAdaptor struct {
@@ -123,13 +124,17 @@ func (a *terminalPollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relay
 }
 
 func (a *batchPollingAdaptor) FetchMode() string { return "batch" }
-func (a *batchPollingAdaptor) FetchBatchTasks(_ string, _ string, tasks []*model.Task, _ string) (*http.Response, error) {
+func (a *batchPollingAdaptor) FetchBatchTasks(_ string, key string, tasks []*model.Task, _ string) (*http.Response, error) {
 	a.batchCalls++
 	a.batchIDs = a.batchIDs[:0]
 	for _, task := range tasks {
 		a.batchIDs = append(a.batchIDs, task.GetUpstreamTaskID())
 	}
-	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(`{}`)))}, nil
+	status := http.StatusOK
+	if a.batchHTTPStatus != nil {
+		status = a.batchHTTPStatus(key, tasks[0])
+	}
+	return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader([]byte(`{}`)))}, nil
 }
 func (a *batchPollingAdaptor) ParseBatchResult(_ []*model.Task, _ *http.Response, _ []byte) (map[string]*BatchTaskResult, error) {
 	if a.results != nil {
@@ -974,12 +979,8 @@ func TestUpdateSunoTasksStalePollsRefundExactlyOnce(t *testing.T) {
 	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
 	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
 
-	require.NoError(t, updateBatchTasks(context.Background(), adaptor, channelID, []string{upstreamTaskID}, map[string]*model.Task{
-		upstreamTaskID: &firstPollTask,
-	}))
-	require.NoError(t, updateBatchTasks(context.Background(), adaptor, channelID, []string{upstreamTaskID}, map[string]*model.Task{
-		upstreamTaskID: &staleSecondPollTask,
-	}))
+	require.NoError(t, updateBatchTasks(context.Background(), adaptor, channelID, []*model.Task{&firstPollTask}))
+	require.NoError(t, updateBatchTasks(context.Background(), adaptor, channelID, []*model.Task{&staleSecondPollTask}))
 
 	var reloaded model.Task
 	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
@@ -1016,6 +1017,82 @@ func TestRunTaskPollingOnceDoesNotRefundHistoricalFailedTask(t *testing.T) {
 	assert.Equal(t, initialQuota, getUserQuota(t, userID))
 	assert.Equal(t, taskQuota, getTaskQuota(t, task.ID))
 	assert.Equal(t, int64(0), countLogs(t))
+}
+
+func TestRunTaskPollingOnceScopesBatchIDsAndRefunds(t *testing.T) {
+	truncate(t)
+	const firstChannelID, secondChannelID, userID = 483, 484, 483
+	const initialQuota, upstreamID = 10_000, "shared-upstream-id"
+	seedUser(t, userID, initialQuota)
+	seedTaskPollingChannel(t, firstChannelID, true)
+	seedTaskPollingChannel(t, secondChannelID, true)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", secondChannelID).Update("key", "second-channel-key").Error)
+
+	rows := []struct {
+		publicID, account, layer, key string
+		channelID, quota              int
+		wantStatus                    model.TaskStatus
+		taskID                        int64
+	}{
+		{publicID: "first", account: "acct-a", layer: "factory", channelID: firstChannelID, quota: 100, wantStatus: model.TaskStatusSuccess},
+		{publicID: "second", account: "acct-b", layer: "factory", channelID: firstChannelID, quota: 200, wantStatus: model.TaskStatusFailure},
+		{publicID: "third", account: "acct-b", layer: "factory", channelID: secondChannelID, quota: 300, wantStatus: model.TaskStatusSuccess},
+		{publicID: "fourth", account: "acct-a", layer: "override", channelID: firstChannelID, quota: 400, wantStatus: model.TaskStatusFailure},
+		{publicID: "same-account", account: "acct-a", layer: "factory", channelID: firstChannelID, quota: 500, wantStatus: model.TaskStatusSuccess},
+		{publicID: "static-a", key: "static-a-key", layer: "factory", channelID: secondChannelID, quota: 600, wantStatus: model.TaskStatusSuccess},
+		{publicID: "static-b", key: "static-b-key", layer: "factory", channelID: secondChannelID, quota: 700, wantStatus: model.TaskStatusFailure},
+	}
+	for i := range rows {
+		row := &rows[i]
+		task := makeTask(userID, row.channelID, row.quota, 0, BillingSourceWallet, 0)
+		task.TaskID, task.Platform, task.Progress = row.publicID, "batch-scope-test", "30%"
+		task.PrivateData.UpstreamTaskID = upstreamID
+		task.PrivateData.CredentialAccount = row.account
+		task.PrivateData.Key = row.key
+		task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+			Key: "batch-scope-test", Version: "1.0.0", APIVersion: 1, Layer: row.layer,
+		}}
+		require.NoError(t, model.DB.Create(task).Error)
+		row.taskID = task.ID
+	}
+
+	previousFactory, previousPinned, previousLimit := GetTaskAdaptorFunc, GetTaskAdaptorForTaskFunc, constant.TaskQueryLimit
+	t.Cleanup(func() {
+		GetTaskAdaptorFunc, GetTaskAdaptorForTaskFunc, constant.TaskQueryLimit = previousFactory, previousPinned, previousLimit
+	})
+	constant.TaskQueryLimit = 20
+	GetTaskAdaptorFunc = nil
+	GetTaskAdaptorForTaskFunc = func(task *model.Task) TaskPollingAdaptor {
+		layer := task.PrivateData.Execution.TaskPlugin.Layer
+		return &batchPollingAdaptor{
+			batchHTTPStatus: func(key string, first *model.Task) int {
+				if layer == "override" || key == "static-b-key" || key == "sk-test" && first.PrivateData.CredentialAccount == "acct-b" {
+					return http.StatusNotFound
+				}
+				return http.StatusOK
+			},
+			results: map[string]*BatchTaskResult{
+				upstreamID: {TaskInfo: relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Url: "https://example.com/result"}, Data: map[string]any{"ok": true}},
+			},
+		}
+	}
+
+	assert.Equal(t, len(rows), RunTaskPollingOnce(t.Context(), nil).UnfinishedTasks)
+	assert.Zero(t, RunTaskPollingOnce(t.Context(), nil).UnfinishedTasks)
+	for _, row := range rows {
+		var task model.Task
+		require.NoError(t, model.DB.First(&task, row.taskID).Error)
+		assert.Equal(t, row.wantStatus, task.Status, row.publicID)
+		if row.wantStatus == model.TaskStatusSuccess {
+			assert.Equal(t, row.quota, task.Quota, row.publicID)
+			assert.Equal(t, "https://example.com/result", task.GetResultURL(), row.publicID)
+		} else {
+			assert.Zero(t, task.Quota, row.publicID)
+			assert.Equal(t, "Upstream task not found", task.FailReason, row.publicID)
+		}
+	}
+	assert.Equal(t, initialQuota+1300, getUserQuota(t, userID))
+	assert.Equal(t, int64(3), countLogs(t))
 }
 
 func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
@@ -1259,9 +1336,7 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			require.NoError(t, model.DB.Create(task).Error)
 
 			adaptor := &scriptedPollingAdaptor{statusCode: testCase.statusCode, fetchErr: testCase.fetchErr, parse: testCase.parse, parseErr: testCase.parseErr}
-			require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, ch, task.GetUpstreamTaskID(), map[string]*model.Task{
-				task.GetUpstreamTaskID(): task,
-			}))
+			require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, ch, task))
 
 			var persisted model.Task
 			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
@@ -1363,4 +1438,83 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A task reports once, when it reaches its final state: not per poll, not
+// when another poller lost the race, never when no instance may report it.
+func TestTaskReportsOnceAtTheFinalState(t *testing.T) {
+	truncate(t)
+	const userID, tokenID, channelID = 520, 520, 520
+	seedUser(t, userID, 10_000)
+	seedToken(t, tokenID, userID, "sk-poll-report", 7_000)
+	ch := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Name: "poll", Key: "sk-test", Status: common.ChannelStatusEnabled}
+
+	var reported []string
+	previous := ReportTaskFunc
+	ReportTaskFunc = func(task *model.Task) { reported = append(reported, task.TaskID+":"+string(task.Status)) }
+	t.Cleanup(func() { ReportTaskFunc = previous })
+
+	newTask := func(id string, plugins bool) *model.Task {
+		task := makeTask(userID, channelID, 1_000, tokenID, BillingSourceWallet, 0)
+		task.TaskID = id
+		task.PrivateData.UpstreamTaskID = "upstream_" + id
+		if plugins {
+			task.PrivateData.RequestPlugins = &model.TaskRequestPlugins{Instances: []string{"audit"}}
+		}
+		require.NoError(t, model.DB.Create(task).Error)
+		return task
+	}
+	reload := func(task *model.Task) *model.Task {
+		var stored model.Task
+		require.NoError(t, model.DB.First(&stored, task.ID).Error)
+		return &stored
+	}
+	poll := func(task *model.Task, status model.TaskStatus) {
+		adaptor := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: string(status), Url: "https://cdn.example.com/v.mp4"}}
+		require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, ch, task))
+	}
+
+	task := newTask("report_once", true)
+	stale := reload(task)
+	staleMissingChannel := reload(task)
+	poll(task, model.TaskStatusInProgress)
+	poll(reload(task), model.TaskStatusInProgress)
+	assert.Empty(t, reported)
+
+	poll(reload(task), model.TaskStatusSuccess)
+	assert.Equal(t, []string{"report_once:SUCCESS"}, reported)
+	// Another poller that read the row before it finished loses the update.
+	poll(stale, model.TaskStatusSuccess)
+	assert.Len(t, reported, 1)
+	// A stale view with a missing channel must not overwrite that success.
+	assert.Zero(t, failUnpollableTasks(t.Context(), []*model.Task{staleMissingChannel}, taskPollingChannelMissing))
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), reload(task).Status)
+	assert.Len(t, reported, 1)
+
+	plain := newTask("no_plugins", false)
+	poll(plain, model.TaskStatusSuccess)
+	assert.Len(t, reported, 1)
+
+	failed := newTask("fails", true)
+	poll(failed, model.TaskStatusFailure)
+	assert.Equal(t, "fails:FAILURE", reported[1])
+
+	previousTimeout := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout })
+	timedOut := newTask("times_out", true)
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", timedOut.ID).Update("submit_time", time.Now().Add(-time.Hour).Unix()).Error)
+	sweepTimedOutTasks(context.Background())
+	sweepTimedOutTasks(context.Background())
+	assert.Equal(t, []string{"report_once:SUCCESS", "fails:FAILURE", "times_out:FAILURE"}, reported)
+
+	missingChannel := newTask("missing_channel", true)
+	stale = reload(missingChannel)
+	assert.Equal(t, 1, failUnpollableTasks(t.Context(), []*model.Task{missingChannel}, taskPollingChannelMissing))
+	assert.Zero(t, failUnpollableTasks(t.Context(), []*model.Task{stale}, taskPollingChannelMissing))
+	stored := reload(missingChannel)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), stored.Status)
+	assert.Equal(t, taskPollingChannelMissing, stored.FailReason)
+	assert.Equal(t, 1_000, stored.Quota)
+	assert.Equal(t, []string{"report_once:SUCCESS", "fails:FAILURE", "times_out:FAILURE", "missing_channel:FAILURE"}, reported)
 }

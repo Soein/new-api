@@ -23,19 +23,36 @@ func ValidateRequestURL(requestURL, baseURL string, allowedHosts []string) error
 	if base.Scheme == "https" && request.Scheme == "http" {
 		return fmt.Errorf("plugin request must not downgrade HTTPS to HTTP")
 	}
-	requestHost := canonicalHost(request)
-	if requestHost == canonicalHost(base) {
+	if canonicalHost(request) == canonicalHost(base) || hostAllowed(request, allowedHosts) {
 		return nil
 	}
+	return fmt.Errorf("plugin request host %q is not allowed", request.Host)
+}
+
+// ValidateServiceURL checks a utils.fetch URL of a hook that runs without a
+// channel: its host must be one of hosts, each `host` or `host:port`.
+func ValidateServiceURL(requestURL string, hosts []string) error {
+	request, err := url.Parse(requestURL)
+	if err != nil || request.Scheme == "" || request.Host == "" {
+		return fmt.Errorf("plugin request URL must be absolute")
+	}
+	if hostAllowed(request, hosts) {
+		return nil
+	}
+	return fmt.Errorf("plugin request host %q is not allowed", request.Host)
+}
+
+func hostAllowed(request *url.URL, allowedHosts []string) bool {
+	requestHost := canonicalHost(request)
 	for _, allowed := range allowedHosts {
 		// Parse with the request scheme so "host:443" matches an https request
 		// the same way an explicit default port on the request URL does.
 		allowedURL, parseErr := url.Parse(request.Scheme + "://" + strings.TrimSpace(allowed))
 		if parseErr == nil && requestHost == canonicalHost(allowedURL) {
-			return nil
+			return true
 		}
 	}
-	return fmt.Errorf("plugin request host %q is not allowed", request.Host)
+	return false
 }
 
 // ValidateRequestHeaders rejects plugin-chosen headers that the host

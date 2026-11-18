@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +20,6 @@ import (
 
 	"github.com/Calcium-Ion/go-epay/epay"
 	"github.com/gin-gonic/gin"
-	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
 )
 
@@ -126,18 +126,112 @@ type AmountRequest struct {
 	Amount int64 `json:"amount"`
 }
 
+const (
+	epayMD5TradeNoPrefix          = "USR"
+	epayRSATradeNoPrefix          = "RSA"
+	epaySubscriptionTradeNoPrefix = "SUB"
+)
+
+func epayConfig() (epay.Config, string) {
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	paymentSetting := operation_setting.GetPaymentSetting()
+	return epay.Config{
+		PartnerID:          operation_setting.EpayId,
+		Key:                operation_setting.EpayKey,
+		SignType:           paymentSetting.EpaySignType,
+		MerchantPrivateKey: paymentSetting.EpayMerchantPrivateKey,
+		PlatformPublicKey:  paymentSetting.EpayPlatformPublicKey,
+	}, operation_setting.PayAddress
+}
+
 func GetEpayClient() *epay.Client {
-	if operation_setting.PayAddress == "" || operation_setting.EpayId == "" || operation_setting.EpayKey == "" {
+	config, address := epayConfig()
+	if strings.TrimSpace(address) == "" || strings.TrimSpace(config.PartnerID) == "" {
 		return nil
 	}
-	withUrl, err := epay.NewClient(&epay.Config{
-		PartnerID: operation_setting.EpayId,
-		Key:       operation_setting.EpayKey,
-	}, operation_setting.PayAddress)
+	switch config.SignType {
+	case "", epay.SignTypeMD5:
+		if strings.TrimSpace(config.Key) == "" {
+			return nil
+		}
+	case epay.SignTypeRSA:
+	default:
+		return nil
+	}
+	client, err := epay.NewClient(&config, address)
 	if err != nil {
 		return nil
 	}
-	return withUrl
+	return client
+}
+
+// The gateway signs the full trade number. Its prefix pins the algorithm to
+// the order, including unmarked MD5 orders created before RSA was supported.
+func newEpayTradeNo(userID int, client *epay.Client, subscription bool) string {
+	prefix := epayMD5TradeNoPrefix
+	if client.Config.SignType == epay.SignTypeRSA {
+		prefix = epayRSATradeNoPrefix
+	}
+	if subscription {
+		prefix = epaySubscriptionTradeNoPrefix + prefix
+	}
+	return fmt.Sprintf("%s%dNO%s%d", prefix, userID, common.GetRandomString(6), time.Now().Unix())
+}
+
+func parseEpayCallbackParams(request *http.Request) (map[string]string, error) {
+	var values url.Values
+	if request.Method == http.MethodPost {
+		if err := request.ParseForm(); err != nil {
+			return nil, err
+		}
+		values = request.PostForm
+	} else {
+		var err error
+		values, err = url.ParseQuery(request.URL.RawQuery)
+		if err != nil {
+			return nil, err
+		}
+	}
+	params := make(map[string]string, len(values))
+	for name, entries := range values {
+		if len(entries) != 1 {
+			return nil, errors.New("duplicate Epay callback parameter")
+		}
+		params[name] = entries[0]
+	}
+	return params, nil
+}
+
+func verifyEpayCallback(params map[string]string) (*epay.VerifyRes, error) {
+	tradeNo := params["out_trade_no"]
+	modeTradeNo := strings.TrimPrefix(tradeNo, epaySubscriptionTradeNoPrefix)
+	config, address := epayConfig()
+	if strings.TrimSpace(address) == "" || strings.TrimSpace(config.PartnerID) == "" || params["pid"] != config.PartnerID {
+		return nil, errors.New("Epay merchant ID does not match the callback")
+	}
+	switch {
+	case strings.HasPrefix(modeTradeNo, epayRSATradeNoPrefix):
+		config.SignType = epay.SignTypeRSA
+	case strings.HasPrefix(modeTradeNo, epayMD5TradeNoPrefix):
+		config.SignType = epay.SignTypeMD5
+		if strings.TrimSpace(config.Key) == "" {
+			return nil, errors.New("Epay merchant key is missing")
+		}
+	default:
+		return nil, errors.New("invalid Epay order number")
+	}
+	// The SDK verifier only needs the platform public key in RSA mode.
+	// A merchant private key is required for issuing orders, not settling them.
+	client := epay.Client{Config: &config}
+	verified, err := client.Verify(params)
+	if err != nil {
+		return nil, err
+	}
+	if !verified.VerifyStatus || verified.ServiceTradeNo != tradeNo {
+		return nil, errors.New("invalid Epay callback signature or order number")
+	}
+	return verified, nil
 }
 
 func getPayMoney(amount int64, group string) float64 {
@@ -307,13 +401,12 @@ func RequestEpay(c *gin.Context) {
 	callBackAddress := service.GetCallbackAddress()
 	returnUrl, _ := url.Parse(paymentReturnPath("/usage-logs"))
 	notifyUrl, _ := url.Parse(callBackAddress + "/api/user/epay/notify")
-	tradeNo := fmt.Sprintf("%s%d", common.GetRandomString(6), time.Now().Unix())
-	tradeNo = fmt.Sprintf("USR%dNO%s", id, tradeNo)
 	client := GetEpayClient()
 	if client == nil {
 		paymentError(c, common.NewMessage("Payment information has not been configured by administrator"))
 		return
 	}
+	tradeNo := newEpayTradeNo(id, client, false)
 	uri, params, err := client.Purchase(&epay.PurchaseArgs{
 		Type:           req.PaymentMethod,
 		ServiceTradeNo: tradeNo,
@@ -403,25 +496,11 @@ func EpayNotify(c *gin.Context) {
 		return
 	}
 
-	var params map[string]string
-
-	if c.Request.Method == "POST" {
-		// POST 请求：从 POST body 解析参数
-		if err := c.Request.ParseForm(); err != nil {
-			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to parse POST form path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
-			_, _ = c.Writer.Write([]byte("fail"))
-			return
-		}
-		params = lo.Reduce(lo.Keys(c.Request.PostForm), func(r map[string]string, t string, i int) map[string]string {
-			r[t] = c.Request.PostForm.Get(t)
-			return r
-		}, map[string]string{})
-	} else {
-		// GET 请求：从 URL Query 解析参数
-		params = lo.Reduce(lo.Keys(c.Request.URL.Query()), func(r map[string]string, t string, i int) map[string]string {
-			r[t] = c.Request.URL.Query().Get(t)
-			return r
-		}, map[string]string{})
+	params, err := parseEpayCallbackParams(c.Request)
+	if err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to parse callback parameters path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+		_, _ = c.Writer.Write([]byte("fail"))
+		return
 	}
 	logger.LogInfo(c.Request.Context(), common.LogText("Epay webhook received request path=%q client_ip=%s method=%s params=%q", c.Request.RequestURI, c.ClientIP(), c.Request.Method, common.GetJsonString(params)))
 
@@ -430,25 +509,12 @@ func EpayNotify(c *gin.Context) {
 		_, _ = c.Writer.Write([]byte("fail"))
 		return
 	}
-	client := GetEpayClient()
-	if client == nil {
-		logger.LogError(c.Request.Context(), common.LogText("Epay client is not initialized path=%q client_ip=%s", c.Request.RequestURI, c.ClientIP()))
-		_, err := c.Writer.Write([]byte("fail"))
-		if err != nil {
-			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to write response path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
-		}
-		return
-	}
-	verifyInfo, err := client.Verify(params)
-	if err != nil || !verifyInfo.VerifyStatus {
+	verifyInfo, err := verifyEpayCallback(params)
+	if err != nil {
 		if _, writeErr := c.Writer.Write([]byte("fail")); writeErr != nil {
 			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to write response path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), writeErr.Error()))
 		}
-		if err != nil {
-			logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook signature verification failed path=%q client_ip=%s verify_error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
-		} else {
-			logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook signature verification failed path=%q client_ip=%s verify_status=false", c.Request.RequestURI, c.ClientIP()))
-		}
+		logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook signature verification failed path=%q client_ip=%s verify_error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
 		return
 	}
 	logger.LogInfo(c.Request.Context(), common.LogText("Epay webhook signature verified trade_no=%s callback_type=%s trade_status=%s client_ip=%s verify_info=%q", verifyInfo.ServiceTradeNo, verifyInfo.Type, verifyInfo.TradeStatus, c.ClientIP(), common.GetJsonString(verifyInfo)))

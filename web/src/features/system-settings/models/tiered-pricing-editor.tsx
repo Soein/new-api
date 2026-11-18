@@ -82,17 +82,22 @@ import {
   type TimeCondition,
   type TimeFunc,
 } from '@/features/pricing/lib/billing-expr'
+import { compileBillingExpression } from '@/features/pricing/lib/billing-expression/parser'
 import {
   parseVisualBillingDocument,
   serializeVisualBillingDocument,
   type VisualBillingDocument,
 } from '@/features/pricing/lib/billing-expression/visual'
 import {
+  CACHE_PRICING_MODES,
+  getCachePriceLabels,
+  getCachePricingMode,
+} from '@/features/pricing/lib/cache-pricing'
+import {
   type ExtraTokenValues,
   createDefaultVisualConfig,
   evalExprLocally,
   buildEstimatorTokens,
-  exprUsesExtraVars,
   exprUsesImageCount,
   generateExprFromVisualConfig,
 } from '@/features/pricing/lib/tier-expr'
@@ -787,12 +792,18 @@ function PresetSection({ applyPreset }: PresetSectionProps) {
 // ---------------------------------------------------------------------------
 
 type EstimatorProps = {
+  modelName?: string
   currency: PricingCurrency
   effectiveExpr: string
   fullExpr: string
 }
 
-function CostEstimator({ effectiveExpr, fullExpr, currency }: EstimatorProps) {
+function CostEstimator({
+  modelName,
+  effectiveExpr,
+  fullExpr,
+  currency,
+}: EstimatorProps) {
   const { t } = useTranslation()
   const inputId = useId()
   const outputId = useId()
@@ -814,33 +825,75 @@ function CostEstimator({ effectiveExpr, fullExpr, currency }: EstimatorProps) {
     imageCount: 1,
   })
 
-  const usesExtras = useMemo(
-    () => exprUsesExtraVars(effectiveExpr),
+  const compiled = useMemo(
+    () => compileBillingExpression(effectiveExpr),
     [effectiveExpr]
+  )
+  const usedVariables: ReadonlySet<string> =
+    compiled.status === 'ready' ? compiled.variables : new Set()
+  const usesExtraTokenVars = BILLING_EXTRA_VARS.some((variable) =>
+    usedVariables.has(variable.key)
   )
   const usesImageCount = useMemo(
     () => exprUsesImageCount(effectiveExpr),
     [effectiveExpr]
   )
+  const usesExtras = usesExtraTokenVars || usesImageCount
+  const cacheMode = getCachePricingMode(usedVariables, modelName)
+  const activeExtras = useMemo(() => {
+    const values = { ...extras }
+    for (const variable of BILLING_EXTRA_VARS) {
+      if (
+        variable.field &&
+        (!usesExtraTokenVars ||
+          (CACHE_PRICING_MODES.custom.variables.includes(variable.key) &&
+            !CACHE_PRICING_MODES[cacheMode].variables.includes(variable.key)))
+      ) {
+        values[
+          variable.field.replace('Price', 'Tokens') as keyof ExtraTokenValues
+        ] = 0
+      }
+    }
+    return values
+  }, [extras, cacheMode, usesExtraTokenVars])
 
   const tokens = useMemo(() => {
     const values = buildEstimatorTokens(
       promptTokens,
       completionTokens,
-      extras,
+      activeExtras,
       effectiveExpr
     )
     if (lengthOverride.trim()) values.len = Number(lengthOverride)
     return values
-  }, [promptTokens, completionTokens, extras, lengthOverride, effectiveExpr])
+  }, [
+    promptTokens,
+    completionTokens,
+    activeExtras,
+    lengthOverride,
+    effectiveExpr,
+  ])
 
   const result = useMemo(
     () =>
-      evalExprLocally(effectiveExpr, promptTokens, completionTokens, extras, {
-        tokens,
-        now: billingTime === undefined ? undefined : new Date(billingTime),
-      }),
-    [effectiveExpr, promptTokens, completionTokens, extras, tokens, billingTime]
+      evalExprLocally(
+        effectiveExpr,
+        promptTokens,
+        completionTokens,
+        activeExtras,
+        {
+          tokens,
+          now: billingTime === undefined ? undefined : new Date(billingTime),
+        }
+      ),
+    [
+      effectiveExpr,
+      promptTokens,
+      completionTokens,
+      activeExtras,
+      tokens,
+      billingTime,
+    ]
   )
 
   if (result.error === 'task usage') {
@@ -856,7 +909,11 @@ function CostEstimator({ effectiveExpr, fullExpr, currency }: EstimatorProps) {
   }
 
   return (
-    <div className='bg-muted/30 space-y-3 rounded-md border p-3'>
+    <div
+      role='group'
+      aria-label={t('Token estimator')}
+      className='bg-muted/30 space-y-3 rounded-md border p-3'
+    >
       <div className='space-y-1'>
         <h4 className='text-sm font-medium'>{t('Token estimator')}</h4>
         <p className='text-muted-foreground text-xs'>
@@ -906,8 +963,11 @@ function CostEstimator({ effectiveExpr, fullExpr, currency }: EstimatorProps) {
         <div className='grid grid-cols-2 gap-3'>
           {usesImageCount && (
             <div className='space-y-1'>
-              <Label className='text-xs'>{t('Image count')}</Label>
+              <Label htmlFor={`${inputId}-imageCount`} className='text-xs'>
+                {t('Image count')}
+              </Label>
               <DraftNumberInput
+                id={`${inputId}-imageCount`}
                 min={0}
                 value={extras.imageCount}
                 onValueChange={(value) =>
@@ -916,31 +976,44 @@ function CostEstimator({ effectiveExpr, fullExpr, currency }: EstimatorProps) {
               />
             </div>
           )}
-          {BILLING_EXTRA_VARS.map((variable) => {
-            // BILLING_EXTRA_VARS only contains pricing variables; they are
-            // guaranteed to have a non-null `field` (the `len` condition-only
-            // variable is filtered out). Narrow the type here for safety.
-            if (!variable.field) return null
-            const stateKey = variable.field.replace(
-              'Price',
-              'Tokens'
-            ) as keyof ExtraTokenValues
-            return (
-              <div key={variable.key} className='space-y-1'>
-                <Label className='text-xs'>{t(variable.shortLabel)}</Label>
-                <DraftNumberInput
-                  min={0}
-                  value={extras[stateKey] ?? 0}
-                  onValueChange={(value) =>
-                    setExtras((prev) => ({
-                      ...prev,
-                      [stateKey]: value,
-                    }))
-                  }
-                />
-              </div>
-            )
-          })}
+          {usesExtraTokenVars &&
+            BILLING_EXTRA_VARS.map((variable) => {
+              // BILLING_EXTRA_VARS only contains pricing variables; they are
+              // guaranteed to have a non-null `field` (the `len` condition-only
+              // variable is filtered out). Narrow the type here for safety.
+              if (!variable.field) return null
+              if (
+                CACHE_PRICING_MODES.custom.variables.includes(variable.key) &&
+                !CACHE_PRICING_MODES[cacheMode].variables.includes(variable.key)
+              ) {
+                return null
+              }
+              const stateKey = variable.field.replace(
+                'Price',
+                'Tokens'
+              ) as keyof ExtraTokenValues
+              return (
+                <div key={variable.key} className='space-y-1'>
+                  <Label
+                    htmlFor={`${inputId}-${variable.key}`}
+                    className='text-xs'
+                  >
+                    {t(getCachePriceLabels(variable, cacheMode).shortLabel)}
+                  </Label>
+                  <DraftNumberInput
+                    id={`${inputId}-${variable.key}`}
+                    min={0}
+                    value={extras[stateKey] ?? 0}
+                    onValueChange={(value) =>
+                      setExtras((prev) => ({
+                        ...prev,
+                        [stateKey]: value,
+                      }))
+                    }
+                  />
+                </div>
+              )
+            })}
         </div>
       )}
       <div
@@ -1331,6 +1404,8 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       <div className='bg-muted/30 space-y-3 rounded-md border p-3'>
         {editorMode === 'visual' && visualDocument && (
           <VisualBillingDocumentEditor
+            key={`${modelName ?? ''}:${visualDocument.source}`}
+            modelName={modelName}
             document={visualDocument}
             currency={currency}
             issues={serialized && !serialized.ok ? serialized.issues : []}
@@ -1410,6 +1485,7 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       </div>
 
       <CostEstimator
+        modelName={modelName}
         effectiveExpr={effectiveExpr}
         fullExpr={
           editorMode === 'raw'

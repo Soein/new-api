@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -38,16 +40,18 @@ func TestBuiltInTaskPluginHistoryKeepsPreUpgradeTasksPollable(t *testing.T) {
 	}{
 		{"alibaba", "1.4.2", "63ef98833760d0bdcdddc66ec9e1dbc12e43a1b6016cda9caa4f3d4bf329e546", "wan2.6-t2v", taskID, "GET", "/ali/api/v1/tasks/" + taskID, "", `{"output":{"task_status":"RUNNING"}}`, "IN_PROGRESS"},
 		{"doubao", "1.3.0", "b3ad4a16dfbf582bb2917c7a631fc46a8b36d5a8b2ad26c6dd160fd6f9ea3f1c", "doubao-seedance-1-0-pro-250528", taskID, "GET", "/doubao/api/v3/contents/generations/tasks/" + taskID, "", `{"status":"running"}`, "IN_PROGRESS"},
+		{"doubao", "1.4.0", "58da524648f3b43e6944c34cc14de59b7162123fe046b033037680a0fa4d182b", "doubao-seedance-1-0-pro-250528", taskID, "GET", "/doubao/api/v3/contents/generations/tasks/" + taskID, "", `{"status":"running"}`, "IN_PROGRESS"},
 		{"google", "1.1.0", "edb5107d2798d55028331f5d804976e1c8c12576eafea266fa8ae1b57b20d2c5", "veo-3.0-generate-001", base64.RawURLEncoding.EncodeToString([]byte(googleOperation)), "GET", "/google/v1beta/" + googleOperation, "", `{"name":"` + googleOperation + `"}`, "IN_PROGRESS"},
 		{"hailuo", "1.3.0", "773b9aa3449dcab67890e2ddad9530b8951f32026114d1abd4100469e0917324", "MiniMax-Hailuo-2.3", taskID, "GET", "/hailuo/v1/query/video_generation/" + taskID, "", `{"status":"Processing","base_resp":{"status_code":0}}`, "IN_PROGRESS"},
 		{"jimeng", "1.1.0", "8ca1acc9fff4abf6188234324f7e41407f037c37b098d7ff27ab9f1e5d162f67", "jimeng_vgfm_t2v_l20", taskID, "POST", "/jimeng/?Action=CVSync2AsyncGetResult&Version=2022-08-31", `{"req_key":"jimeng_vgfm_t2v_l20","task_id":"` + taskID + `"}`, `{"code":10000,"data":{"status":"in_queue"}}`, "QUEUED"},
 		{"kling", "1.1.0", "c297187e42ef290bcc56564571a5cfeffc78121ae3f69029168d109b55ae5106", "kling-v1", taskID, "GET", "/kling/v1/videos/text2video/" + taskID, "", `{"code":0,"data":{"task_id":"` + taskID + `","task_status":"processing"}}`, "IN_PROGRESS"},
 		{"vertex-ai", "1.1.0", "084e70d7578ad965f730741375d99f9c8ca2df81e64086c6e0b1ff7b145e84a6", "veo-3.0-generate-001", base64.RawURLEncoding.EncodeToString([]byte(vertexOperation)), "POST", "/vertex-ai/v1/projects/history-project/locations/us-central1/publishers/google/models/veo-3.0-generate-001:fetchPredictOperation", `{"operationName":"` + vertexOperation + `"}`, `{"name":"` + vertexOperation + `"}`, "IN_PROGRESS"},
+		{"vertex-ai", "1.2.0", "90a40af64d7617614b2327f480c8a67b7d22630011f659890b496395d573d910", "veo-3.0-generate-001", base64.RawURLEncoding.EncodeToString([]byte(vertexOperation)), "POST", "/vertex-ai/v1/projects/history-project/locations/us-central1/publishers/google/models/veo-3.0-generate-001:fetchPredictOperation", `{"operationName":"` + vertexOperation + `"}`, `{"name":"` + vertexOperation + `"}`, "IN_PROGRESS"},
 		{"vidu", "1.1.0", "d7252585c1de4caf3a255aff7c92ff27b54ddaaea27077cca3b72149642d2c5f", "viduq2", taskID, "GET", "/vidu/ent/v2/tasks/" + taskID + "/creations", "", `{"state":"processing"}`, "IN_PROGRESS"},
 		{"xai", "1.1.0", "9ec1f0514fae96ed945a493636ded0f280ae340a6fd493e108c7e18e665b52a7", "grok-imagine-video", taskID, "GET", "/xai/v1/videos/" + taskID, "", `{"status":"pending"}`, "IN_PROGRESS"},
 	}
 	for _, tc := range cases {
-		t.Run(tc.key, func(t *testing.T) {
+		t.Run(tc.key+"@"+tc.version, func(t *testing.T) {
 			current, found := jsplugin.DefaultRegistry.FactoryPlugin(tc.key)
 			require.True(t, found)
 			require.NotEqual(t, tc.version, current.Meta.Version)
@@ -103,6 +107,16 @@ func TestBuiltInTaskPluginHistoryKeepsPreUpgradeTasksPollable(t *testing.T) {
 			assert.False(t, restored, "an old version with a different source hash must fail closed")
 		})
 	}
+}
+
+// The built-in request processing plugins and the stage hooks each exports.
+var requestPluginHooks = map[string][]string{
+	"auto-reasoning":     {"request"},
+	"content-moderation": {"ingress", "reply"},
+	"image-compress":     {"outbound"},
+	"param-override":     {"outbound"},
+	"request-filter":     {"ingress", "egress", "reply"},
+	"request-redact":     {"ingress", "egress", "reply"},
 }
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
@@ -223,9 +237,9 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 		{48, "xai"},
 	}
 	for _, channelType := range channelTypes {
-		plugin, found := generation.GetByChannelType(channelType.value)
-		require.True(t, found)
-		require.Equal(t, channelType.key, plugin.Meta.Key)
+		plugins := generation.PluginsByChannelType(channelType.value)
+		require.Len(t, plugins, 1, channelType.value)
+		require.Equal(t, channelType.key, plugins[0].Meta.Key)
 	}
 }
 
@@ -241,7 +255,11 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 			actualKeys = append(actualKeys, entry.Name())
 		}
 	}
-	assert.Equal(t, expectedKeys, actualKeys)
+	// Every other directory holds a request processing plugin, which has no
+	// task part.
+	allKeys := slices.Concat(expectedKeys, slices.Collect(maps.Keys(requestPluginHooks)))
+	slices.Sort(allKeys)
+	assert.Equal(t, allKeys, actualKeys)
 
 	for _, key := range expectedKeys {
 		t.Run(key, func(t *testing.T) {
@@ -282,6 +300,33 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 			for usageKey, schema := range plugin.Meta.UsageSchema {
 				assert.NotEmpty(t, schema.Description, usageKey)
 			}
+		})
+	}
+}
+
+func TestBuiltInRequestPluginsExportTheirStageHooks(t *testing.T) {
+	generation := jsplugin.DefaultRegistry.Generation()
+	require.NotNil(t, generation)
+
+	for key, hooks := range requestPluginHooks {
+		t.Run(key, func(t *testing.T) {
+			plugin, found := generation.Get(key)
+			require.True(t, found, "factory plugin was excluded from the active generation")
+			assert.Equal(t, hooks, plugin.TransformHooks())
+			// A request may skip a failure only of the plugins whose work is
+			// an improvement, never of a policy or a configured override.
+			assert.Equal(t, key == "auto-reasoning" || key == "image-compress", plugin.Meta.Optional)
+			assert.False(t, plugin.Engine.HasExport("buildSubmitRequest"))
+			assert.Empty(t, plugin.Meta.Relay)
+			assert.NotEmpty(t, plugin.Meta.NameI18n["zh"])
+			// An instance saved without config takes the schema defaults.
+			_, err := plugin.ValidateConfig(nil)
+			require.NoError(t, err)
+			// The icon endpoint serves the sidecar logo from this data URI.
+			mediaType, data, err := jsplugin.DecodeIconDataURI(IconDataURI(key))
+			require.NoError(t, err)
+			assert.Equal(t, "image/svg+xml", mediaType)
+			assert.NotEmpty(t, data)
 		})
 	}
 }

@@ -25,7 +25,7 @@ func setupTaskPluginModelTest(t *testing.T) {
 	var err error
 	DB, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, DB.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}))
+	require.NoError(t, DB.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}, &SystemTask{}))
 }
 
 func TestConcurrentFirstTaskPluginUploadsCreateSingleActiveVersion(t *testing.T) {
@@ -36,7 +36,7 @@ func TestConcurrentFirstTaskPluginUploadsCreateSingleActiveVersion(t *testing.T)
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(2)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-	require.NoError(t, database.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}))
+	require.NoError(t, database.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}, &SystemTask{}))
 
 	originalDB := DB
 	DB = database
@@ -133,7 +133,7 @@ func TestRestoreTaskPluginActivationDoesNotOverwriteNewerActivation(t *testing.T
 
 	nodeA := openNode()
 	nodeB := openNode()
-	require.NoError(t, nodeA.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}))
+	require.NoError(t, nodeA.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}, &SystemTask{}))
 
 	originalDB := DB
 	t.Cleanup(func() { DB = originalDB })
@@ -197,7 +197,7 @@ func TestRestoreTaskPluginActivationRejectsABAReactivation(t *testing.T) {
 	}
 	nodeA := openNode()
 	nodeB := openNode()
-	require.NoError(t, nodeA.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}))
+	require.NoError(t, nodeA.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}, &SystemTask{}))
 	originalDB := DB
 	t.Cleanup(func() { DB = originalDB })
 	DB = nodeA
@@ -411,10 +411,10 @@ func TestTaskPluginActivationRestoreDatabaseMatrix(t *testing.T) {
 			dropped := false
 			t.Cleanup(func() {
 				if !dropped {
-					_ = database.Migrator().DropTable(&TaskPlugin{}, &TaskPluginState{})
+					_ = database.Migrator().DropTable(&TaskPlugin{}, &TaskPluginState{}, &SystemTask{})
 				}
 			})
-			require.NoError(t, database.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}))
+			require.NoError(t, database.AutoMigrate(&TaskPluginState{}, &TaskPlugin{}, &SystemTask{}))
 
 			start := make(chan struct{})
 			saveErrors := make(chan error, 2)
@@ -476,6 +476,11 @@ func TestTaskPluginActivationRestoreDatabaseMatrix(t *testing.T) {
 				assert.Equal(t, v1.Version, active.Version)
 				assert.False(t, active.Enabled)
 			}
+			var notifications int64
+			require.NoError(t, database.Model(&SystemTask{}).Where("type = ?", SyncTaskType(SyncTopicPlugins)).Count(&notifications).Error)
+			// Four uploads and two restorations sync immediately. The caller
+			// of ActivateTaskPluginWithState owns publication and notification.
+			assert.Equal(t, int64(6), notifications)
 
 			var rows []TaskPlugin
 			require.NoError(t, database.Where(&TaskPlugin{Key: "matrix-plugin"}).Order("version").Find(&rows).Error)
@@ -519,7 +524,7 @@ func TestTaskPluginActivationRestoreDatabaseMatrix(t *testing.T) {
 			require.NoError(t, database.Where(&TaskPluginState{Key: "legacy-plugin"}).First(&state).Error)
 			assert.Equal(t, int64(1), state.Revision)
 
-			require.NoError(t, database.Migrator().DropTable(&TaskPlugin{}, &TaskPluginState{}))
+			require.NoError(t, database.Migrator().DropTable(&TaskPlugin{}, &TaskPluginState{}, &SystemTask{}))
 			dropped = true
 			assert.False(t, database.Migrator().HasTable(&TaskPlugin{}))
 		})

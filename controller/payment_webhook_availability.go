@@ -3,6 +3,7 @@ package controller
 import (
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 )
@@ -77,15 +78,31 @@ func isWaffoPancakeWebhookEnabled() bool {
 }
 
 func isEpayTopUpEnabled() bool {
-	return isEpayWebhookConfigured() && len(operation_setting.PayMethods) > 0
-}
-
-func isEpayWebhookConfigured() bool {
-	return strings.TrimSpace(operation_setting.PayAddress) != "" &&
-		strings.TrimSpace(operation_setting.EpayId) != "" &&
-		strings.TrimSpace(operation_setting.EpayKey) != ""
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	if len(operation_setting.PayMethods) == 0 || strings.TrimSpace(operation_setting.PayAddress) == "" || strings.TrimSpace(operation_setting.EpayId) == "" {
+		return false
+	}
+	paymentSetting := operation_setting.GetPaymentSetting()
+	switch paymentSetting.EpaySignType {
+	case "", operation_setting.EpaySignTypeMD5:
+		return strings.TrimSpace(operation_setting.EpayKey) != ""
+	case operation_setting.EpaySignTypeRSA:
+		return strings.TrimSpace(paymentSetting.EpayMerchantPrivateKey) != "" &&
+			strings.TrimSpace(paymentSetting.EpayPlatformPublicKey) != ""
+	default:
+		return false
+	}
 }
 
 func isEpayWebhookEnabled() bool {
-	return isEpayTopUpEnabled()
+	// Retain the payment-method gate, but allow outstanding orders to use the
+	// verification key for the mode they were issued in.
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	return len(operation_setting.PayMethods) > 0 &&
+		strings.TrimSpace(operation_setting.PayAddress) != "" &&
+		strings.TrimSpace(operation_setting.EpayId) != "" &&
+		(strings.TrimSpace(operation_setting.EpayKey) != "" ||
+			strings.TrimSpace(operation_setting.GetPaymentSetting().EpayPlatformPublicKey) != "")
 }

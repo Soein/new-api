@@ -73,11 +73,14 @@ import {
   getTaskPluginVersions,
 } from '../api'
 import { toastPluginChange } from '../lib/plugin-change-toast'
+import { localizedPluginName } from '../lib/plugin-name'
+import { resolvePluginParts } from '../lib/plugin-parts'
 import type { TaskPluginListItem } from '../types'
 import { JavaScriptViewer } from './javascript-viewer'
 import { PluginIcon } from './plugin-icon'
 import { PluginMetadataCard } from './plugin-metadata-card'
 import { PluginModelList } from './plugin-model-list'
+import { PluginPartsBadges } from './plugin-parts-badges'
 import { PluginSandbox } from './plugin-sandbox'
 import { SourceDiff } from './source-diff'
 import { UsageSchemaTable } from './usage-schema-table'
@@ -138,6 +141,12 @@ function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
   })
   const detail = detailQuery.data
   const versions = versionsQuery.data ?? []
+  const parts = resolvePluginParts(detail ?? props.plugin)
+  // A provider-only plugin has no billing parameters or task sandbox.
+  const tab =
+    !parts.task && (activeTab === 'billing' || activeTab === 'sandbox')
+      ? 'overview'
+      : activeTab
   const description = resolveLocalizedText(
     detail?.meta.description ?? props.plugin?.meta.description,
     i18n.language
@@ -207,7 +216,10 @@ function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
             />
           </span>
           <span className='min-w-0 text-lg font-semibold break-words'>
-            {detail?.meta.name ?? props.plugin.meta.name}
+            {localizedPluginName(
+              detail?.meta ?? props.plugin.meta,
+              i18n.language
+            )}
           </span>
         </SheetTitle>
         <div className='flex min-w-0 items-center gap-1'>
@@ -227,12 +239,21 @@ function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
             {detail?.meta.version ?? props.plugin.meta.version}
           </Badge>
         </div>
+        {(parts.provider || parts.login || parts.transform) && (
+          <div className='flex flex-wrap items-center gap-1.5'>
+            <PluginPartsBadges
+              provider={parts.provider}
+              login={parts.login}
+              transform={parts.transform}
+            />
+          </div>
+        )}
         <SheetDescription className='max-h-24 overflow-y-auto text-xs leading-relaxed break-words'>
           {description || t('Not declared')}
         </SheetDescription>
       </SheetHeader>
       <Tabs
-        value={activeTab}
+        value={tab}
         onValueChange={(value) => {
           setActiveTab(String(value))
           if (value === 'sandbox') setSandboxVisited(true)
@@ -246,11 +267,17 @@ function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
             aria-label={t('Plugin details')}
           >
             <TabsTrigger value='overview'>{t('Overview')}</TabsTrigger>
-            <TabsTrigger value='billing'>{t('Billing parameters')}</TabsTrigger>
+            {parts.task && (
+              <TabsTrigger value='billing'>
+                {t('Billing parameters')}
+              </TabsTrigger>
+            )}
             <TabsTrigger value='source'>{t('Plugin source')}</TabsTrigger>
             <TabsTrigger value='versions'>{t('Version history')}</TabsTrigger>
             <TabsTrigger value='diff'>{t('Source diff')}</TabsTrigger>
-            <TabsTrigger value='sandbox'>{t('Plugin sandbox')}</TabsTrigger>
+            {parts.task && (
+              <TabsTrigger value='sandbox'>{t('Plugin sandbox')}</TabsTrigger>
+            )}
           </TabsList>
         </div>
         <TabsContent value='overview' className={panelClassName}>
@@ -259,6 +286,8 @@ function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
               <PluginMetadataCard
                 meta={detail.meta}
                 skippedRoutes={detail.skipped_routes}
+                transformHooks={detail.transform_hooks}
+                parts={parts}
               />
             ))}
         </TabsContent>

@@ -75,7 +75,7 @@ func TestRequestPolicyDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Raw(query).Scan(&version).Error)
 			t.Logf("database version: %s", version)
 			require.NoError(t, db.Create(&Option{Key: "FrtBreakerThresholdSec", Value: "17"}).Error)
-			loadOptionsFromDatabase()
+			require.NoError(t, LoadOptionsFromDatabase())
 			assert.Equal(t, "17", CurrentRequestPolicy().Options["FrtBreakerThresholdSec"], "the GET read model includes existing FRT settings")
 			assert.Equal(t, 17, common.FrtBreakerThresholdSec)
 			for _, key := range []string{
@@ -109,7 +109,7 @@ func TestRequestPolicyDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, 240, common.FrtBreakerHalfOpenWindowSec)
 			assert.Equal(t, 2, common.FrtBreakerHalfOpenStrikes)
 			assert.Equal(t, 5, common.FrtBreakerHalfOpenSweepSec)
-			loadOptionsFromDatabase()
+			require.NoError(t, LoadOptionsFromDatabase())
 			for key, value := range frtValues {
 				assert.Equal(t, value, CurrentRequestPolicy().Options[key], "FRT setting survives database reload: "+key)
 			}
@@ -119,12 +119,12 @@ func TestRequestPolicyDatabaseMatrix(t *testing.T) {
 			assert.Error(t, UpdateRequestPolicyOptions(map[string]string{"request_policy_setting.mode": "off"}), "the removed mode switch is not a policy option")
 			assert.False(t, CurrentRequestPolicy().Affinity.Rules[0].SkipRetryOnFailure)
 			assert.Equal(t, rules, CurrentRequestPolicy().Options["channel_affinity_setting.rules"])
-			loadOptionsFromDatabase()
-			loadOptionsFromDatabase()
+			LoadOptionsFromDatabase()
+			LoadOptionsFromDatabase()
 			assert.Equal(t, rules, CurrentRequestPolicy().Options["channel_affinity_setting.rules"], "legacy rule JSON survives reloads without dropping extension fields")
 			require.NoError(t, UpdateRequestPolicyOptions(map[string]string{"channel_affinity_setting.session_mode": "strict"}))
-			loadOptionsFromDatabase()
-			loadOptionsFromDatabase()
+			LoadOptionsFromDatabase()
+			LoadOptionsFromDatabase()
 			assert.Equal(t, "strict", CurrentRequestPolicy().Affinity.SessionMode)
 			assert.Equal(t, rules, CurrentRequestPolicy().Options["channel_affinity_setting.rules"], "a global mode never rewrites rule fields")
 			snapshot := CurrentRequestPolicy()
@@ -165,7 +165,7 @@ func TestRequestPolicyDatabaseMatrix(t *testing.T) {
 			option = Option{}
 			require.NoError(t, db.Where(map[string]any{"key": "RetryTimes"}).First(&option).Error)
 			assert.Equal(t, "2", option.Value)
-			loadOptionsFromDatabase()
+			LoadOptionsFromDatabase()
 			assert.Equal(t, "strict", CurrentRequestPolicy().Affinity.SessionMode, "a failed save keeps the persisted global mode")
 		})
 	}

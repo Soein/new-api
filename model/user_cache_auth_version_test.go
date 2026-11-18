@@ -14,6 +14,30 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestAuthCacheHonorsFencesFromPreviousRelease(t *testing.T) {
+	useUserCacheMiniRedis(t)
+	const userID = 4200
+	const tokenKey = "rolling-release-token"
+	require.NoError(t, common.RDB.Set(t.Context(), "auth:user:fence:4200", 2, time.Minute).Err())
+	require.NoError(t, common.RDB.Set(t.Context(), "auth:user:version:4200", 1, 0).Err())
+	require.NoError(t, common.RDB.Set(t.Context(), "token:fence:"+common.GenerateHMAC(tokenKey), 1, time.Minute).Err())
+
+	floor, err := getUserAuthVersionFloor(userID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, floor)
+	err = writeUserCache(&UserBase{Id: userID, AuthVersion: 1}, true)
+	assert.ErrorIs(t, err, ErrUserAuthCachePending)
+
+	result, err := cacheInitToken(Token{Id: 1, Key: tokenKey})
+	require.NoError(t, err)
+	assert.Zero(t, result)
+
+	require.NoError(t, publishCommittedUserAuthVersion(userID, 2))
+	committed, err := common.RDB.Get(t.Context(), "auth:user:version:4200").Int64()
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, committed)
+}
+
 func useUserCacheMiniRedis(t *testing.T) *miniredis.Miniredis {
 	t.Helper()
 	server := miniredis.RunT(t)
@@ -86,14 +110,14 @@ func TestPendingUserAuthFenceRejectsStaleCacheWrite(t *testing.T) {
 	assert.False(t, server.Exists(getUserCacheKey(userID)))
 }
 
-func TestUserAuthFieldUpdateRejectsVersionMismatch(t *testing.T) {
+func TestUserAuthCacheUpdateRejectsVersionMismatch(t *testing.T) {
 	useUserCacheMiniRedis(t)
 	const userID = 4202
 	require.NoError(t, writeUserCache(&UserBase{
 		Id: userID, Group: "current", Username: "cached", AuthVersion: 3,
 	}, true))
 
-	err := updateUserCacheFieldAtVersion(userID, "Group", "stale", 2)
+	err := writeUserCache(&UserBase{Id: userID, Group: "stale", AuthVersion: 2}, false)
 
 	assert.ErrorIs(t, err, ErrUserAuthCachePending)
 	group, err := common.RDB.HGet(t.Context(), getUserCacheKey(userID), "Group").Result()

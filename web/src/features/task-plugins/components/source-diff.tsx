@@ -27,6 +27,10 @@ export type SourceDiffProps = {
   before: string
   after: string
   className?: string
+  /** Accessible name of the diff; defaults to "Source diff". */
+  label?: string
+  /** Shown when nothing changed; defaults to "No source changes". */
+  emptyText?: string
 }
 
 export function SourceDiff(props: SourceDiffProps) {
@@ -37,7 +41,7 @@ export function SourceDiff(props: SourceDiffProps) {
     return (
       <div
         role='region'
-        aria-label={t('Source diff')}
+        aria-label={props.label ?? t('Source diff')}
         className='text-muted-foreground flex flex-col items-start gap-1 rounded-md border border-dashed p-4 text-xs'
       >
         <div className='text-foreground flex items-center gap-1.5 font-medium'>
@@ -66,7 +70,7 @@ export function SourceDiff(props: SourceDiffProps) {
         role='status'
         className='text-muted-foreground rounded-md border px-3 py-6 text-center text-sm'
       >
-        {t('No source changes')}
+        {props.emptyText ?? t('No source changes')}
       </p>
     )
   }
@@ -74,7 +78,7 @@ export function SourceDiff(props: SourceDiffProps) {
   return (
     <div
       role='region'
-      aria-label={t('Source diff')}
+      aria-label={props.label ?? t('Source diff')}
       className={cn(
         'max-h-96 overflow-auto rounded-md border font-mono text-xs',
         props.className

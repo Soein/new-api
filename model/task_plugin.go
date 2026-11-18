@@ -1,6 +1,7 @@
 package model
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -105,7 +106,11 @@ func UnbindTaskPlugin(channelID int, key string) (bool, error) {
 	}
 	setting.TaskExtendPluginKeys = slices.DeleteFunc(setting.TaskExtendPluginKeys, func(bound string) bool { return bound == key })
 	channel.SetSetting(setting)
-	return true, DB.Model(&Channel{}).Where("id = ?", channelID).Update("setting", channel.Setting).Error
+	if err = DB.Model(&Channel{}).Where("id = ?", channelID).Update("setting", channel.Setting).Error; err != nil {
+		return true, err
+	}
+	BumpSyncTopic(SyncTopicChannels)
+	return true, nil
 }
 
 // LongText is a string column sized for plugin payloads on every supported
@@ -160,7 +165,7 @@ type TaskPluginState struct {
 }
 
 func SaveTaskPlugin(plugin *TaskPlugin) error {
-	return DB.Transaction(func(tx *gorm.DB) error {
+	err := DB.Transaction(func(tx *gorm.DB) error {
 		state, err := lockTaskPluginState(tx, plugin.Key)
 		if err != nil {
 			return err
@@ -216,6 +221,10 @@ func SaveTaskPlugin(plugin *TaskPlugin) error {
 		}
 		return tx.Create(plugin).Error
 	})
+	if err == nil {
+		BumpSyncTopic(SyncTopicPlugins)
+	}
+	return err
 }
 
 func ListTaskPluginVersions(key string) ([]TaskPlugin, error) {
@@ -356,12 +365,16 @@ func GetTaskPluginSource(id int64) (LongText, error) {
 }
 
 func ActivateTaskPlugin(key, version string) error {
-	_, err := ActivateTaskPluginWithState(key, version)
+	activation, err := ActivateTaskPluginWithState(key, version)
+	if err == nil && activation.Changed {
+		BumpSyncTopic(SyncTopicPlugins)
+	}
 	return err
 }
 
 // ActivateTaskPluginWithState atomically switches the active version and
 // returns the exact database states needed to compensate a failed publication.
+// The caller notifies other nodes after publishing the selected version.
 func ActivateTaskPluginWithState(key, version string) (TaskPluginActivation, error) {
 	activation := TaskPluginActivation{}
 	err := DB.Transaction(func(tx *gorm.DB) error {
@@ -545,6 +558,9 @@ func RestoreTaskPluginActivation(activation TaskPluginActivation) (bool, error) 
 		restored = true
 		return nil
 	})
+	if err == nil && restored {
+		BumpSyncTopic(SyncTopicPlugins)
+	}
 	return restored, err
 }
 
@@ -555,7 +571,7 @@ func taskPluginActivationState(plugin TaskPlugin) TaskPluginActivationState {
 }
 
 func SetTaskPluginEnabled(key string, enabled bool) error {
-	return DB.Transaction(func(tx *gorm.DB) error {
+	err := DB.Transaction(func(tx *gorm.DB) error {
 		state, err := lockTaskPluginState(tx, key)
 		if err != nil {
 			return err
@@ -592,6 +608,10 @@ func SetTaskPluginEnabled(key string, enabled bool) error {
 		}
 		return nil
 	})
+	if err == nil {
+		BumpSyncTopic(SyncTopicPlugins)
+	}
+	return err
 }
 
 type TaskPluginDeleteResult struct {
@@ -667,6 +687,9 @@ func DeleteTaskPluginVersion(key, version string, revokeHistorical ...bool) (Tas
 		result.Promoted = &promoted
 		return nil
 	})
+	if err == nil {
+		BumpSyncTopic(SyncTopicPlugins)
+	}
 	return result, err
 }
 
@@ -730,4 +753,34 @@ func advanceTaskPluginRevision(tx *gorm.DB, state *TaskPluginState, key string, 
 
 func setTaskPluginRevisionExcept(tx *gorm.DB, key string, id, revision int64) error {
 	return tx.Model(&TaskPlugin{}).Where(&TaskPlugin{Key: key}).Where("id <> ?", id).Update("revision", revision).Error
+}
+
+// TaskPluginGatewayIDKey names the option row holding the random gateway id
+// sent with community plugin install counts.
+const TaskPluginGatewayIDKey = "TaskPluginGatewayID"
+
+// GetTaskPluginGatewayID returns the gateway id, creating it on first use. The
+// first node to insert the row wins, so every node reads the same value.
+func GetTaskPluginGatewayID() (string, error) {
+	var option Option
+	err := DB.Where(&Option{Key: TaskPluginGatewayIDKey}).First(&option).Error
+	if err == nil {
+		return option.Value, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", err
+	}
+	random := make([]byte, 32)
+	if _, err = rand.Read(random); err != nil {
+		return "", err
+	}
+	candidate := Option{Key: TaskPluginGatewayIDKey, Value: hex.EncodeToString(random)}
+	if err = DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&candidate).Error; err != nil {
+		return "", err
+	}
+	option = Option{}
+	if err = DB.Where(&Option{Key: TaskPluginGatewayIDKey}).First(&option).Error; err != nil {
+		return "", err
+	}
+	return option.Value, nil
 }

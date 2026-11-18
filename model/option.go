@@ -189,14 +189,9 @@ func InitOptionMap() {
 	common.OptionMap["MjModeClearEnabled"] = strconv.FormatBool(setting.MjModeClearEnabled)
 	common.OptionMap["MjForwardUrlEnabled"] = strconv.FormatBool(setting.MjForwardUrlEnabled)
 	common.OptionMap["MjActionCheckSuccessEnabled"] = strconv.FormatBool(setting.MjActionCheckSuccessEnabled)
-	common.OptionMap["CheckSensitiveEnabled"] = strconv.FormatBool(setting.CheckSensitiveEnabled)
 	common.OptionMap["DemoSiteEnabled"] = strconv.FormatBool(operation_setting.DemoSiteEnabled)
 	common.OptionMap["SelfUseModeEnabled"] = strconv.FormatBool(operation_setting.SelfUseModeEnabled)
 	common.OptionMap["ModelRequestRateLimitEnabled"] = strconv.FormatBool(setting.ModelRequestRateLimitEnabled)
-	common.OptionMap["CheckSensitiveOnPromptEnabled"] = strconv.FormatBool(setting.CheckSensitiveOnPromptEnabled)
-	common.OptionMap["StopOnSensitiveEnabled"] = strconv.FormatBool(setting.StopOnSensitiveEnabled)
-	common.OptionMap["SensitiveWords"] = setting.SensitiveWordsToString()
-	common.OptionMap["StreamCacheQueueLength"] = strconv.Itoa(setting.StreamCacheQueueLength)
 	common.OptionMap["AutomaticDisableKeywords"] = operation_setting.AutomaticDisableKeywordsToString()
 	common.OptionMap["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
@@ -207,20 +202,27 @@ func InitOptionMap() {
 	maps.Copy(common.OptionMap, modelConfigs)
 
 	common.OptionMapRWMutex.Unlock()
-	loadOptionsFromDatabase()
+	if err := LoadOptionsFromDatabase(); err != nil {
+		common.SysError(common.LogText("failed to load options from database: %s", err.Error()))
+	}
 }
 
-func loadOptionsFromDatabase() {
+// LoadOptionsFromDatabase applies every stored option. A failed read keeps
+// the options in memory as they are.
+func LoadOptionsFromDatabase() error {
 	requestPolicyOptionMutex.Lock()
 	defer requestPolicyOptionMutex.Unlock()
+	passkeyOptionMutex.Lock()
+	defer passkeyOptionMutex.Unlock()
+	options, err := AllOption()
+	if err != nil {
+		return err
+	}
 	defer func() {
 		if err := refreshRequestPolicySnapshot(); err != nil {
 			common.SysError(common.LogText("invalid request policy: %s", err.Error()))
 		}
 	}()
-	passkeyOptionMutex.Lock()
-	defer passkeyOptionMutex.Unlock()
-	options, _ := AllOption()
 	passkeyOptions := make(map[string]string)
 	for _, option := range options {
 		if IsPasskeyDomainOption(option.Key) {
@@ -233,21 +235,30 @@ func loadOptionsFromDatabase() {
 		}
 	}
 	applyPasskeyDomainOptions(passkeyOptions)
+	return nil
 }
 
 func SyncOptions(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Second)
 		common.SysLog(common.LogText("syncing options from database"))
-		loadOptionsFromDatabase()
+		if err := LoadOptionsFromDatabase(); err != nil {
+			common.SysError(common.LogText("failed to load options from database: %s", err.Error()))
+		}
 	}
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == sensitiveWordMigrationOptionKey {
+		return common.NewMessage("Invalid request")
+	}
 	if key == legacyAccessTokenRetireAtKey {
 		return errLegacyRetireAtReadOnly
 	}
 	if err := operation_setting.ValidateQuotaOption(key, value); err != nil {
+		return err
+	}
+	if err := operation_setting.ValidateEpaySignOption(key, value); err != nil {
 		return err
 	}
 	if key == "EmailProvider" || key == "ResendApiKey" || key == "ResendFrom" {
@@ -280,6 +291,9 @@ func validateOptionValue(key string, value string) error {
 	if key == operation_setting.LogMaxRangeDaysOptionKey {
 		return operation_setting.ValidateLogMaxRangeDays(value)
 	}
+	if key == operation_setting.SystemTaskRetentionDaysOptionKey {
+		return operation_setting.ValidateSystemTaskRetentionDays(value)
+	}
 	if key == "MaxTokenAutoGroups" {
 		return setting.ValidateMaxTokenAutoGroups(value)
 	}
@@ -311,6 +325,7 @@ func UpdateOption(key string, value string) error {
 	// If save value does not contain primary key, it will execute Create,
 	// otherwise it will execute Update (with all fields).
 	DB.Save(&option)
+	BumpSyncTopic(SyncTopicOptions)
 	// Update OptionMap
 	return updateOptionMap(key, value)
 }
@@ -371,6 +386,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err != nil {
 		return err
 	}
+	BumpSyncTopic(SyncTopicOptions)
 	for k, v := range values {
 		if err := updateOptionMap(k, v); err != nil {
 			return err
@@ -383,7 +399,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
-	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey {
+	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey || key == sensitiveWordMigrationOptionKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)
 		common.OptionMapRWMutex.Unlock()
@@ -484,18 +500,12 @@ func updateOptionMap(key string, value string) (err error) {
 			setting.MjForwardUrlEnabled = boolValue
 		case "MjActionCheckSuccessEnabled":
 			setting.MjActionCheckSuccessEnabled = boolValue
-		case "CheckSensitiveEnabled":
-			setting.CheckSensitiveEnabled = boolValue
 		case "DemoSiteEnabled":
 			operation_setting.DemoSiteEnabled = boolValue
 		case "SelfUseModeEnabled":
 			operation_setting.SelfUseModeEnabled = boolValue
-		case "CheckSensitiveOnPromptEnabled":
-			setting.CheckSensitiveOnPromptEnabled = boolValue
 		case "ModelRequestRateLimitEnabled":
 			setting.ModelRequestRateLimitEnabled = boolValue
-		case "StopOnSensitiveEnabled":
-			setting.StopOnSensitiveEnabled = boolValue
 		case "SMTPSSLEnabled":
 			common.SMTPSSLEnabled = boolValue
 		case "SMTPStartTLSEnabled":
@@ -731,16 +741,12 @@ func updateOptionMap(key string, value string) (err error) {
 		common.FrtBreakerHalfOpenSweepSec, _ = strconv.Atoi(value)
 	case "QuotaPerUnit":
 		common.QuotaPerUnit, _ = strconv.ParseFloat(value, 64)
-	case "SensitiveWords":
-		setting.SensitiveWordsFromString(value)
 	case "AutomaticDisableKeywords":
 		operation_setting.AutomaticDisableKeywordsFromString(value)
 	case "AutomaticDisableStatusCodes":
 		err = operation_setting.AutomaticDisableStatusCodesFromString(value)
 	case "AutomaticRetryStatusCodes":
 		err = operation_setting.AutomaticRetryStatusCodesFromString(value)
-	case "StreamCacheQueueLength":
-		setting.StreamCacheQueueLength, _ = strconv.Atoi(value)
 	case "PayMethods":
 		err = operation_setting.UpdatePayMethodsByJsonString(value)
 	case "WaffoPayMethods":

@@ -62,10 +62,21 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 	// top-level n validation; enforce the same bound so we never generate
 	// (and get charged by the upstream for) more images than we bill.
 	if sfRequest.BatchSize > uint(dto.MaxImageN) {
-		return nil, fmt.Errorf("batch_size must be an integer between 1 and %d", dto.MaxImageN)
+		err := fmt.Errorf("batch_size must be an integer between 1 and %d", dto.MaxImageN)
+		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeConvertRequestFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 
 	return sfRequest, nil
+}
+
+// OutboundImageCount reads the image count of an image request body:
+// SiliconFlow generates batch_size images.
+func (a *Adaptor) OutboundImageCount(body []byte) (*uint, error) {
+	var request struct {
+		BatchSize *uint `json:"batch_size"`
+	}
+	err := common.Unmarshal(body, &request)
+	return request.BatchSize, err
 }
 
 func (a *Adaptor) Init(info *relaycommon.RelayInfo) {

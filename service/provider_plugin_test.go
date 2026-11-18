@@ -513,14 +513,35 @@ func TestRefreshFailuresKeepTheCredential(t *testing.T) {
 func TestRefreshRemovedCredential(t *testing.T) {
 	useProviderPluginDatabase(t)
 	server := newFakeAuthServer(t)
-	registerProviderPlugin(t, "refresh-gone", "redirect")
-	line := expiringLine(t, "refresh-gone", "refresh-0", "acct-1", 1)
-	other := expiringLine(t, "refresh-gone", "refresh-9", "acct-9", 1)
-	channel := createProviderChannel(t, "refresh-gone", server.URL, other, false)
+	const pluginKey = "refresh-gone"
+	plugin := registerProviderPlugin(t, pluginKey, "redirect")
+	soon := time.Now().Add(20 * time.Second).Unix()
+	line := expiringLine(t, pluginKey, "refresh-0", "acct-1", soon)
+	for _, tc := range []struct {
+		name        string
+		replacement string
+	}{
+		{name: "different account", replacement: expiringLine(t, pluginKey, "refresh-9", "acct-9", 0)},
+		{name: "accountless credential", replacement: expiringLine(t, pluginKey, "refresh-9", "", 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := createProviderChannel(t, pluginKey, server.URL, tc.replacement, false)
+			fresh, err := FreshPluginCredentialLine(t.Context(), plugin, channel.Id, 0, line)
+			require.ErrorIs(t, err, ErrPluginCredentialRemoved)
+			assert.Empty(t, fresh)
+			assert.Equal(t, tc.replacement, storedChannel(t, channel.Id).Key)
+		})
+	}
 
-	_, err := RefreshPluginCredential(context.Background(), channel.Id, 0, line)
+	t.Run("accountless callers can use the current credential", func(t *testing.T) {
+		legacy := expiringLine(t, pluginKey, "refresh-legacy", "", soon)
+		current := expiringLine(t, pluginKey, "refresh-current", "acct-1", 0)
+		channel := createProviderChannel(t, pluginKey, server.URL, current, false)
+		fresh, err := FreshPluginCredentialLine(t.Context(), plugin, channel.Id, 0, legacy)
+		require.NoError(t, err)
+		assert.Equal(t, current, fresh)
+	})
 
-	require.ErrorIs(t, err, ErrPluginCredentialRemoved)
 	assert.Zero(t, server.refreshCalls.Load())
 }
 

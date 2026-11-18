@@ -92,9 +92,19 @@ func (a *TaskAdaptor) taskCredentialLine(ctx context.Context, key string, task *
 	lines := strings.Split(strings.Trim(key, "\n"), "\n")
 	for index, line := range lines {
 		credential, ok := pluginruntime.ParseCredential(line)
-		if ok && credential.Plugin == a.plugin.Meta.Key && (account == "" || credential.AccountID == account) {
-			return service.FreshPluginCredentialLine(ctx, a.plugin, a.info.ChannelId, index, line)
+		if !ok || credential.Plugin != a.plugin.Meta.Key || (account != "" && credential.AccountID != account) {
+			continue
 		}
+		fresh, err := service.FreshPluginCredentialLine(ctx, a.plugin, a.info.ChannelId, index, line)
+		if err != nil || account == "" || fresh == line {
+			return fresh, err
+		}
+		// A refresh can return a line updated by another node.
+		resolved, ok := pluginruntime.ParseCredential(fresh)
+		if !ok || resolved.Plugin != a.plugin.Meta.Key || resolved.AccountID != account {
+			break
+		}
+		return fresh, nil
 	}
 	if account != "" {
 		return "", errors.New("channel key no longer holds the credential of the account that submitted the task")

@@ -375,11 +375,12 @@ func InvalidatePluginKeyToken(plugin *jsplugin.LoadedPlugin, channelID int, line
 
 // FreshPluginCredentialLine returns the line a request about to use the
 // credential line at keyIndex sends: the line, or its refresh when it expires
-// within the request margin. A failed refresh keeps a credential that has not
-// expired and is logged by category only, since the plugin's message may
-// quote the vendor's answer. A credential only a new login restores reports
-// ErrPluginCredentialNeedsLogin, an expired one whose refresh failed
-// ErrPluginCredentialRefreshFailed. A static key is returned as it is.
+// within the request margin. A temporary refresh failure keeps a credential
+// that has not expired. An identified credential removed from the channel
+// reports ErrPluginCredentialRemoved. Failures are logged by category only.
+// A credential that requires a new login reports ErrPluginCredentialNeedsLogin.
+// An expired credential whose refresh failed reports ErrPluginCredentialRefreshFailed.
+// A static key is returned as it is.
 func FreshPluginCredentialLine(ctx context.Context, plugin *jsplugin.LoadedPlugin, channelID, keyIndex int, line string) (string, error) {
 	credential, ok := jsplugin.ParseCredential(line)
 	if !ok {
@@ -395,6 +396,9 @@ func FreshPluginCredentialLine(ctx context.Context, plugin *jsplugin.LoadedPlugi
 	refreshed, err := RefreshPluginCredential(ctx, channelID, keyIndex, line)
 	if err == nil || errors.Is(err, ErrPluginCredentialNeedsLogin) {
 		return refreshed, err
+	}
+	if credential.AccountID != "" && errors.Is(err, ErrPluginCredentialRemoved) {
+		return "", err
 	}
 	common.SysLog(common.LogText("plugin credential refresh failed: plugin=%s channel_id=%d key_index=%d category=%s", plugin.Meta.Key, channelID, keyIndex, pluginErrorCategory(err)))
 	if credential.ExpiresWithin(now, 0) {
@@ -444,7 +448,7 @@ func locatePluginCredentialLine(lines []string, index int, used string, usedCred
 		}
 		stored, ok := jsplugin.ParseCredential(lines[index])
 		if ok && stored.Plugin == usedCredential.Plugin &&
-			(stored.AccountID == "" || usedCredential.AccountID == "" || stored.AccountID == usedCredential.AccountID) {
+			(usedCredential.AccountID == "" || stored.AccountID == usedCredential.AccountID) {
 			return index
 		}
 	}
